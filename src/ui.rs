@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, DisplayKind};
+use crate::app::{App, DisplayKind, SettingsField, SettingsState};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -38,6 +38,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_status(frame, main[2], app);
     if app.pending_approval.is_some() {
         draw_approval(frame, area, app);
+    }
+    if let Some(settings) = &app.settings {
+        draw_settings(frame, area, settings);
     }
 }
 
@@ -170,6 +173,86 @@ fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         popup,
     );
+}
+
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState) {
+    let popup = centered_rect(84, 16, area);
+    let key = if settings.api_key.is_empty() {
+        if settings.has_existing_key {
+            "********".to_owned()
+        } else {
+            "(not set)".to_owned()
+        }
+    } else {
+        "*".repeat(settings.api_key.chars().count().min(32))
+    };
+    let values = [
+        (
+            SettingsField::Preset,
+            "Provider",
+            settings.provider.preset.label().to_owned(),
+        ),
+        (
+            SettingsField::Protocol,
+            "Protocol",
+            settings.provider.kind.label().to_owned(),
+        ),
+        (
+            SettingsField::BaseUrl,
+            "Base URL",
+            settings.provider.base_url.clone(),
+        ),
+        (
+            SettingsField::Model,
+            "Model",
+            settings.provider.model.clone(),
+        ),
+        (SettingsField::ApiKey, "API Key", key),
+    ];
+    let value_width = popup.width.saturating_sub(19) as usize;
+    let mut lines = vec![Line::default()];
+    for (field, label, value) in values {
+        let selected = settings.field == field;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} {label:<10}"), style),
+            Span::styled(fit_text(&value, value_width), style),
+        ]));
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(Span::styled(
+        "                         Save",
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Provider settings ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn fit_text(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    value.chars().take(width - 3).collect::<String>() + "..."
 }
 
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {

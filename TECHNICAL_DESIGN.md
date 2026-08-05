@@ -29,11 +29,20 @@ serializes conventional message/tool-call/tool-result messages. Responses
 serializes message, function-call, and function-call-output items and records a
 returned response identifier for optional server-side continuation.
 
-API keys are read from `OPENAI_API_KEY` first and then the OS keyring service
-(`1h-agent/openai`). Keys are never serialized, persisted, or logged. The
-provider schema must be checked against the official OpenAI OpenAPI contract
-before a release; compatibility endpoints are allowed to implement only the
-features they advertise.
+Provider Settings is an in-TUI configuration surface. Saving rebuilds the
+provider and Agent runner immediately; no restart is required. Non-secret
+provider settings go to TOML, while API keys use provider-specific OS keyring
+accounts below the `1h-agent` service. If secure storage is unavailable, a newly
+entered key remains in process memory for that session only. Keys are never
+serialized to TOML, SQLite, or logs.
+
+Built-in presets use current official compatibility settings: OpenAI;
+DeepSeek (`https://api.deepseek.com`, `deepseek-v4-flash`); Qwen/Bailian
+(`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`,
+`qwen3.8-max`); and Volcano Ark
+(`https://ark.cn-beijing.volces.com/api/v3`,
+`doubao-seed-2-1-pro-260628`). Qwen and Volcano default to Chat Completions;
+unsupported Responses selection is forced back to Chat during validation.
 
 ## Tools and policy
 
@@ -70,7 +79,8 @@ Configuration precedence is CLI, environment, user TOML, defaults. Non-secret
 configuration is stored below the OS configuration directory; the SQLite file
 is below the OS data directory. If those directories are unavailable, the app
 uses `.1h-agent` below the workspace. Recognized environment variables include
-`OPENAI_API_KEY`, `AGENT_API_BASE`, `AGENT_MODEL`, `AGENT_PROVIDER`, and
+`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`, `ARK_API_KEY`,
+`AGENT_API_KEY`, `AGENT_API_BASE`, `AGENT_MODEL`, `AGENT_PROVIDER`, and
 `AGENT_DATA_DIR`.
 
 ## Cross-platform behavior

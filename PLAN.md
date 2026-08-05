@@ -49,7 +49,7 @@ on a conservative subset of the official protocols.
 
 ## Verification snapshot
 
-On the Linux development host, formatting, Clippy with warnings denied, 13 unit
+On the Linux development host, formatting, Clippy with warnings denied, 15 unit
 tests, 2 integration tests, and the optimized GNU release build pass. The
 release binary is approximately 6.3 MiB. An idle TUI process measured 8.3 MiB
 RSS and 0.0% CPU, and `Ctrl+C` restored the terminal normally. The musl check

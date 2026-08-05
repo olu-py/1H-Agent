@@ -1,8 +1,13 @@
 [provider]
+preset = "open_ai"
 kind = "responses"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5-mini"
 use_previous_response_id = false
+
+# Available presets: open_ai, deep_seek, qwen, volcano, custom.
+# Qwen's current China endpoint contains your Bailian WorkspaceId:
+# https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 
 [runtime]
 max_agent_turns = 8
@@ -12,4 +17,3 @@ max_fetch_bytes = 10485760
 
 [security]
 allow_private_networks = false
-

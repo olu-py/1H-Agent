@@ -18,7 +18,7 @@ use tokio::{
 
 use crate::{
     agent::{AgentEvent, AgentRunner},
-    config::Config,
+    config::{Config, ProviderConfig, ProviderKind, ProviderPreset},
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
     secrets,
     security::Workspace,
@@ -48,6 +48,42 @@ pub struct PendingApproval {
     pub reply: oneshot::Sender<bool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsField {
+    Preset,
+    Protocol,
+    BaseUrl,
+    Model,
+    ApiKey,
+}
+
+impl SettingsField {
+    const ALL: [Self; 5] = [
+        Self::Preset,
+        Self::Protocol,
+        Self::BaseUrl,
+        Self::Model,
+        Self::ApiKey,
+    ];
+
+    fn cycle(self, direction: i32) -> Self {
+        let current = Self::ALL
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0) as i32;
+        let next = (current + direction).rem_euclid(Self::ALL.len() as i32) as usize;
+        Self::ALL[next]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsState {
+    pub provider: ProviderConfig,
+    pub api_key: String,
+    pub has_existing_key: bool,
+    pub field: SettingsField,
+}
+
 pub struct App {
     pub workspace: PathBuf,
     pub input: String,
@@ -56,10 +92,14 @@ pub struct App {
     pub busy: bool,
     pub usage: Usage,
     pub pending_approval: Option<PendingApproval>,
+    pub settings: Option<SettingsState>,
     pub session_id: String,
     conversation: Vec<ConversationItem>,
     storage: Storage,
+    config: Config,
+    registry: Arc<ToolRegistry>,
     runner: Option<AgentRunner>,
+    active_secret: Option<(ProviderPreset, String)>,
     agent_tx: mpsc::Sender<AgentEvent>,
     agent_rx: mpsc::Receiver<AgentEvent>,
     active_task: Option<JoinHandle<()>>,
@@ -82,22 +122,27 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         config.security.allow_private_networks,
     ));
     let (agent_tx, agent_rx) = mpsc::channel(128);
-    let (runner, initial_status) = match secrets::openai_api_key() {
+    let (runner, active_secret, initial_status) = match secrets::api_key(config.provider.preset) {
         Ok(api_key) => {
-            let provider = OpenAiClient::new(config.provider.base_url.clone(), api_key)?;
+            let provider = OpenAiClient::new(config.provider.base_url.clone(), api_key.clone())?;
             (
                 Some(AgentRunner::new(
                     provider,
                     config.provider.clone(),
                     config.runtime.clone(),
-                    registry,
+                    registry.clone(),
                     storage.clone(),
                     session_id.clone(),
                 )),
-                format!("Ready | {}", config.provider.model),
+                Some((config.provider.preset, api_key)),
+                format!(
+                    "Ready | {} | {}",
+                    config.provider.preset.label(),
+                    config.provider.model
+                ),
             )
         }
-        Err(error) => (None, format!("Configuration required: {error}")),
+        Err(_) => (None, None, "Provider configuration required".into()),
     };
     let mut entries = conversation
         .iter()
@@ -127,10 +172,14 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         busy: false,
         usage: Usage::default(),
         pending_approval: None,
+        settings: None,
         session_id,
         conversation,
         storage,
+        config,
+        registry,
         runner,
+        active_secret,
         agent_tx,
         agent_rx,
         active_task: None,
@@ -200,6 +249,10 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
         app.should_quit = true;
         return Ok(());
     }
+    if app.settings.is_some() {
+        handle_settings_key(app, key.code, key.modifiers);
+        return Ok(());
+    }
     if app.pending_approval.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => resolve_approval(app, true),
@@ -209,6 +262,18 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
         return Ok(());
     }
     match key.code {
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
+            app.settings = Some(SettingsState {
+                provider: app.config.provider.clone(),
+                api_key: String::new(),
+                has_existing_key: app
+                    .active_secret
+                    .as_ref()
+                    .is_some_and(|(preset, _)| *preset == app.config.provider.preset),
+                field: SettingsField::Preset,
+            });
+            app.status = "Provider settings".into();
+        }
         KeyCode::Esc => {
             if let Some(task) = app.active_task.take() {
                 task.abort();
@@ -238,7 +303,7 @@ fn submit_input(app: &mut App) -> Result<()> {
         return Ok(());
     }
     let Some(runner) = app.runner.clone() else {
-        app.status = "Set OPENAI_API_KEY and restart 1H-Agent".into();
+        app.status = "Open Provider Settings to configure an API key".into();
         return Ok(());
     };
     app.input.clear();
@@ -264,6 +329,149 @@ fn submit_input(app: &mut App) -> Result<()> {
         runner.run(items, events).await;
     }));
     trim_entries(&mut app.entries);
+    Ok(())
+}
+
+fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    match code {
+        KeyCode::Esc => {
+            app.settings = None;
+            app.status = "Settings cancelled".into();
+        }
+        KeyCode::Tab => {
+            if let Some(settings) = &mut app.settings {
+                settings.field = settings.field.cycle(1);
+            }
+        }
+        KeyCode::BackTab => {
+            if let Some(settings) = &mut app.settings {
+                settings.field = settings.field.cycle(-1);
+            }
+        }
+        KeyCode::Up => {
+            if let Some(settings) = &mut app.settings {
+                settings.field = settings.field.cycle(-1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(settings) = &mut app.settings {
+                settings.field = settings.field.cycle(1);
+            }
+        }
+        KeyCode::Left => cycle_setting_value(app, -1),
+        KeyCode::Right => cycle_setting_value(app, 1),
+        KeyCode::Backspace => edit_setting(app, None),
+        KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            edit_setting(app, Some(character));
+        }
+        KeyCode::Enter => {
+            if let Err(error) = apply_settings(app) {
+                app.status = format!("Settings error: {}", secrets::redact(&error.to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cycle_setting_value(app: &mut App, direction: i32) {
+    let Some(settings) = &mut app.settings else {
+        return;
+    };
+    match settings.field {
+        SettingsField::Preset => {
+            let current = ProviderPreset::ALL
+                .iter()
+                .position(|preset| *preset == settings.provider.preset)
+                .unwrap_or(0) as i32;
+            let next = (current + direction).rem_euclid(ProviderPreset::ALL.len() as i32) as usize;
+            settings.provider = ProviderPreset::ALL[next].defaults();
+            settings.api_key.clear();
+            settings.has_existing_key = app
+                .active_secret
+                .as_ref()
+                .is_some_and(|(preset, _)| *preset == settings.provider.preset);
+        }
+        SettingsField::Protocol if settings.provider.preset.supports_responses() => {
+            settings.provider.kind = match settings.provider.kind {
+                ProviderKind::ChatCompletions => ProviderKind::Responses,
+                ProviderKind::Responses => ProviderKind::ChatCompletions,
+            };
+        }
+        _ => {}
+    }
+}
+
+fn edit_setting(app: &mut App, character: Option<char>) {
+    let Some(settings) = &mut app.settings else {
+        return;
+    };
+    let value = match settings.field {
+        SettingsField::BaseUrl => &mut settings.provider.base_url,
+        SettingsField::Model => &mut settings.provider.model,
+        SettingsField::ApiKey => &mut settings.api_key,
+        _ => return,
+    };
+    match character {
+        Some(character) => value.push(character),
+        None => {
+            value.pop();
+        }
+    }
+}
+
+fn apply_settings(app: &mut App) -> Result<()> {
+    let settings = app.settings.as_ref().context("settings are not open")?;
+    let mut provider_config = settings.provider.clone();
+    provider_config.validate()?;
+    let entered_key = settings.api_key.trim();
+    let api_key = if !entered_key.is_empty() {
+        entered_key.to_owned()
+    } else if let Some((preset, key)) = &app.active_secret {
+        if *preset == provider_config.preset {
+            key.clone()
+        } else {
+            secrets::api_key(provider_config.preset)?
+        }
+    } else {
+        secrets::api_key(provider_config.preset)?
+    };
+
+    let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())?;
+    app.runner = Some(AgentRunner::new(
+        provider,
+        provider_config.clone(),
+        app.config.runtime.clone(),
+        app.registry.clone(),
+        app.storage.clone(),
+        app.session_id.clone(),
+    ));
+    app.active_secret = Some((provider_config.preset, api_key));
+    app.config.provider = provider_config.clone();
+
+    let key_warning = if !entered_key.is_empty() {
+        secrets::store_api_key(provider_config.preset, entered_key)
+            .err()
+            .map(|_| "API key is session-only")
+    } else {
+        None
+    };
+    let config_warning = app.config.save().err().map(|_| "config is session-only");
+    let warnings = [key_warning, config_warning]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+    app.settings = None;
+    app.status = format!(
+        "Ready | {} | {}{}",
+        provider_config.preset.label(),
+        provider_config.model,
+        if warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" | {warnings}")
+        }
+    );
     Ok(())
 }
 

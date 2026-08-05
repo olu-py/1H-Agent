@@ -20,10 +20,28 @@ workspace and commands, mutations, and remote Git operations require approval.
 ## Run
 
 ```bash
-export OPENAI_API_KEY="..."
-export AGENT_MODEL="gpt-5-mini"
 cargo run -- --workspace /path/to/project
 ```
+
+Open Provider Settings with `Ctrl+S`. Use the arrow keys to select OpenAI,
+DeepSeek, Qwen/Bailian, Volcano Ark, or a custom OpenAI-compatible endpoint.
+Use `Tab` to move between fields, edit the Base URL/model/API Key, and press
+`Enter` to apply immediately. `Esc` closes the panel without saving.
+
+The API Key is stored under a provider-specific account in the OS keyring. If
+secure storage is unavailable, the key remains usable only for the current
+process. Environment variables remain supported for unattended use:
+
+| Preset | Environment variable | Default model |
+| --- | --- | --- |
+| OpenAI | `OPENAI_API_KEY` | `gpt-5-mini` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` |
+| Qwen/Bailian | `DASHSCOPE_API_KEY` | `qwen3.8-max` |
+| Volcano Ark | `ARK_API_KEY` | `doubao-seed-2-1-pro-260628` |
+| Custom | `AGENT_API_KEY` | editable |
+
+Qwen's current China-compatible endpoint contains an account-specific
+`WorkspaceId`. Replace the placeholder in Provider Settings before saving.
 
 Configuration can be copied from `config/config.example.toml`. Environment
 variables override the file. Press `Ctrl+C` to quit, `Esc` to cancel an active
