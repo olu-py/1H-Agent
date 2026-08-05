@@ -1,0 +1,25 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Runtime state and secrets
+/.1h-agent/
+config.toml
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Packaging output
+/dist/
+*.deb
+*.msi
+*.zip
+*.tar.gz
+

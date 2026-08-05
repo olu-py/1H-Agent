@@ -1,0 +1,15 @@
+[provider]
+kind = "responses"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5-mini"
+use_previous_response_id = false
+
+[runtime]
+max_agent_turns = 8
+command_timeout_seconds = 60
+max_tool_output_bytes = 1048576
+max_fetch_bytes = 10485760
+
+[security]
+allow_private_networks = false
+
