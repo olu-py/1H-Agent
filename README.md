@@ -44,8 +44,10 @@ Qwen's current China-compatible endpoint contains an account-specific
 `WorkspaceId`. Replace the placeholder in Provider Settings before saving.
 
 Configuration can be copied from `config/config.example.toml`. Environment
-variables override the file. Press `Ctrl+C` to quit, `Esc` to cancel an active
-request, and `Y` or `N` when a tool approval dialog is open.
+variables override the file. The TUI keeps the main controls visible in its
+footer: `Enter` sends, `Ctrl+S` opens provider settings, `Alt+Up/Down` switches
+sessions, `Ctrl+N` creates a session, `Esc` cancels an active request, and
+`Ctrl+C` quits. Use `Y` or `N` when a tool approval dialog is open.
 
 `AGENT_DATA_DIR` overrides the platform data directory, which is useful in
 portable or sandboxed environments.

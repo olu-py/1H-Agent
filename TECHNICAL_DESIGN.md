@@ -74,6 +74,9 @@ execution result is recorded without secret values.
 SQLite uses bundled SQLite and WAL mode. Migrations create sessions, messages,
 tool calls, and provider state. Large tool output is truncated in memory; a
 future attachment store may retain an explicitly requested full output.
+The session sidebar is backed by the workspace-filtered SQLite session list;
+`Alt+Up/Down` reloads the selected history and rebinds the runner, while
+`Ctrl+N` creates and activates a new session.
 
 Configuration precedence is CLI, environment, user TOML, defaults. Non-secret
 configuration is stored below the OS configuration directory; the SQLite file

@@ -15,6 +15,12 @@ pub struct Storage {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -104,6 +110,21 @@ impl Storage {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub fn list_sessions(&self, workspace: &Path) -> Result<Vec<SessionSummary>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT id, title FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC, created_at DESC",
+        )?;
+        let rows = statement.query_map([workspace.display().to_string()], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     }
 
@@ -231,5 +252,9 @@ mod tests {
             storage.latest_session(root.path()).unwrap().as_deref(),
             Some(session.as_str())
         );
+        let sessions = storage.list_sessions(root.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session);
+        assert_eq!(sessions[0].title, "hello");
     }
 }

@@ -11,6 +11,7 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use serde_json::Value;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -22,7 +23,7 @@ use crate::{
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
     secrets,
     security::Workspace,
-    storage::Storage,
+    storage::{SessionSummary, Storage},
     tools::ToolRegistry,
     ui,
 };
@@ -39,7 +40,14 @@ pub enum DisplayKind {
 #[derive(Clone, Debug)]
 pub struct DisplayEntry {
     pub kind: DisplayKind,
-    pub text: String,
+    pub content: DisplayContent,
+}
+
+#[derive(Clone, Debug)]
+pub enum DisplayContent {
+    Markdown(String),
+    ToolCall { name: String, arguments: Value },
+    ToolResult { name: String, result: String },
 }
 
 pub struct PendingApproval {
@@ -94,6 +102,7 @@ pub struct App {
     pub pending_approval: Option<PendingApproval>,
     pub settings: Option<SettingsState>,
     pub session_id: String,
+    pub sessions: Vec<SessionSummary>,
     conversation: Vec<ConversationItem>,
     storage: Storage,
     config: Config,
@@ -114,6 +123,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         Some(session_id) => session_id,
         None => storage.create_session(&workspace_path)?,
     };
+    let sessions = storage.list_sessions(&workspace_path)?;
     let conversation = storage.load_messages(&session_id)?;
     let workspace = Workspace::new(&workspace_path)?;
     let registry = Arc::new(ToolRegistry::new(
@@ -144,26 +154,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         }
         Err(_) => (None, None, "Provider configuration required".into()),
     };
-    let mut entries = conversation
-        .iter()
-        .filter_map(|item| match item {
-            ConversationItem::Message { role, content } => Some(DisplayEntry {
-                kind: match role {
-                    Role::User => DisplayKind::User,
-                    Role::Assistant => DisplayKind::Assistant,
-                    Role::System => DisplayKind::System,
-                },
-                text: content.clone(),
-            }),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
-        entries.push(DisplayEntry {
-            kind: DisplayKind::System,
-            text: "1H-Agent ready. Type a task and press Enter.".into(),
-        });
-    }
+    let entries = display_entries(&conversation);
     let mut app = App {
         workspace: workspace_path,
         input: String::new(),
@@ -174,6 +165,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         pending_approval: None,
         settings: None,
         session_id,
+        sessions,
         conversation,
         storage,
         config,
@@ -274,6 +266,25 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
             });
             app.status = "Provider settings".into();
         }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
+            create_session(app)?;
+        }
+        KeyCode::Up
+            if !app.busy
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            switch_session(app, -1)?;
+        }
+        KeyCode::Down
+            if !app.busy
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            switch_session(app, 1)?;
+        }
         KeyCode::Esc => {
             if let Some(task) = app.active_task.take() {
                 task.abort();
@@ -281,7 +292,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
                 app.status = "Cancelled".into();
                 app.entries.push(DisplayEntry {
                     kind: DisplayKind::System,
-                    text: "Request cancelled.".into(),
+                    content: DisplayContent::Markdown("Request cancelled.".into()),
                 });
             }
         }
@@ -289,7 +300,12 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
         KeyCode::Backspace if !app.busy => {
             app.input.pop();
         }
-        KeyCode::Char(character) if !app.busy && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(character)
+            if !app.busy
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             app.input.push(character);
         }
         _ => {}
@@ -309,11 +325,11 @@ fn submit_input(app: &mut App) -> Result<()> {
     app.input.clear();
     app.entries.push(DisplayEntry {
         kind: DisplayKind::User,
-        text: input.clone(),
+        content: DisplayContent::Markdown(input.clone()),
     });
     app.entries.push(DisplayEntry {
         kind: DisplayKind::Assistant,
-        text: String::new(),
+        content: DisplayContent::Markdown(String::new()),
     });
     app.conversation.push(ConversationItem::Message {
         role: Role::User,
@@ -321,6 +337,7 @@ fn submit_input(app: &mut App) -> Result<()> {
     });
     app.storage
         .append_message(&app.session_id, Role::User, &input)?;
+    refresh_sessions(app)?;
     app.busy = true;
     app.status = "Thinking... | Esc cancels".into();
     let items = app.conversation.clone();
@@ -484,7 +501,9 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
                 .rev()
                 .find(|entry| matches!(entry.kind, DisplayKind::Assistant))
             {
-                entry.text.push_str(&delta);
+                if let DisplayContent::Markdown(text) = &mut entry.content {
+                    text.push_str(&delta);
+                }
             }
             app.status = "Streaming... | Esc cancels".into();
         }
@@ -504,13 +523,19 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             app.status = format!("Running {}...", call.name);
             app.entries.push(DisplayEntry {
                 kind: DisplayKind::Tool,
-                text: format!("{} {}", call.name, call.arguments),
+                content: DisplayContent::ToolCall {
+                    name: call.name,
+                    arguments: call.arguments,
+                },
             });
         }
         AgentEvent::ToolFinished { call, result } => {
             app.entries.push(DisplayEntry {
                 kind: DisplayKind::Tool,
-                text: format!("{} result:\n{}", call.name, result),
+                content: DisplayContent::ToolResult {
+                    name: call.name,
+                    result,
+                },
             });
             app.status = "Returning tool result to model...".into();
         }
@@ -519,12 +544,16 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             app.conversation = items;
             app.busy = false;
             app.active_task = None;
-            app.status = "Ready".into();
+            app.status = if refresh_sessions(app).is_ok() {
+                "Ready".into()
+            } else {
+                "Ready | failed to refresh sessions".into()
+            };
         }
         AgentEvent::Failed(error) => {
             app.entries.push(DisplayEntry {
                 kind: DisplayKind::Error,
-                text: secrets::redact(&error),
+                content: DisplayContent::Markdown(secrets::redact(&error)),
             });
             app.busy = false;
             app.active_task = None;
@@ -543,6 +572,96 @@ fn resolve_approval(app: &mut App, approved: bool) {
             "Rejected; returning result to model...".into()
         };
     }
+}
+
+fn create_session(app: &mut App) -> Result<()> {
+    let session_id = app.storage.create_session(&app.workspace)?;
+    activate_session(app, session_id)?;
+    refresh_sessions(app)?;
+    app.status = "New session ready".into();
+    Ok(())
+}
+
+fn switch_session(app: &mut App, direction: i32) -> Result<()> {
+    refresh_sessions(app)?;
+    if app.sessions.len() < 2 {
+        app.status = "Only one session | Ctrl+N creates another".into();
+        return Ok(());
+    }
+    let current = app
+        .sessions
+        .iter()
+        .position(|session| session.id == app.session_id)
+        .unwrap_or(0) as i32;
+    let next = (current + direction).rem_euclid(app.sessions.len() as i32) as usize;
+    let session_id = app.sessions[next].id.clone();
+    activate_session(app, session_id)
+}
+
+fn activate_session(app: &mut App, session_id: String) -> Result<()> {
+    let conversation = app.storage.load_messages(&session_id)?;
+    let entries = display_entries(&conversation);
+    let runner = if let Some((_, api_key)) = &app.active_secret {
+        let provider = OpenAiClient::new(app.config.provider.base_url.clone(), api_key.clone())?;
+        Some(AgentRunner::new(
+            provider,
+            app.config.provider.clone(),
+            app.config.runtime.clone(),
+            app.registry.clone(),
+            app.storage.clone(),
+            session_id.clone(),
+        ))
+    } else {
+        None
+    };
+
+    app.session_id = session_id;
+    app.conversation = conversation;
+    app.entries = entries;
+    app.input.clear();
+    app.usage = Usage::default();
+    app.runner = runner;
+    app.status = if app.runner.is_some() {
+        format!(
+            "Ready | {} | {}",
+            app.config.provider.preset.label(),
+            app.config.provider.model
+        )
+    } else {
+        "Provider configuration required".into()
+    };
+    Ok(())
+}
+
+fn refresh_sessions(app: &mut App) -> Result<()> {
+    app.sessions = app.storage.list_sessions(&app.workspace)?;
+    Ok(())
+}
+
+fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {
+    let mut entries = conversation
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::Message { role, content } => Some(DisplayEntry {
+                kind: match role {
+                    Role::User => DisplayKind::User,
+                    Role::Assistant => DisplayKind::Assistant,
+                    Role::System => DisplayKind::System,
+                },
+                content: DisplayContent::Markdown(content.clone()),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        entries.push(DisplayEntry {
+            kind: DisplayKind::System,
+            content: DisplayContent::Markdown(
+                "1H-Agent ready. Type a task and press Enter.".into(),
+            ),
+        });
+    }
+    entries
 }
 
 fn trim_entries(entries: &mut Vec<DisplayEntry>) {
