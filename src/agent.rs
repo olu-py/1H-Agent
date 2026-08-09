@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     config::{ProviderConfig, RuntimeConfig},
+    prompt,
     provider::{ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ToolCall, Usage},
     security::PolicyDecision,
     storage::Storage,
@@ -13,6 +15,20 @@ use crate::{
 
 #[derive(Debug)]
 pub enum AgentEvent {
+    ThinkingSummary(String),
+    ModelStreaming,
+    WebSearchStarted {
+        query: String,
+    },
+    WebSearchResult {
+        title: String,
+        url: String,
+        snippet: String,
+    },
+    WebSearchCompleted {
+        count: usize,
+    },
+    Cancelled(String),
     TextDelta(String),
     Approval {
         call: ToolCall,
@@ -29,6 +45,10 @@ pub enum AgentEvent {
         items: Vec<ConversationItem>,
     },
     Failed(String),
+    LocalCommandFinished {
+        command: String,
+        result: String,
+    },
 }
 
 #[derive(Clone)]
@@ -68,15 +88,29 @@ impl AgentRunner {
     }
 
     pub async fn run(&self, mut items: Vec<ConversationItem>, ui_events: mpsc::Sender<AgentEvent>) {
-        if let Err(error) = self.run_inner(&mut items, &ui_events).await {
-            let _ = ui_events.send(AgentEvent::Failed(error)).await;
+        if let Err(error) = self.run_at_depth(&mut items, &ui_events, 0).await {
+            if error.starts_with("cancelled:") {
+                let _ = ui_events.send(AgentEvent::Cancelled(error)).await;
+            } else {
+                let _ = ui_events.send(AgentEvent::Failed(error)).await;
+            }
         }
+    }
+
+    async fn run_at_depth(
+        &self,
+        items: &mut Vec<ConversationItem>,
+        ui_events: &mpsc::Sender<AgentEvent>,
+        depth: usize,
+    ) -> Result<(), String> {
+        self.run_inner(items, ui_events, depth).await
     }
 
     async fn run_inner(
         &self,
         items: &mut Vec<ConversationItem>,
         ui_events: &mpsc::Sender<AgentEvent>,
+        depth: usize,
     ) -> Result<(), String> {
         let mut previous_response_id = if self.provider_config.use_previous_response_id {
             self.storage
@@ -91,13 +125,40 @@ impl AgentRunner {
         } else {
             0
         };
-
+        let mut next_summary = format!(
+            "正在以 {} 模式分析请求，并选择下一项安全操作。",
+            self.tools.mode().as_str().to_ascii_uppercase()
+        );
         for _turn in 0..self.runtime.max_agent_turns {
+            let summary = next_summary.clone();
+            ui_events
+                .send(AgentEvent::ThinkingSummary(summary.clone()))
+                .await
+                .map_err(|_| "UI event receiver closed".to_owned())?;
+            items.push(ConversationItem::ThinkingSummary {
+                content: summary.clone(),
+            });
+            self.storage
+                .append_thinking_summary(&self.session_id, &summary)
+                .map_err(|error| error.to_string())?;
             let request_items = if previous_response_id.is_some() {
                 items[request_cursor..].to_vec()
             } else {
                 items.clone()
             };
+            let mut request_items = request_items;
+            if previous_response_id.is_none() {
+                request_items.insert(
+                    0,
+                    ConversationItem::Message {
+                        role: Role::System,
+                        content: prompt::system_prompt(
+                            self.provider_config.preset,
+                            self.tools.mode(),
+                        ),
+                    },
+                );
+            }
             let request = ModelRequest {
                 kind: self.provider_config.kind,
                 model: self.provider_config.model.clone(),
@@ -106,6 +167,10 @@ impl AgentRunner {
                 previous_response_id: previous_response_id.clone(),
             };
             let (model_tx, mut model_rx) = mpsc::channel(128);
+            ui_events
+                .send(AgentEvent::ModelStreaming)
+                .await
+                .map_err(|_| "UI event receiver closed".to_owned())?;
             let provider = self.provider.clone();
             let provider_task =
                 tokio::spawn(async move { provider.stream(request, model_tx).await });
@@ -115,8 +180,56 @@ impl AgentRunner {
             let mut completed_calls = Vec::new();
             let mut completed_ids = HashSet::new();
             let mut saw_done = false;
+            let mut search_results = 0usize;
+            let mut search_bytes = 0usize;
             while let Some(event) = model_rx.recv().await {
                 match event {
+                    ModelEvent::WebSearchStarted { query } => {
+                        ui_events
+                            .send(AgentEvent::WebSearchStarted { query })
+                            .await
+                            .map_err(|_| "UI event receiver closed".to_owned())?;
+                    }
+                    ModelEvent::WebSearchResult {
+                        title,
+                        url,
+                        snippet,
+                    } => {
+                        let item_bytes = title.len() + url.len() + snippet.len();
+                        if search_results < 10 && search_bytes + item_bytes <= 64 * 1024 {
+                            search_results += 1;
+                            search_bytes += item_bytes;
+                            let label = format!("搜索来源：{title}");
+                            let content = format!("{url}\n{snippet}");
+                            items.push(ConversationItem::Context {
+                                label: label.clone(),
+                                content: content.clone(),
+                            });
+                            self.storage
+                                .append_context(&self.session_id, &label, &content)
+                                .map_err(|error| error.to_string())?;
+                            ui_events
+                                .send(AgentEvent::WebSearchResult {
+                                    title,
+                                    url,
+                                    snippet,
+                                })
+                                .await
+                                .map_err(|_| "UI event receiver closed".to_owned())?;
+                        }
+                    }
+                    ModelEvent::WebSearchCompleted { count } => {
+                        ui_events
+                            .send(AgentEvent::WebSearchCompleted {
+                                count: if count == 0 {
+                                    search_results
+                                } else {
+                                    count.min(10)
+                                },
+                            })
+                            .await
+                            .map_err(|_| "UI event receiver closed".to_owned())?;
+                    }
                     ModelEvent::TextDelta(delta) => {
                         assistant_text.push_str(&delta);
                         ui_events
@@ -221,6 +334,14 @@ impl AgentRunner {
             items.push(ConversationItem::AssistantToolCalls {
                 calls: completed_calls.clone(),
             });
+            self.storage
+                .append_tool_calls(&self.session_id, &completed_calls)
+                .map_err(|error| error.to_string())?;
+            let tool_names = completed_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             // When Responses server state is enabled, the response already owns the
             // assistant text and tool calls. Only subsequent tool outputs are new.
             request_cursor = items.len();
@@ -237,9 +358,12 @@ impl AgentRunner {
                             .finish_tool(&call.id, &result)
                             .map_err(|error| error.to_string())?;
                         items.push(ConversationItem::ToolOutput {
-                            call_id: call.id,
-                            output: result,
+                            call_id: call.id.clone(),
+                            output: result.clone(),
                         });
+                        self.storage
+                            .append_tool_output(&self.session_id, &call.id, &result)
+                            .map_err(|error| error.to_string())?;
                         continue;
                     }
                     PolicyDecision::RequireApproval(reason) => {
@@ -252,7 +376,9 @@ impl AgentRunner {
                             })
                             .await
                             .map_err(|_| "UI event receiver closed".to_owned())?;
-                        answer.await.unwrap_or(false)
+                        answer
+                            .await
+                            .map_err(|_| "cancelled: approval channel closed".to_owned())?
                     }
                 };
                 let decision_name = if approved { "approved" } else { "rejected" };
@@ -264,10 +390,18 @@ impl AgentRunner {
                         .send(AgentEvent::ToolStarted(call.clone()))
                         .await
                         .map_err(|_| "UI event receiver closed".to_owned())?;
-                    self.tools
-                        .execute(&call)
-                        .await
-                        .unwrap_or_else(|error| error.to_string())
+                    if call.name == "agent_spawn" {
+                        if depth >= 1 {
+                            "child agents cannot recursively spawn another child".into()
+                        } else {
+                            self.run_child(&call).await.unwrap_or_else(|error| error)
+                        }
+                    } else {
+                        self.tools
+                            .execute(&call)
+                            .await
+                            .unwrap_or_else(|error| error.to_string())
+                    }
                 } else {
                     "rejected by user".into()
                 };
@@ -282,14 +416,98 @@ impl AgentRunner {
                     .await
                     .map_err(|_| "UI event receiver closed".to_owned())?;
                 items.push(ConversationItem::ToolOutput {
-                    call_id: call.id,
-                    output: result,
+                    call_id: call.id.clone(),
+                    output: result.clone(),
                 });
+                self.storage
+                    .append_tool_output(&self.session_id, &call.id, &result)
+                    .map_err(|error| error.to_string())?;
             }
+            next_summary = format!("正在检查 {tool_names} 的结果，并决定下一项安全操作。");
         }
         Err(format!(
-            "agent stopped after {} tool turns",
+            "maximum tool turns reached ({})",
             self.runtime.max_agent_turns
         ))
     }
+
+    async fn run_child(&self, call: &ToolCall) -> Result<String, String> {
+        let arguments: ChildArgs = serde_json::from_value(call.arguments.clone())
+            .map_err(|error| format!("invalid child agent arguments: {error}"))?;
+        if arguments.prompt.trim().is_empty() {
+            return Err("child agent prompt must not be empty".into());
+        }
+        let mut provider_config = self.provider_config.clone();
+        let _max_turns = arguments.max_turns.unwrap_or(3).clamp(1, 3);
+        provider_config.use_previous_response_id = false;
+        let request = ModelRequest {
+            kind: provider_config.kind,
+            model: provider_config.model,
+            items: vec![ConversationItem::Message {
+                role: Role::User,
+                content: arguments.prompt,
+            }],
+            tools: self
+                .tools
+                .definitions()
+                .into_iter()
+                .filter(|tool| {
+                    matches!(
+                        tool.name.as_str(),
+                        "file_list"
+                            | "file_stat"
+                            | "file_read"
+                            | "file_search"
+                            | "web_fetch"
+                            | "git_diff"
+                    )
+                })
+                .collect(),
+            previous_response_id: None,
+        };
+        let (events, mut receiver) = mpsc::channel(512);
+        let provider = self.provider.clone();
+        let task = tokio::spawn(async move { provider.stream(request, events).await });
+        let mut output = String::new();
+        while let Some(event) = receiver.recv().await {
+            match event {
+                ModelEvent::TextDelta(delta) => {
+                    let remaining = 256 * 1024usize - output.len();
+                    if remaining > 0 {
+                        let mut end = delta.len().min(remaining);
+                        while end > 0 && !delta.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        output.push_str(&delta[..end]);
+                    }
+                }
+                ModelEvent::Done => break,
+                ModelEvent::Usage(_)
+                | ModelEvent::ResponseId(_)
+                | ModelEvent::WebSearchStarted { .. }
+                | ModelEvent::WebSearchResult { .. }
+                | ModelEvent::WebSearchCompleted { .. }
+                | ModelEvent::ToolCallDelta { .. }
+                | ModelEvent::ToolCallComplete(_) => {}
+            }
+        }
+        let result = task
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string());
+        if let Err(error) = result {
+            output.push_str(&format!("\n[child failed: {error}]"));
+        }
+        if output.is_empty() {
+            output.push_str("[child agent returned no text]");
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildArgs {
+    prompt: String,
+    max_turns: Option<usize>,
 }

@@ -1,5 +1,7 @@
 # 1H-Agent Development Plan
 
+项目名中的 `1H` 指氕（protium，氢-1 同位素），代表轻量化的核心方向。
+
 ## Goal
 
 Deliver a low-memory TUI agent for Linux and Windows that can converse through
@@ -42,16 +44,21 @@ native Windows CI runner instead of installing MinGW/WiX locally.
 
 ## Current release boundaries
 
-The first release excludes a headless browser, desktop automation, local model,
-voice, a plugin ABI, and provider-native Anthropic/Gemini protocols. `webfetch`
-is HTTP only. OpenAI-compatible servers are supported through a custom base URL
-on a conservative subset of the official protocols.
+The lightweight TUI includes OpenCode-style commands, multi-line input,
+bounded file references, approved `!` shell commands, session branching,
+undo/redo, compaction, export, diff viewing, Plan/Build/Explore modes, and a
+bounded one-level child-agent request. Browser automation is external only:
+the optional JSONL bridge is a user-installed process, and no Chromium is
+bundled. A minimal local stdio MCP subset can discover and call tools when
+explicitly enabled. Remote sharing, Web UI, voice, a plugin ABI/marketplace,
+and provider-native Anthropic/Gemini protocols remain excluded.
 
 ## Verification snapshot
 
-On the Linux development host, formatting, Clippy with warnings denied, 15 unit
-tests, 2 integration tests, and the optimized GNU release build pass. The
-release binary is approximately 6.3 MiB. An idle TUI process measured 8.3 MiB
-RSS and 0.0% CPU, and `Ctrl+C` restored the terminal normally. The musl check
-currently requires the approved `musl-tools` system package; Windows compilation
-and installers are defined in CI and must be confirmed on a native runner.
+On the development host, formatting, Clippy with warnings denied, 28 unit
+tests, 2 integration tests, and the optimized release build pass. The current
+release binary is approximately 5.6 MiB. Existing idle measurements remain the
+baseline: about 8.3 MiB RSS on Linux, 3.3 MiB on macOS, and effectively zero
+idle CPU. The musl check requires the approved `musl-tools` system package;
+Windows compilation and installers are defined in CI and must be confirmed on
+a native runner.

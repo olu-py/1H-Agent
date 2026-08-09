@@ -1,6 +1,9 @@
 pub mod agent;
 pub mod app;
+pub mod commands;
 pub mod config;
+pub mod input;
+pub mod prompt;
 pub mod provider;
 pub mod secrets;
 pub mod security;

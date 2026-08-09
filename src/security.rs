@@ -97,13 +97,13 @@ impl Workspace {
 
 pub fn classify_tool(name: &str, arguments: &Value) -> PolicyDecision {
     match name {
-        "file_list" | "file_stat" | "file_read" | "file_search" | "web_fetch" => {
-            PolicyDecision::Allow
-        }
+        "file_list" | "file_stat" | "file_read" | "file_search" | "web_search" | "web_fetch"
+        | "git_diff" => PolicyDecision::Allow,
         "file_write" | "file_mkdir" | "file_copy" | "file_move" | "file_delete" => {
             PolicyDecision::RequireApproval(format!("{name} changes workspace files"))
         }
         "terminal_exec" => PolicyDecision::RequireApproval("run a local process".into()),
+        "agent_spawn" => PolicyDecision::RequireApproval("start a bounded child agent".into()),
         "git" => classify_git(arguments),
         _ => PolicyDecision::Deny(format!("unknown tool: {name}")),
     }

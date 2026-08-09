@@ -25,6 +25,8 @@ pub struct SessionSummary {
 pub enum StorageError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("invalid stored JSON: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("storage lock is poisoned")]
     Poisoned,
 }
@@ -40,7 +42,6 @@ impl Storage {
         Self::from_connection(connection)
     }
 
-    #[cfg(test)]
     pub fn in_memory() -> Result<Self, StorageError> {
         Self::from_connection(Connection::open_in_memory()?)
     }
@@ -59,14 +60,30 @@ impl Storage {
                 workspace TEXT NOT NULL,
                 title TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'build',
+                provider TEXT NOT NULL DEFAULT 'openai',
+                model TEXT NOT NULL DEFAULT '',
+                parent_id TEXT,
+                deleted_at TEXT,
+                head_turn_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS turns (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                parent_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                turn_id TEXT,
+                kind TEXT NOT NULL DEFAULT 'message',
+                hidden INTEGER NOT NULL DEFAULT 0,
+                metadata TEXT
             );
             CREATE TABLE IF NOT EXISTS tool_calls (
                 id TEXT PRIMARY KEY,
@@ -87,6 +104,43 @@ impl Storage {
             VALUES (1, CURRENT_TIMESTAMP);
             ",
         )?;
+        // These checks keep databases created by the first release compatible
+        // without relying on SQLite's optional ALTER TABLE syntax extensions.
+        ensure_column(
+            &connection,
+            "sessions",
+            "mode",
+            "TEXT NOT NULL DEFAULT 'build'",
+        )?;
+        ensure_column(
+            &connection,
+            "sessions",
+            "provider",
+            "TEXT NOT NULL DEFAULT 'openai'",
+        )?;
+        ensure_column(&connection, "sessions", "model", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&connection, "sessions", "parent_id", "TEXT")?;
+        ensure_column(&connection, "sessions", "deleted_at", "TEXT")?;
+        ensure_column(&connection, "sessions", "head_turn_id", "TEXT")?;
+        ensure_column(&connection, "messages", "turn_id", "TEXT")?;
+        ensure_column(
+            &connection,
+            "messages",
+            "kind",
+            "TEXT NOT NULL DEFAULT 'message'",
+        )?;
+        ensure_column(
+            &connection,
+            "messages",
+            "hidden",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&connection, "messages", "metadata", "TEXT")?;
+        backfill_turns(&connection)?;
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP)",
+            [],
+        )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -94,10 +148,16 @@ impl Storage {
 
     pub fn create_session(&self, workspace: &Path) -> Result<String, StorageError> {
         let id = Uuid::new_v4().to_string();
+        let turn_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        self.lock()?.execute(
-            "INSERT INTO sessions(id, workspace, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![id, workspace.display().to_string(), "New session", now],
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, head_turn_id) VALUES (?1, ?2, ?3, ?4, ?4, 'build', 'openai', '', ?5)",
+            params![id, workspace.display().to_string(), "New session", now, turn_id],
+        )?;
+        connection.execute(
+            "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+            params![turn_id, id, now],
         )?;
         Ok(id)
     }
@@ -105,7 +165,7 @@ impl Storage {
     pub fn latest_session(&self, workspace: &Path) -> Result<Option<String>, StorageError> {
         self.lock()?
             .query_row(
-                "SELECT id FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC LIMIT 1",
+                "SELECT id FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1",
                 [workspace.display().to_string()],
                 |row| row.get(0),
             )
@@ -116,7 +176,7 @@ impl Storage {
     pub fn list_sessions(&self, workspace: &Path) -> Result<Vec<SessionSummary>, StorageError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT id, title FROM sessions WHERE workspace = ?1 ORDER BY updated_at DESC, created_at DESC",
+            "SELECT id, title FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC",
         )?;
         let rows = statement.query_map([workspace.display().to_string()], |row| {
             Ok(SessionSummary {
@@ -134,42 +194,344 @@ impl Storage {
         role: Role,
         content: &str,
     ) -> Result<(), StorageError> {
-        let role = match role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
+        let connection = self.lock()?;
+        let current_turn: Option<String> = connection
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let turn_id = current_turn
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        if current_turn.is_none() {
+            let now = Utc::now().to_rfc3339();
+            connection.execute(
+                "INSERT OR IGNORE INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+                params![turn_id, session_id, now],
+            )?;
+            connection.execute(
+                "UPDATE sessions SET head_turn_id = ?2 WHERE id = ?1",
+                params![session_id, turn_id],
+            )?;
+        }
+        if role == Role::User {
+            let child = Uuid::new_v4().to_string();
+            let now = Utc::now().to_rfc3339();
+            connection.execute(
+                "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![child, session_id, turn_id, now],
+            )?;
+            connection.execute(
+                "UPDATE sessions SET head_turn_id = ?2 WHERE id = ?1",
+                params![session_id, child],
+            )?;
+            return append_message_on_turn(&connection, session_id, &child, role, content);
+        }
+        append_message_on_turn(&connection, session_id, &turn_id, role, content)
+    }
+
+    pub fn append_context(
+        &self,
+        session_id: &str,
+        label: &str,
+        content: &str,
+    ) -> Result<(), StorageError> {
+        let connection = self.lock()?;
+        let turn_id: Option<String> = connection
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(turn_id) = turn_id else {
+            return Ok(());
         };
         let now = Utc::now().to_rfc3339();
-        let connection = self.lock()?;
         connection.execute(
-            "INSERT INTO messages(session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, role, content, now],
+            "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden, metadata) VALUES (?1, 'context', ?2, ?3, ?4, 'context', 0, ?5)",
+            params![session_id, content, now, turn_id, label],
         )?;
         connection.execute(
-            "UPDATE sessions SET updated_at = ?2, title = CASE WHEN title = 'New session' AND ?3 = 'user' THEN substr(?4, 1, 80) ELSE title END WHERE id = ?1",
-            params![session_id, now, role, content],
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session_id, now],
         )?;
         Ok(())
     }
 
+    pub fn append_thinking_summary(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<(), StorageError> {
+        self.append_typed_item(session_id, "thinking", "thinking_summary", content, None)
+    }
+
+    pub fn append_tool_calls(
+        &self,
+        session_id: &str,
+        calls: &[ToolCall],
+    ) -> Result<(), StorageError> {
+        let content = serde_json::to_string(calls)?;
+        self.append_typed_item(session_id, "assistant", "tool_calls", &content, None)
+    }
+
+    pub fn append_tool_output(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        output: &str,
+    ) -> Result<(), StorageError> {
+        self.append_typed_item(session_id, "tool", "tool_output", output, Some(call_id))
+    }
+
+    fn append_typed_item(
+        &self,
+        session_id: &str,
+        role: &str,
+        kind: &str,
+        content: &str,
+        metadata: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let connection = self.lock()?;
+        let turn_id: Option<String> = connection
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(turn_id) = turn_id else {
+            return Ok(());
+        };
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![session_id, role, content, now, turn_id, kind, metadata],
+        )?;
+        connection.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_session(&self, session_id: &str, title: &str) -> Result<(), StorageError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(());
+        }
+        let title = title.chars().take(120).collect::<String>();
+        self.lock()?.execute(
+            "UPDATE sessions SET title = ?2, updated_at = ?3 WHERE id = ?1 AND deleted_at IS NULL",
+            params![session_id, title, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<(), StorageError> {
+        self.lock()?.execute(
+            "UPDATE sessions SET deleted_at = ?2 WHERE id = ?1",
+            params![session_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn fork_session(&self, session_id: &str) -> Result<String, StorageError> {
+        let connection = self.lock()?;
+        let (workspace, title, mode, provider, model): (String, String, String, String, String) =
+            connection.query_row(
+                "SELECT workspace, title, mode, provider, model FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+        let new_id = Uuid::new_v4().to_string();
+        let root_turn = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![new_id, workspace, format!("{title} (fork)"), now, mode, provider, model, session_id, root_turn],
+        )?;
+        connection.execute(
+            "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+            params![root_turn, new_id, now],
+        )?;
+        let rows = {
+            let mut statement = connection.prepare(
+                "SELECT role, content, kind, hidden, metadata FROM messages WHERE session_id = ?1 ORDER BY id ASC",
+            )?;
+            statement
+                .query_map([session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (role, content, kind, hidden, metadata) in rows {
+            connection.execute(
+                "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![new_id, role, content, now, root_turn, kind, hidden, metadata],
+            )?;
+        }
+        Ok(new_id)
+    }
+
+    pub fn undo(&self, session_id: &str) -> Result<bool, StorageError> {
+        let connection = self.lock()?;
+        let head: Option<String> = connection
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(head) = head else { return Ok(false) };
+        let parent: Option<String> = connection.query_row(
+            "SELECT parent_id FROM turns WHERE id = ?1",
+            [&head],
+            |row| row.get(0),
+        )?;
+        let Some(parent) = parent else {
+            return Ok(false);
+        };
+        connection.execute(
+            "UPDATE sessions SET head_turn_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![session_id, parent, Utc::now().to_rfc3339()],
+        )?;
+        Ok(true)
+    }
+
+    pub fn redo(&self, session_id: &str) -> Result<bool, StorageError> {
+        let connection = self.lock()?;
+        let head: Option<String> = connection
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(head) = head else { return Ok(false) };
+        let child: Option<String> = connection
+            .query_row(
+                "SELECT id FROM turns WHERE session_id = ?1 AND parent_id = ?2 ORDER BY created_at DESC LIMIT 1",
+                params![session_id, head],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(child) = child else { return Ok(false) };
+        connection.execute(
+            "UPDATE sessions SET head_turn_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![session_id, child, Utc::now().to_rfc3339()],
+        )?;
+        Ok(true)
+    }
+
+    pub fn compact_session(&self, session_id: &str, keep: usize) -> Result<usize, StorageError> {
+        let connection = self.lock()?;
+        let ids = {
+            let mut statement = connection.prepare(
+                "SELECT id FROM messages WHERE session_id = ?1 AND hidden = 0 ORDER BY id DESC",
+            )?;
+            statement
+                .query_map([session_id], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let hidden = ids.into_iter().skip(keep).collect::<Vec<_>>();
+        for id in &hidden {
+            connection.execute("UPDATE messages SET hidden = 1 WHERE id = ?1", [id])?;
+        }
+        Ok(hidden.len())
+    }
+
+    pub fn set_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StorageError> {
+        self.lock()?.execute(
+            "UPDATE sessions SET mode = ?2, updated_at = ?3 WHERE id = ?1",
+            params![session_id, mode, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_mode(&self, session_id: &str) -> Result<String, StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT mode FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+    }
+
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<ConversationItem>, StorageError> {
         let connection = self.lock()?;
-        let mut statement = connection
-            .prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id ASC")?;
-        let rows = statement.query_map([session_id], |row| {
-            let role: String = row.get(0)?;
-            let role = match role.as_str() {
-                "system" => Role::System,
-                "assistant" => Role::Assistant,
-                _ => Role::User,
-            };
-            Ok(ConversationItem::Message {
-                role,
-                content: row.get(1)?,
+        let mut statement = connection.prepare(
+            "WITH RECURSIVE chain(id) AS (
+                 SELECT head_turn_id FROM sessions WHERE id = ?1
+                 UNION ALL
+                 SELECT turns.parent_id FROM turns JOIN chain ON turns.id = chain.id
+                 WHERE turns.parent_id IS NOT NULL
+             )
+             SELECT role, content, kind, metadata FROM messages
+             WHERE session_id = ?1 AND hidden = 0 AND (turn_id IN (SELECT id FROM chain) OR turn_id IS NULL)
+             ORDER BY id ASC",
+        )?;
+        let rows = statement
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(role, content, kind, metadata)| match kind.as_str() {
+                "context" => Ok(ConversationItem::Context {
+                    label: metadata.unwrap_or_else(|| "context".into()),
+                    content,
+                }),
+                "thinking_summary" => Ok(ConversationItem::ThinkingSummary { content }),
+                "tool_calls" => Ok(ConversationItem::AssistantToolCalls {
+                    calls: serde_json::from_str(&content)?,
+                }),
+                "tool_output" => Ok(ConversationItem::ToolOutput {
+                    call_id: metadata.unwrap_or_default(),
+                    output: content,
+                }),
+                _ if role == "context" => Ok(ConversationItem::Context {
+                    label: metadata.unwrap_or_else(|| "context".into()),
+                    content,
+                }),
+                _ => Ok(ConversationItem::Message {
+                    role: match role.as_str() {
+                        "system" => Role::System,
+                        "assistant" => Role::Assistant,
+                        _ => Role::User,
+                    },
+                    content,
+                }),
             })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+            .collect()
     }
 
     pub fn begin_tool(
@@ -224,9 +586,94 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    pub fn clear_response_id(&self, session_id: &str) -> Result<(), StorageError> {
+        self.lock()?.execute(
+            "DELETE FROM provider_state WHERE session_id = ?1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Poisoned)
     }
+}
+
+fn append_message_on_turn(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    role: Role,
+    content: &str,
+) -> Result<(), StorageError> {
+    let role_name = match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden) VALUES (?1, ?2, ?3, ?4, ?5, 'message', 0)",
+        params![session_id, role_name, content, now, turn_id],
+    )?;
+    connection.execute(
+        "UPDATE sessions SET updated_at = ?2, title = CASE WHEN title = 'New session' AND ?3 = 'user' THEN substr(?4, 1, 80) ELSE title END WHERE id = ?1",
+        params![session_id, now, role_name, content],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), StorageError> {
+    let exists = connection
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column);
+    if !exists {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_turns(connection: &Connection) -> Result<(), StorageError> {
+    let sessions = {
+        let mut statement = connection.prepare("SELECT id, head_turn_id FROM sessions")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (session_id, head) in sessions {
+        let turn_id = if let Some(head) = head {
+            head
+        } else {
+            let turn_id = Uuid::new_v4().to_string();
+            connection.execute(
+                "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+                params![turn_id, session_id, Utc::now().to_rfc3339()],
+            )?;
+            connection.execute(
+                "UPDATE sessions SET head_turn_id = ?2 WHERE id = ?1",
+                params![session_id, turn_id],
+            )?;
+            turn_id
+        };
+        connection.execute(
+            "UPDATE messages SET turn_id = ?2 WHERE session_id = ?1 AND turn_id IS NULL",
+            params![session_id, turn_id],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -256,5 +703,56 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session);
         assert_eq!(sessions[0].title, "hello");
+    }
+
+    #[test]
+    fn supports_fork_undo_redo_and_compaction() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        storage.append_message(&session, Role::User, "one").unwrap();
+        storage
+            .append_message(&session, Role::Assistant, "answer")
+            .unwrap();
+        storage.append_message(&session, Role::User, "two").unwrap();
+        assert!(storage.undo(&session).unwrap());
+        assert_eq!(storage.load_messages(&session).unwrap().len(), 2);
+        assert!(storage.redo(&session).unwrap());
+        assert_eq!(storage.load_messages(&session).unwrap().len(), 3);
+        assert!(storage.compact_session(&session, 1).unwrap() >= 1);
+        let fork = storage.fork_session(&session).unwrap();
+        assert_eq!(storage.load_messages(&fork).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn preserves_thinking_and_tool_order_for_display_restore() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        storage
+            .append_message(&session, Role::User, "inspect")
+            .unwrap();
+        storage
+            .append_thinking_summary(&session, "Checking the workspace")
+            .unwrap();
+        storage
+            .append_message(&session, Role::Assistant, "I will inspect it.")
+            .unwrap();
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path":"src/lib.rs"}),
+        };
+        storage.append_tool_calls(&session, &[call]).unwrap();
+        storage
+            .append_tool_output(&session, "call_1", "contents")
+            .unwrap();
+        let items = storage.load_messages(&session).unwrap();
+        assert!(matches!(items[1], ConversationItem::ThinkingSummary { .. }));
+        assert!(matches!(
+            items[3],
+            ConversationItem::AssistantToolCalls { .. }
+        ));
+        assert!(matches!(items[4], ConversationItem::ToolOutput { .. }));
     }
 }

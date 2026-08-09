@@ -125,6 +125,11 @@ fn chat_item(item: &ConversationItem) -> Option<Value> {
             "role": role_name(*role),
             "content": content,
         })),
+        ConversationItem::ThinkingSummary { .. } => None,
+        ConversationItem::Context { label, content } => Some(json!({
+            "role": "user",
+            "content": format!("[Context: {label}]\n{content}"),
+        })),
         ConversationItem::AssistantToolCalls { calls } => Some(json!({
             "role": "assistant",
             "tool_calls": calls.iter().map(|call| json!({
@@ -166,6 +171,11 @@ fn responses_item(item: &ConversationItem) -> Vec<Value> {
         ConversationItem::Message { role, content } => vec![json!({
             "role": role_name(*role),
             "content": content,
+        })],
+        ConversationItem::ThinkingSummary { .. } => Vec::new(),
+        ConversationItem::Context { label, content } => vec![json!({
+            "role": "user",
+            "content": format!("[Context: {label}]\n{content}"),
         })],
         ConversationItem::AssistantToolCalls { calls } => calls
             .iter()
@@ -252,6 +262,7 @@ pub(crate) fn parse_chat_event(value: &Value) -> Result<Vec<ModelEvent>, Provide
             });
         }
     }
+    append_native_search_events(value, &mut events);
     Ok(events)
 }
 
@@ -261,6 +272,7 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut events = Vec::new();
+    append_native_search_events(value, &mut events);
     match event_type {
         "response.created" | "response.in_progress" => {
             if let Some(id) = value.pointer("/response/id").and_then(Value::as_str) {
@@ -348,6 +360,70 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
         _ => {}
     }
     Ok(events)
+}
+
+// Some compatible gateways emit search events. Accept them defensively even
+// though 1H-Agent does not send provider-specific search request fields.
+fn append_native_search_events(value: &Value, events: &mut Vec<ModelEvent>) {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !event_type.contains("web_search") && !event_type.contains("search") {
+        return;
+    }
+    let result = value
+        .get("result")
+        .or_else(|| value.get("item"))
+        .or_else(|| value.get("source"));
+    if let Some(query) = value
+        .get("query")
+        .or_else(|| value.pointer("/search/query"))
+        .and_then(Value::as_str)
+    {
+        events.push(ModelEvent::WebSearchStarted {
+            query: bounded_text(query, 512),
+        });
+    }
+    if let Some(result) = result {
+        let title = result
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Search result");
+        let url = result
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let snippet = result
+            .get("snippet")
+            .or_else(|| result.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !url.is_empty() {
+            events.push(ModelEvent::WebSearchResult {
+                title: bounded_text(title, 256),
+                url: bounded_text(url, 2048),
+                snippet: bounded_text(snippet, 4096),
+            });
+        }
+    }
+    if event_type.contains("completed") || event_type.ends_with(".done") {
+        events.push(ModelEvent::WebSearchCompleted {
+            count: value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize,
+        });
+    }
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes.saturating_sub(3);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
 }
 
 fn response_slot(event: &Value, item: &Value) -> String {
@@ -472,5 +548,44 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(events, vec![ModelEvent::TextDelta("hello".into())]);
+    }
+
+    #[test]
+    fn parses_bounded_compatible_search_events() {
+        let events = parse_responses_event(&json!({
+            "type": "response.web_search.result",
+            "query": "rust async",
+            "result": {
+                "title": "Tokio",
+                "url": "https://tokio.rs",
+                "snippet": "runtime"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(ModelEvent::WebSearchStarted { query }) if query == "rust async"
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(ModelEvent::WebSearchResult { url, .. }) if url == "https://tokio.rs"
+        ));
+    }
+
+    #[test]
+    fn provider_body_uses_only_declared_function_tools() {
+        let request = ModelRequest {
+            kind: ProviderKind::ChatCompletions,
+            model: "deepseek-v4".into(),
+            items: vec![ConversationItem::Message {
+                role: Role::User,
+                content: "search".into(),
+            }],
+            tools: Vec::new(),
+            previous_response_id: None,
+        };
+        let body = chat_body(&request);
+        assert!(body.get("tools").is_none());
+        assert_eq!(body.pointer("/messages/0/content"), Some(&json!("search")));
     }
 }

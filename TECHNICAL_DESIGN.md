@@ -1,5 +1,8 @@
 # 1H-Agent Technical Design
 
+`1H` 指氕（protium，氢-1 同位素）。名称强调项目以最小运行时和最少状态
+提供高性能 Agent 能力。
+
 ## Architecture
 
 1H-Agent is one Tokio process. Crossterm produces terminal events, Ratatui
@@ -19,6 +22,34 @@ and Responses wire formats are isolated in their respective serializers and
 SSE parsers. The Agent runner owns the bounded multi-turn loop: collect a
 response, approve/execute requested tools, append function outputs, then call
 the model again up to the configured limit.
+
+The TUI input path is dependency-free. `InputBuffer` stores a UTF-8 byte
+cursor, bounded in-memory history, and multi-line editing state. `Command` is a
+static command enum used by slash commands, the `Ctrl+P` palette, and the
+`Ctrl+X` leader key. Crossterm events are the only source of redraws while
+idle; visible message lines and folded tool outputs are rendered from bounded
+snapshots.
+
+Runtime presentation uses independent `AgentPhase` and `ModelPhase` state
+machines. Model streaming therefore does not imply that the Agent is thinking,
+waiting for approval, or running a tool. Display entries are appended in event
+order, so a later text delta creates a new assistant segment after the latest
+tool result instead of mutating an earlier assistant block. Bounded thinking
+summaries and tool call/output items are persisted as typed message rows; they
+are restored for display but thinking summaries are excluded from provider
+request serialization.
+
+The footer also renders an allocation-free context estimate as a fixed-width
+Unicode ring. Provider-reported input tokens take precedence over the local
+conversation-byte estimate. Capacity comes from an explicit per-provider
+override or an exact/prefix model registry; unknown models show an unknown
+limit. Explicit limits are bounded between 4,096 and 10,000,000 tokens.
+
+DeepSeek's public API does not expose its consumer client's native web-search
+feature. The Agent instead receives ordinary `web_search` and `web_fetch`
+function tools. Search uses a text-only public endpoint, returns at most ten
+bounded result blocks and 64 KiB, and shares web fetch's redirect and SSRF
+validation. No browser or search runtime is bundled.
 
 ## OpenAI protocols
 
@@ -57,6 +88,11 @@ JSON Schema function definitions to the model and dispatches only known names.
   the explicit shell mode is approved.
 - Git is the installed executable with a validated subcommand/argument vector;
   repository reads may auto-run, while mutations and network operations do not.
+- `git_diff` is a read-only fixed-argument diff view. Direct `!` commands use
+  the platform shell only after an explicit approval and retain bounded output.
+- `browser_*` tools and `mcp:<server>:<tool>` tools are process-backed JSONL
+  adapters. They are started only when configured/enabled, have timeouts and
+  output caps, and never load a browser runtime or dynamic plugin ABI.
 
 The workspace root is canonicalized once. Existing targets are canonicalized
 before access. New targets require a canonical in-workspace parent. This blocks
@@ -73,10 +109,18 @@ execution result is recorded without secret values.
 
 SQLite uses bundled SQLite and WAL mode. Migrations create sessions, messages,
 tool calls, and provider state. Large tool output is truncated in memory; a
-future attachment store may retain an explicitly requested full output.
+future attachment store may retain an explicitly requested full output. The
+current migration adds session mode, soft deletion, turn heads, parent/child
+branches, message kinds, hidden rows, and bounded context attachments. Undo
+and redo move the session head through the turn tree; a new prompt after undo
+creates a new branch.
 The session sidebar is backed by the workspace-filtered SQLite session list;
 `Alt+Up/Down` reloads the selected history and rebinds the runner, while
 `Ctrl+N` creates and activates a new session.
+
+Configuration also supports per-tool `allow`/`ask`/`deny` overrides, custom
+prompt commands, named Plan/Build/Explore agents, an external browser bridge,
+and a minimal local stdio MCP server list. Configuration never stores API keys.
 
 Configuration precedence is CLI, environment, user TOML, defaults. Non-secret
 configuration is stored below the OS configuration directory; the SQLite file

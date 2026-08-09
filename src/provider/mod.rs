@@ -12,6 +12,8 @@ use crate::config::ProviderKind;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConversationItem {
     Message { role: Role, content: String },
+    ThinkingSummary { content: String },
+    Context { label: String, content: String },
     AssistantToolCalls { calls: Vec<ToolCall> },
     ToolOutput { call_id: String, output: String },
 }
@@ -49,6 +51,17 @@ pub struct ModelRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEvent {
+    WebSearchStarted {
+        query: String,
+    },
+    WebSearchResult {
+        title: String,
+        url: String,
+        snippet: String,
+    },
+    WebSearchCompleted {
+        count: usize,
+    },
     TextDelta(String),
     ToolCallDelta {
         slot: String,

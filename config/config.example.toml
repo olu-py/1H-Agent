@@ -4,6 +4,11 @@ kind = "responses"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5-mini"
 use_previous_response_id = false
+# Optional override for gateways or new models absent from the built-in registry.
+# context_window_tokens = 128000
+
+[ui]
+context_meter = true
 
 # Available presets: open_ai, deep_seek, qwen, volcano, custom.
 # Qwen's current China endpoint contains your Bailian WorkspaceId:
@@ -17,3 +22,40 @@ max_fetch_bytes = 10485760
 
 [security]
 allow_private_networks = false
+
+[permissions.tools]
+# file_write = "ask"
+# file_delete = "deny"
+# terminal_exec = "ask"
+# web_fetch = "allow"
+# web_search = "allow"
+
+[browser]
+enabled = false
+command = ""
+args = []
+timeout_seconds = 30
+max_output_bytes = 2097152
+keep_alive_seconds = 30
+
+# Custom slash commands expand {args} and {workspace} only.
+# [[commands]]
+# name = "review"
+# description = "Review the current change"
+# template = "Review the current git diff and list risks. {args}"
+
+# Local stdio MCP subset (tools/list and tools/call).
+# [[mcp_servers]]
+# name = "local-tools"
+# command = "my-mcp-server"
+# args = []
+# enabled = false
+# timeout_seconds = 30
+# max_output_bytes = 1048576
+
+# [[agents]]
+# name = "reviewer"
+# mode = "explore"
+# max_turns = 3
+# allowed_tools = ["file_read", "file_search", "git"]
+# system_prompt = "Review code for correctness and security."

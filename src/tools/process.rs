@@ -105,6 +105,36 @@ pub async fn execute_args(
     ))
 }
 
+/// Execute an explicitly requested shell command. The caller must perform an
+/// approval check before invoking this function.
+pub async fn execute_shell(
+    workspace: &Workspace,
+    command: &str,
+    runtime: &RuntimeConfig,
+) -> Result<String, ToolError> {
+    if command.trim().is_empty() {
+        return Err(ToolError::Execution(
+            "shell command must not be empty".into(),
+        ));
+    }
+    let args = if cfg!(windows) {
+        ExecArgs {
+            program: "cmd".into(),
+            args: vec!["/C".into(), command.into()],
+            cwd: ".".into(),
+            timeout_seconds: None,
+        }
+    } else {
+        ExecArgs {
+            program: "sh".into(),
+            args: vec!["-c".into(), command.into()],
+            cwd: ".".into(),
+            timeout_seconds: None,
+        }
+    };
+    execute_args(workspace, args, runtime).await
+}
+
 struct ProcessTreeGuard {
     pid: Option<u32>,
     armed: bool,

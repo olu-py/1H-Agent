@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -6,12 +7,20 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::commands::AgentMode;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub provider: ProviderConfig,
+    pub ui: UiConfig,
     pub runtime: RuntimeConfig,
     pub security: SecurityConfig,
+    pub permissions: PermissionConfig,
+    pub browser: BrowserConfig,
+    pub commands: Vec<CustomCommandConfig>,
+    pub agents: Vec<AgentConfig>,
+    pub mcp_servers: Vec<McpServerConfig>,
     #[serde(skip)]
     pub data_dir: PathBuf,
     #[serde(skip)]
@@ -26,6 +35,21 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub model: String,
     pub use_previous_response_id: bool,
+    pub context_window_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub context_meter: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            context_meter: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -62,12 +86,89 @@ pub struct SecurityConfig {
     pub allow_private_networks: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PermissionConfig {
+    pub tools: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BrowserConfig {
+    pub enabled: bool,
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_seconds: u64,
+    pub max_output_bytes: usize,
+    pub keep_alive_seconds: u64,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: String::new(),
+            args: Vec::new(),
+            timeout_seconds: 30,
+            max_output_bytes: 2 * 1024 * 1024,
+            keep_alive_seconds: 30,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CustomCommandConfig {
+    pub name: String,
+    pub description: String,
+    pub template: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub name: String,
+    pub mode: AgentMode,
+    pub max_turns: usize,
+    pub allowed_tools: Vec<String>,
+    pub system_prompt: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mode: AgentMode::Explore,
+            max_turns: 3,
+            allowed_tools: Vec::new(),
+            system_prompt: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+    pub timeout_seconds: u64,
+    pub max_output_bytes: usize,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             provider: ProviderConfig::default(),
+            ui: UiConfig::default(),
             runtime: RuntimeConfig::default(),
             security: SecurityConfig::default(),
+            permissions: PermissionConfig::default(),
+            browser: BrowserConfig::default(),
+            commands: Vec::new(),
+            agents: Vec::new(),
+            mcp_servers: Vec::new(),
             data_dir: PathBuf::new(),
             config_path: None,
         }
@@ -82,6 +183,7 @@ impl Default for ProviderConfig {
             base_url: "https://api.openai.com/v1".into(),
             model: "gpt-5-mini".into(),
             use_previous_response_id: false,
+            context_window_tokens: None,
         }
     }
 }
@@ -129,8 +231,31 @@ impl Config {
         }
 
         config.provider.validate()?;
+        if let Some(limit) = config.provider.context_window_tokens {
+            if limit < 4096 {
+                anyhow::bail!("provider.context_window_tokens must be at least 4096");
+            }
+            config.provider.context_window_tokens = Some(limit.min(10_000_000));
+        }
         if config.runtime.max_agent_turns == 0 || config.runtime.max_agent_turns > 32 {
             anyhow::bail!("max_agent_turns must be between 1 and 32");
+        }
+        if config.browser.timeout_seconds == 0 || config.browser.timeout_seconds > 3600 {
+            anyhow::bail!("browser timeout must be between 1 and 3600 seconds");
+        }
+        config.browser.max_output_bytes = config.browser.max_output_bytes.min(8 * 1024 * 1024);
+        config.browser.keep_alive_seconds = config.browser.keep_alive_seconds.min(300);
+        for agent in &mut config.agents {
+            agent.max_turns = agent.max_turns.clamp(1, 8);
+        }
+        for (tool, permission) in &config.permissions.tools {
+            if !matches!(permission.as_str(), "allow" | "ask" | "deny") {
+                anyhow::bail!("permission for {tool} must be allow, ask, or deny");
+            }
+        }
+        for server in &mut config.mcp_servers {
+            server.timeout_seconds = server.timeout_seconds.clamp(1, 3600);
+            server.max_output_bytes = server.max_output_bytes.clamp(1024, 8 * 1024 * 1024);
         }
 
         config.data_dir = env::var_os("AGENT_DATA_DIR")
@@ -158,6 +283,11 @@ impl Config {
 }
 
 impl ProviderConfig {
+    pub fn resolved_context_window_tokens(&self) -> Option<u64> {
+        self.context_window_tokens
+            .or_else(|| known_context_window(&self.model))
+    }
+
     pub fn validate(&mut self) -> Result<()> {
         self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
         self.model = self.model.trim().to_owned();
@@ -245,11 +375,29 @@ impl ProviderPreset {
             base_url: base_url.into(),
             model: model.into(),
             use_previous_response_id: false,
+            context_window_tokens: None,
         }
     }
 
     pub fn supports_responses(self) -> bool {
         matches!(self, Self::OpenAi | Self::DeepSeek | Self::Custom)
+    }
+}
+
+fn known_context_window(model: &str) -> Option<u64> {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gpt-5") {
+        Some(400_000)
+    } else if model.starts_with("gpt-4.1") {
+        Some(1_047_576)
+    } else if model.starts_with("gpt-4o")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || matches!(model.as_str(), "deepseek-chat" | "deepseek-reasoner")
+    {
+        Some(128_000)
+    } else {
+        None
     }
 }
 
@@ -296,5 +444,22 @@ mod tests {
         assert!(qwen.validate().is_err());
         qwen.base_url = qwen.base_url.replace("{WorkspaceId}", "ws-example");
         assert!(qwen.validate().is_ok());
+    }
+
+    #[test]
+    fn context_window_uses_registry_without_guessing_unknown_models() {
+        let mut provider = ProviderPreset::DeepSeek.defaults();
+        provider.model = "deepseek-chat".into();
+        assert_eq!(provider.resolved_context_window_tokens(), Some(128_000));
+
+        provider.model = "deepseek-v4-flash".into();
+        assert_eq!(provider.resolved_context_window_tokens(), None);
+    }
+
+    #[test]
+    fn explicit_context_window_override_wins() {
+        let mut provider = ProviderPreset::OpenAi.defaults();
+        provider.context_window_tokens = Some(32_768);
+        assert_eq!(provider.resolved_context_window_tokens(), Some(32_768));
     }
 }
