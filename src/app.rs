@@ -239,7 +239,15 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
                 ),
             )
         }
-        Err(_) => (None, None, "需要配置提供商".into()),
+        Err(secrets::SecretError::Missing(_)) => (None, None, "需要配置提供商".into()),
+        Err(error) => (
+            None,
+            None,
+            format!(
+                "系统密钥环读取失败：{}",
+                secrets::redact(&error.to_string())
+            ),
+        ),
     };
     let entries = display_entries(&conversation);
     let initial_mode = storage
@@ -1200,11 +1208,21 @@ fn apply_settings(app: &mut App) -> Result<()> {
     let key_warning = if !entered_key.is_empty() {
         secrets::store_api_key(provider_config.preset, entered_key)
             .err()
-            .map(|_| "API key is session-only")
+            .map(|error| {
+                format!(
+                    "API Key 仅本次运行有效：{}",
+                    secrets::redact(&error.to_string())
+                )
+            })
     } else {
         None
     };
-    let config_warning = app.config.save().err().map(|_| "config is session-only");
+    let config_warning = app.config.save().err().map(|error| {
+        format!(
+            "配置仅本次运行有效：{}",
+            secrets::redact(&error.to_string())
+        )
+    });
     let warnings = [key_warning, config_warning]
         .into_iter()
         .flatten()
