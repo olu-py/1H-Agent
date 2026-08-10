@@ -2,45 +2,127 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
-  portable:
-    runs-on: ${{ matrix.os }}
+  verify:
+    name: Verify (${{ matrix.os }})
     strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: verify
+    strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: 1h-agent-linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            slug: linux-x86_64
+            binary: 1h-agent
+            archive: tar.gz
           - os: windows-latest
-            artifact: 1h-agent-windows-x86_64
+            target: x86_64-pc-windows-msvc
+            slug: windows-x86_64
+            binary: 1h-agent.exe
+            archive: zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            slug: macos-x86_64
+            binary: 1h-agent
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            slug: macos-aarch64
+            binary: 1h-agent
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build optimized binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
       - name: Package Linux archive
         if: runner.os == 'Linux'
-        run: bash scripts/package-linux.sh "${{ matrix.artifact }}" ../1H-Agent-Release
+        shell: bash
+        run: |
+          package="1h-agent-${GITHUB_REF_NAME}-${{ matrix.slug }}"
+          mkdir -p "dist/${package}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${package}/"
+          cp README.md LICENSE config/config.example.toml "dist/${package}/"
+          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+
       - name: Package Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/package-windows.ps1 -Name "${{ matrix.artifact }}" -OutputDir ../1H-Agent-Release
-      - uses: actions/upload-artifact@v4
+        run: |
+          $package = "1h-agent-${{ github.ref_name }}-${{ matrix.slug }}"
+          New-Item -ItemType Directory -Path "dist/$package" -Force
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$package/"
+          Copy-Item README.md, LICENSE, config/config.example.toml "dist/$package/"
+          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
+
+      - name: Package macOS archive
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          package="1h-agent-${GITHUB_REF_NAME}-${{ matrix.slug }}"
+          mkdir -p "dist/${package}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${package}/"
+          cp README.md LICENSE config/config.example.toml "dist/${package}/"
+          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ../1H-Agent-Release/*
+          name: 1h-agent-${{ github.ref_name }}-${{ matrix.slug }}
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
 
   installers:
-    runs-on: ${{ matrix.os }}
+    name: Installer (${{ matrix.os }})
+    needs: verify
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            slug: linux-deb
+            path: target/debian/*.deb
+          - os: windows-latest
+            slug: windows-msi
+            path: target/wix/*.msi
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
       - name: Build deb
         if: runner.os == 'Linux'
         run: |
@@ -53,9 +135,32 @@ jobs:
           cargo install cargo-wix --locked
           cargo wix init
           cargo wix --nocapture
-      - uses: actions/upload-artifact@v4
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
         with:
-          name: installers-${{ runner.os }}
-          path: |
-            target/debian/*.deb
-            target/wix/*.msi
+          name: 1h-agent-${{ github.ref_name }}-${{ matrix.slug }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build, installers]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: release-artifacts
+        run: find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-artifacts/* \
+            --verify-tag \
+            --generate-notes \
+            --title "1H-Agent ${GITHUB_REF_NAME}"

@@ -136,11 +136,12 @@ uses `.1h-agent` below the workspace. Recognized environment variables include
 
 ## Cross-platform behavior
 
-Linux processes start in their own process group and the group is terminated on
-timeout. Windows uses a new process group and `taskkill /T` as the process-tree
-fallback. Input, resize, UTF-8 rendering, Ctrl+C, and terminal restoration are
-tested natively on both systems. Release CI builds portable archives first;
-`cargo-deb` and WiX packaging are release gates rather than runtime dependencies.
+Linux and macOS processes start in their own process group and the group is
+terminated on timeout. Windows uses a new process group and `taskkill /T` as
+the process-tree fallback. Input, resize, UTF-8 rendering, Ctrl+C, and terminal
+restoration are tested natively on all three systems. Release CI builds
+portable archives first; `cargo-deb` and WiX packaging are release gates rather
+than runtime dependencies.
 
 ## Verification
 
@@ -148,5 +149,5 @@ Unit fixtures cover fragmented SSE frames, Chat and Responses text/tool events,
 path/symlink escapes, private-address rejection, approval classification,
 redaction, output limits, and config precedence. Integration tests use temporary
 workspaces and Git repositories. CI runs formatting checks, Clippy with warnings
-denied, tests, and release builds on Linux and Windows. Linux additionally checks
-the musl build when system prerequisites are available.
+denied, tests, and release builds on Linux, macOS, and Windows. Linux additionally
+checks the musl build when system prerequisites are available.

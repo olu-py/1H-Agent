@@ -3,9 +3,9 @@
 `1H` 指氕（protium），即氢元素最轻、最常见的氢-1 同位素；项目名称表达
 轻量、基础而高效的 Agent 核心，而不是泛指的“1 小时”。
 
-1H-Agent is a lightweight, permission-aware terminal agent for Linux and
-Windows. It uses a native Rust TUI and supports both OpenAI Chat Completions
-and Responses endpoints.
+1H-Agent is a lightweight, permission-aware terminal agent for Linux, macOS,
+and Windows. It uses a native Rust TUI and supports both OpenAI Chat
+Completions and Responses endpoints.
 
 ## Status
 
@@ -20,6 +20,33 @@ and remote Git operations require approval.
 - Git for Git tools
 - A UTF-8 terminal
 - `OPENAI_API_KEY` for OpenAI requests
+
+## Download a release
+
+GitHub Releases provide ready-to-run archives for Linux x86_64, Windows x86_64,
+macOS Intel, and macOS Apple Silicon. Each archive contains the native
+`1h-agent` executable, the example configuration, README, and license. Verify
+downloads with the published `SHA256SUMS.txt` file.
+
+On Windows, extract the zip and run in PowerShell:
+
+```powershell
+.\1h-agent.exe --workspace C:\path\to\project
+```
+
+On macOS, choose `macos-aarch64` for Apple Silicon or `macos-x86_64` for an
+Intel Mac, extract the archive, and run in Terminal:
+
+```bash
+./1h-agent --workspace /path/to/project
+```
+
+Release binaries are currently unsigned. If macOS quarantine blocks the first
+launch, review the downloaded file and remove only its quarantine attribute:
+
+```bash
+xattr -d com.apple.quarantine ./1h-agent
+```
 
 ## Run
 

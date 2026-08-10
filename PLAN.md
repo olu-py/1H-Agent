@@ -4,10 +4,10 @@
 
 ## Goal
 
-Deliver a low-memory TUI agent for Linux and Windows that can converse through
-OpenAI Chat Completions or Responses and safely operate on a selected local
-workspace. The process stays native and single-binary; Node.js, Python, Docker,
-and a local model are not runtime dependencies.
+Deliver a low-memory TUI agent for Linux, macOS, and Windows that can converse
+through OpenAI Chat Completions or Responses and safely operate on a selected
+local workspace. The process stays native and single-binary; Node.js, Python,
+Docker, and a local model are not runtime dependencies.
 
 ## Delivery phases
 
@@ -18,9 +18,10 @@ and a local model are not runtime dependencies.
 3. **Tools**: workspace files, public HTTP fetch, controlled processes, Git,
    approval flow, timeouts, bounded output, audit records.
 4. **Hardening**: path and symlink escape tests, SSRF checks, secret redaction,
-   process-tree cleanup, crash recovery, Windows behavior tests.
-5. **Release**: Linux `tar.gz` and `deb`, Windows `zip` and `msi`, hashes,
-   native CI builds, startup and memory benchmarks.
+   process-tree cleanup, crash recovery, Windows and macOS behavior tests.
+5. **Release**: Linux `tar.gz` and `deb`, Windows `zip` and `msi`, macOS Intel
+   and Apple Silicon `tar.gz`, hashes, native CI builds, startup and memory
+   benchmarks.
 
 ## Acceptance criteria
 
@@ -31,7 +32,7 @@ and a local model are not runtime dependencies.
 - Tool output and channels are bounded; large output cannot grow memory without
   limit.
 - Terminal modes are restored after normal exit, cancellation, or an error.
-- Linux and Windows native CI compile and run the automated test suite.
+- Linux, macOS, and Windows native CI compile and run the automated test suite.
 - Normal interactive memory is targeted at 20-50 MB and idle CPU at effectively
   zero; measured results are recorded before the first release.
 
@@ -40,7 +41,8 @@ and a local model are not runtime dependencies.
 The approved environment is `1H-Agent Rust development toolchain`: rustup
 minimal, Rust stable, Cargo, rustfmt, Clippy, and Linux GNU/musl targets. The
 toolchain and build cache have a 5 GB budget. Windows artifacts are built on a
-native Windows CI runner instead of installing MinGW/WiX locally.
+native Windows CI runner instead of installing MinGW/WiX locally; macOS release
+archives cover both Intel and Apple Silicon.
 
 ## Current release boundaries
 
@@ -55,10 +57,10 @@ and provider-native Anthropic/Gemini protocols remain excluded.
 
 ## Verification snapshot
 
-On the development host, formatting, Clippy with warnings denied, 28 unit
+On the development host, formatting, Clippy with warnings denied, 45 unit
 tests, 2 integration tests, and the optimized release build pass. The current
 release binary is approximately 5.6 MiB. Existing idle measurements remain the
 baseline: about 8.3 MiB RSS on Linux, 3.3 MiB on macOS, and effectively zero
 idle CPU. The musl check requires the approved `musl-tools` system package;
-Windows compilation and installers are defined in CI and must be confirmed on
-a native runner.
+Windows compilation/installers and both macOS architectures are defined in CI
+and must be confirmed on their hosted runners.
