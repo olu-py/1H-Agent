@@ -22,6 +22,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libdbus-1-dev pkg-config
       - name: Formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check

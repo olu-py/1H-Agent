@@ -213,11 +213,10 @@ fn format_result(response: Value, max_output_bytes: usize) -> Result<String, Too
     Ok(output)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exchanges_bounded_jsonl_with_a_local_process() {
         let response = call_stdio(
