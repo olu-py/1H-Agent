@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A lightweight, permission-aware TUI agent for Linux, macOS, and Windows"
+authors = ["1H-Agent contributors"]
 license-file = "LICENSE"
 
 [[bin]]
@@ -62,3 +63,6 @@ assets = [
   ["README.md", "usr/share/doc/1h-agent/README.md", "644"],
   ["config/config.example.toml", "usr/share/doc/1h-agent/config.example.toml", "644"],
 ]
+
+[package.metadata.wix]
+eula = false
