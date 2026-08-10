@@ -271,6 +271,20 @@ impl Storage {
         self.append_typed_item(session_id, "thinking", "thinking_summary", content, None)
     }
 
+    pub fn append_provider_item(
+        &self,
+        session_id: &str,
+        item: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        self.append_typed_item(
+            session_id,
+            "assistant",
+            "provider_item",
+            &serde_json::to_string(item)?,
+            None,
+        )
+    }
+
     pub fn append_tool_calls(
         &self,
         session_id: &str,
@@ -511,6 +525,9 @@ impl Storage {
                     content,
                 }),
                 "thinking_summary" => Ok(ConversationItem::ThinkingSummary { content }),
+                "provider_item" => Ok(ConversationItem::ProviderItem {
+                    item: serde_json::from_str(&content)?,
+                }),
                 "tool_calls" => Ok(ConversationItem::AssistantToolCalls {
                     calls: serde_json::from_str(&content)?,
                 }),
@@ -754,5 +771,31 @@ mod tests {
             ConversationItem::AssistantToolCalls { .. }
         ));
         assert!(matches!(items[4], ConversationItem::ToolOutput { .. }));
+    }
+
+    #[test]
+    fn persists_provider_items_for_stateless_responses_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&root.path().join("agent.db")).unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        storage
+            .append_message(&session, Role::User, "search")
+            .unwrap();
+        storage
+            .append_provider_item(
+                &session,
+                &serde_json::json!({
+                    "id": "ws_1",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {"type":"search", "query":"Rust"}
+                }),
+            )
+            .unwrap();
+        let items = storage.load_messages(&session).unwrap();
+        assert!(matches!(
+            &items[1],
+            ConversationItem::ProviderItem { item } if item["id"] == "ws_1"
+        ));
     }
 }

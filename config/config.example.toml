@@ -4,6 +4,8 @@ kind = "responses"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5-mini"
 use_previous_response_id = false
+# auto | enabled | disabled; DeepSeek Responses API only
+native_web_search = "auto"
 # Optional override for gateways or new models absent from the built-in registry.
 # context_window_tokens = 128000
 

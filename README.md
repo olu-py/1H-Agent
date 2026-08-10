@@ -71,11 +71,11 @@ model limits. Unknown models display an unknown limit instead of assuming
 128,000 tokens. Provider input-token usage takes precedence over the local
 allocation-free estimate. At 85% it recommends `/compact`.
 
-DeepSeek's public Chat Completions API does not expose the native search feature
-from its consumer client. 1H-Agent therefore provides a lightweight
-`web_search` function tool backed by a bounded, text-only public search request,
-plus `web_fetch` for reading a selected URL. Both use the same redirect, output,
-timeout, and SSRF controls and require no browser runtime.
+DeepSeek's Responses API supports provider-hosted web search for
+`deepseek-v4-flash`. The DeepSeek preset uses Responses and enables the native
+`web_search` tool by default; set `provider.native_web_search = "disabled"` to
+turn it off. Chat Completions and other providers retain 1H-Agent's lightweight
+bounded text-search function plus `web_fetch`. No browser runtime is required.
 
 Built-in slash commands include `/help`, `/new`, `/sessions`, `/rename`,
 `/delete`, `/fork`, `/undo`, `/redo`, `/compact`, `/export`, `/diff`,

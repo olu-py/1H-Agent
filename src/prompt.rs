@@ -15,7 +15,7 @@ pub fn system_prompt(preset: ProviderPreset, mode: AgentMode) -> String {
         }
     };
     let provider = if preset == ProviderPreset::DeepSeek {
-        "For DeepSeek models, preserve this stable prefix and tool schemas, avoid repeating long context, follow the user's intent precisely, and give concise conclusions without exposing private chain-of-thought. For current or external information, call web_search first, then web_fetch for a selected URL when more detail is required; do not claim access to DeepSeek client-product search."
+        "For DeepSeek models, preserve this stable prefix and tool schemas, avoid repeating long context, follow the user's intent precisely, and give concise conclusions without exposing private chain-of-thought. For current or external information, use the available web_search tool first; under the Responses API this is DeepSeek's server-side search, while other protocols may use 1H-Agent's bounded text search. Use web_fetch only when a selected URL needs more detail."
     } else {
         "Preserve stable instructions and tool schemas, avoid repeating long context, and give concise conclusions without exposing private chain-of-thought."
     };

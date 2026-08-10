@@ -35,7 +35,17 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub model: String,
     pub use_previous_response_id: bool,
+    pub native_web_search: NativeWebSearch,
     pub context_window_tokens: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeWebSearch {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -183,6 +193,7 @@ impl Default for ProviderConfig {
             base_url: "https://api.openai.com/v1".into(),
             model: "gpt-5-mini".into(),
             use_previous_response_id: false,
+            native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
         }
     }
@@ -308,6 +319,9 @@ impl ProviderConfig {
             self.kind = ProviderKind::ChatCompletions;
             self.use_previous_response_id = false;
         }
+        if !self.preset.supports_previous_response_id() {
+            self.use_previous_response_id = false;
+        }
         Ok(())
     }
 }
@@ -349,7 +363,7 @@ impl ProviderPreset {
                 "gpt-5-mini",
             ),
             Self::DeepSeek => (
-                ProviderKind::ChatCompletions,
+                ProviderKind::Responses,
                 "https://api.deepseek.com",
                 "deepseek-v4-flash",
             ),
@@ -375,12 +389,17 @@ impl ProviderPreset {
             base_url: base_url.into(),
             model: model.into(),
             use_previous_response_id: false,
+            native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
         }
     }
 
     pub fn supports_responses(self) -> bool {
         matches!(self, Self::OpenAi | Self::DeepSeek | Self::Custom)
+    }
+
+    pub fn supports_previous_response_id(self) -> bool {
+        !matches!(self, Self::DeepSeek)
     }
 }
 
@@ -431,6 +450,7 @@ mod tests {
         let deepseek = ProviderPreset::DeepSeek.defaults();
         assert_eq!(deepseek.model, "deepseek-v4-flash");
         assert_eq!(deepseek.base_url, "https://api.deepseek.com");
+        assert_eq!(deepseek.kind, ProviderKind::Responses);
         let qwen = ProviderPreset::Qwen.defaults();
         assert!(qwen.base_url.contains("{WorkspaceId}"));
         assert_eq!(qwen.kind, ProviderKind::ChatCompletions);
@@ -461,5 +481,14 @@ mod tests {
         let mut provider = ProviderPreset::OpenAi.defaults();
         provider.context_window_tokens = Some(32_768);
         assert_eq!(provider.resolved_context_window_tokens(), Some(32_768));
+    }
+
+    #[test]
+    fn deepseek_responses_is_stateless_and_native_search_defaults_to_auto() {
+        let mut provider = ProviderPreset::DeepSeek.defaults();
+        provider.use_previous_response_id = true;
+        provider.validate().unwrap();
+        assert!(!provider.use_previous_response_id);
+        assert_eq!(provider.native_web_search, NativeWebSearch::Auto);
     }
 }

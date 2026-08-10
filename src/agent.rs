@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    config::{ProviderConfig, RuntimeConfig},
+    config::{NativeWebSearch, ProviderConfig, ProviderKind, ProviderPreset, RuntimeConfig},
     prompt,
     provider::{ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ToolCall, Usage},
     security::PolicyDecision,
@@ -129,6 +129,9 @@ impl AgentRunner {
             "正在以 {} 模式分析请求，并选择下一项安全操作。",
             self.tools.mode().as_str().to_ascii_uppercase()
         );
+        let native_web_search = self.provider_config.preset == ProviderPreset::DeepSeek
+            && self.provider_config.kind == ProviderKind::Responses
+            && self.provider_config.native_web_search != NativeWebSearch::Disabled;
         for _turn in 0..self.runtime.max_agent_turns {
             let summary = next_summary.clone();
             ui_events
@@ -165,6 +168,7 @@ impl AgentRunner {
                 items: request_items,
                 tools: self.tools.definitions(),
                 previous_response_id: previous_response_id.clone(),
+                native_web_search,
             };
             let (model_tx, mut model_rx) = mpsc::channel(128);
             ui_events
@@ -230,6 +234,16 @@ impl AgentRunner {
                             .await
                             .map_err(|_| "UI event receiver closed".to_owned())?;
                     }
+                    ModelEvent::ProviderItem(item) => {
+                        let encoded = serde_json::to_vec(&item)
+                            .map_err(|error| format!("invalid provider item: {error}"))?;
+                        if encoded.len() <= 64 * 1024 {
+                            items.push(ConversationItem::ProviderItem { item: item.clone() });
+                            self.storage
+                                .append_provider_item(&self.session_id, &item)
+                                .map_err(|error| error.to_string())?;
+                        }
+                    }
                     ModelEvent::TextDelta(delta) => {
                         assistant_text.push_str(&delta);
                         ui_events
@@ -259,10 +273,10 @@ impl AgentRunner {
                     ModelEvent::ResponseId(id) => {
                         if self.provider_config.use_previous_response_id {
                             previous_response_id = Some(id.clone());
+                            self.storage
+                                .save_response_id(&self.session_id, &id)
+                                .map_err(|error| error.to_string())?;
                         }
-                        self.storage
-                            .save_response_id(&self.session_id, &id)
-                            .map_err(|error| error.to_string())?;
                     }
                     ModelEvent::Usage(usage) => {
                         let _ = ui_events.send(AgentEvent::Usage(usage)).await;
@@ -458,12 +472,16 @@ impl AgentRunner {
                             | "file_stat"
                             | "file_read"
                             | "file_search"
+                            | "web_search"
                             | "web_fetch"
                             | "git_diff"
                     )
                 })
                 .collect(),
             previous_response_id: None,
+            native_web_search: provider_config.preset == ProviderPreset::DeepSeek
+                && provider_config.kind == ProviderKind::Responses
+                && provider_config.native_web_search != NativeWebSearch::Disabled,
         };
         let (events, mut receiver) = mpsc::channel(512);
         let provider = self.provider.clone();
@@ -487,6 +505,7 @@ impl AgentRunner {
                 | ModelEvent::WebSearchStarted { .. }
                 | ModelEvent::WebSearchResult { .. }
                 | ModelEvent::WebSearchCompleted { .. }
+                | ModelEvent::ProviderItem(_)
                 | ModelEvent::ToolCallDelta { .. }
                 | ModelEvent::ToolCallComplete(_) => {}
             }

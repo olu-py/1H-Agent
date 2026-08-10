@@ -1277,7 +1277,11 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::WebSearchCompleted { count } => {
             app.agent_phase = AgentPhase::Thinking;
-            app.status = format!("联网搜索完成：{count} 条结果");
+            app.status = if count == 0 {
+                "联网搜索完成".into()
+            } else {
+                format!("联网搜索完成：{count} 条结果")
+            };
         }
         AgentEvent::Cancelled(reason) => {
             app.busy = false;
@@ -1588,6 +1592,17 @@ fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(format!("### @{label}\n\n{content}")),
             }),
+            ConversationItem::ProviderItem { item } => {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("web_search_call") {
+                    entries.push(DisplayEntry {
+                        kind: DisplayKind::Tool,
+                        content: DisplayContent::ToolCall {
+                            name: "DeepSeek web_search".into(),
+                            arguments: item.get("action").cloned().unwrap_or_default(),
+                        },
+                    });
+                }
+            }
             ConversationItem::AssistantToolCalls { calls } => {
                 for call in calls {
                     tool_names.insert(call.id.clone(), call.name.clone());
@@ -1675,6 +1690,7 @@ fn conversation_bytes(items: &[ConversationItem]) -> usize {
             ConversationItem::Message { content, .. }
             | ConversationItem::Context { content, .. } => content.len(),
             ConversationItem::ThinkingSummary { .. } => 0,
+            ConversationItem::ProviderItem { item } => item.to_string().len(),
             ConversationItem::AssistantToolCalls { calls } => calls
                 .iter()
                 .map(|call| call.name.len() + call.arguments.to_string().len())

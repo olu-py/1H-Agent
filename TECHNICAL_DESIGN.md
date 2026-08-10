@@ -45,11 +45,13 @@ conversation-byte estimate. Capacity comes from an explicit per-provider
 override or an exact/prefix model registry; unknown models show an unknown
 limit. Explicit limits are bounded between 4,096 and 10,000,000 tokens.
 
-DeepSeek's public API does not expose its consumer client's native web-search
-feature. The Agent instead receives ordinary `web_search` and `web_fetch`
-function tools. Search uses a text-only public endpoint, returns at most ten
-bounded result blocks and 64 KiB, and shares web fetch's redirect and SSRF
-validation. No browser or search runtime is bundled.
+DeepSeek Responses requests may include the provider-hosted
+`{"type":"web_search"}` tool. When enabled, the local function with the same
+name is omitted from that request. Search status events and URL citations are
+bounded before display, while completed `reasoning` and `web_search_call` items
+are persisted and replayed because DeepSeek Responses is stateless. Chat and
+other providers retain the bounded text-search function and SSRF-protected
+`web_fetch`; no browser or search runtime is bundled.
 
 ## OpenAI protocols
 
@@ -68,12 +70,14 @@ entered key remains in process memory for that session only. Keys are never
 serialized to TOML, SQLite, or logs.
 
 Built-in presets use current official compatibility settings: OpenAI;
-DeepSeek (`https://api.deepseek.com`, `deepseek-v4-flash`); Qwen/Bailian
+DeepSeek Responses (`https://api.deepseek.com`, `deepseek-v4-flash`); Qwen/Bailian
 (`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`,
 `qwen3.8-max`); and Volcano Ark
 (`https://ark.cn-beijing.volces.com/api/v3`,
 `doubao-seed-2-1-pro-260628`). Qwen and Volcano default to Chat Completions;
 unsupported Responses selection is forced back to Chat during validation.
+DeepSeek never sends `previous_response_id`, because its Responses endpoint is
+stateless and requires the relevant input items to be replayed locally.
 
 ## Tools and policy
 

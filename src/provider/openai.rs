@@ -130,6 +130,7 @@ fn chat_item(item: &ConversationItem) -> Option<Value> {
             "role": "user",
             "content": format!("[Context: {label}]\n{content}"),
         })),
+        ConversationItem::ProviderItem { .. } => None,
         ConversationItem::AssistantToolCalls { calls } => Some(json!({
             "role": "assistant",
             "tool_calls": calls.iter().map(|call| json!({
@@ -150,13 +151,42 @@ fn chat_item(item: &ConversationItem) -> Option<Value> {
 }
 
 fn responses_body(request: &ModelRequest) -> Value {
-    let input: Vec<Value> = request.items.iter().flat_map(responses_item).collect();
-    let tools: Vec<Value> = request.tools.iter().map(responses_tool).collect();
+    let mut instructions = None;
+    let input: Vec<Value> = request
+        .items
+        .iter()
+        .filter(|item| {
+            if instructions.is_none()
+                && let ConversationItem::Message {
+                    role: Role::System,
+                    content,
+                } = item
+            {
+                instructions = Some(content.clone());
+                false
+            } else {
+                true
+            }
+        })
+        .flat_map(responses_item)
+        .collect();
+    let mut tools: Vec<Value> = request
+        .tools
+        .iter()
+        .filter(|tool| !(request.native_web_search && tool.name == "web_search"))
+        .map(responses_tool)
+        .collect();
+    if request.native_web_search {
+        tools.push(json!({"type": "web_search"}));
+    }
     let mut body = json!({
         "model": request.model,
         "input": input,
         "stream": true,
     });
+    if let Some(instructions) = instructions {
+        body["instructions"] = Value::String(instructions);
+    }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
@@ -177,6 +207,7 @@ fn responses_item(item: &ConversationItem) -> Vec<Value> {
             "role": "user",
             "content": format!("[Context: {label}]\n{content}"),
         })],
+        ConversationItem::ProviderItem { item } => vec![item.clone()],
         ConversationItem::AssistantToolCalls { calls } => calls
             .iter()
             .map(|call| {
@@ -316,26 +347,32 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
         }
         "response.output_item.done" => {
             let item = value.get("item").unwrap_or(&Value::Null);
-            if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                events.push(ModelEvent::ToolCallComplete(ToolCall {
-                    id: item
-                        .get("call_id")
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    let arguments = item
+                        .get("arguments")
                         .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    name: item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    arguments: serde_json::from_str(arguments).map_err(|error| {
-                        ProviderError::Protocol(format!("invalid tool arguments: {error}"))
-                    })?,
-                }));
+                        .unwrap_or("{}");
+                    events.push(ModelEvent::ToolCallComplete(ToolCall {
+                        id: item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        name: item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        arguments: serde_json::from_str(arguments).map_err(|error| {
+                            ProviderError::Protocol(format!("invalid tool arguments: {error}"))
+                        })?,
+                    }));
+                }
+                Some("reasoning" | "web_search_call") => {
+                    events.push(ModelEvent::ProviderItem(item.clone()));
+                }
+                _ => {}
             }
         }
         "response.completed" => {
@@ -348,6 +385,15 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
                 }
             }
             events.push(ModelEvent::Done);
+        }
+        "response.incomplete" => {
+            let reason = value
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("output was truncated");
+            return Err(ProviderError::Protocol(format!(
+                "provider response incomplete: {reason}"
+            )));
         }
         "response.failed" | "error" => {
             let message = value
@@ -362,31 +408,32 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
     Ok(events)
 }
 
-// Some compatible gateways emit search events. Accept them defensively even
-// though 1H-Agent does not send provider-specific search request fields.
+// DeepSeek Responses follows the OpenAI web-search event and citation shapes.
+// Keep support for compatible gateways that attach query/result fields directly.
 fn append_native_search_events(value: &Value, events: &mut Vec<ModelEvent>) {
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !event_type.contains("web_search") && !event_type.contains("search") {
-        return;
-    }
-    let result = value
-        .get("result")
-        .or_else(|| value.get("item"))
-        .or_else(|| value.get("source"));
+    let item = value.get("item").unwrap_or(&Value::Null);
+    let is_search_item = item.get("type").and_then(Value::as_str) == Some("web_search_call");
+    let is_search_event = event_type.contains("web_search") || event_type.contains("search");
     if let Some(query) = value
         .get("query")
         .or_else(|| value.pointer("/search/query"))
+        .or_else(|| item.pointer("/action/query"))
         .and_then(Value::as_str)
     {
         events.push(ModelEvent::WebSearchStarted {
             query: bounded_text(query, 512),
         });
+    } else if is_search_event && !event_type.contains("completed") {
+        events.push(ModelEvent::WebSearchStarted {
+            query: "DeepSeek 服务端网络搜索".into(),
+        });
     }
-    if let Some(result) = result {
+    if let Some(result) = value.get("result").or_else(|| value.get("source")) {
         let title = result
             .get("title")
             .and_then(Value::as_str)
@@ -408,10 +455,49 @@ fn append_native_search_events(value: &Value, events: &mut Vec<ModelEvent>) {
             });
         }
     }
-    if event_type.contains("completed") || event_type.ends_with(".done") {
+    append_url_citations(item, events);
+    if event_type.contains("completed") || (is_search_item && event_type.ends_with(".done")) {
         events.push(ModelEvent::WebSearchCompleted {
             count: value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize,
         });
+    }
+}
+
+fn append_url_citations(item: &Value, events: &mut Vec<ModelEvent>) {
+    for content in item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for annotation in content
+            .get("annotations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(10)
+        {
+            if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                continue;
+            }
+            let url = annotation
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !url.is_empty() {
+                events.push(ModelEvent::WebSearchResult {
+                    title: bounded_text(
+                        annotation
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("搜索来源"),
+                        256,
+                    ),
+                    url: bounded_text(url, 2048),
+                    snippet: String::new(),
+                });
+            }
+        }
     }
 }
 
@@ -573,6 +659,92 @@ mod tests {
     }
 
     #[test]
+    fn parses_deepseek_web_search_status_and_citation() {
+        let status = parse_responses_event(&json!({
+            "type": "response.web_search_call.searching",
+            "item_id": "ws_1"
+        }))
+        .unwrap();
+        assert!(matches!(
+            status.first(),
+            Some(ModelEvent::WebSearchStarted { query }) if query.contains("DeepSeek")
+        ));
+
+        let done = parse_responses_event(&json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "msg_1",
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "source",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "title": "DeepSeek Docs",
+                        "url": "https://api-docs.deepseek.com/"
+                    }]
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            done.first(),
+            Some(ModelEvent::WebSearchResult { url, .. }) if url.contains("deepseek.com")
+        ));
+    }
+
+    #[test]
+    fn preserves_deepseek_provider_items_and_rejects_incomplete_response() {
+        let events = parse_responses_event(&json!({
+            "type": "response.output_item.done",
+            "item": {"id":"rs_1", "type":"reasoning", "content":[]}
+        }))
+        .unwrap();
+        assert!(
+            matches!(events.first(), Some(ModelEvent::ProviderItem(item)) if item["id"] == "rs_1")
+        );
+
+        let error = parse_responses_event(&json!({
+            "type": "response.incomplete",
+            "response": {"incomplete_details":{"reason":"max_output_tokens"}}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn deepseek_responses_body_uses_native_search_and_instructions() {
+        let request = ModelRequest {
+            kind: ProviderKind::Responses,
+            model: "deepseek-v4-flash".into(),
+            items: vec![
+                ConversationItem::Message {
+                    role: Role::System,
+                    content: "stable system prefix".into(),
+                },
+                ConversationItem::Message {
+                    role: Role::User,
+                    content: "latest news".into(),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "web_search".into(),
+                description: "local fallback".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            previous_response_id: None,
+            native_web_search: true,
+        };
+        let body = responses_body(&request);
+        assert_eq!(body["instructions"], "stable system prefix");
+        assert_eq!(body["tools"], json!([{"type":"web_search"}]));
+        assert_eq!(
+            body.pointer("/input/0/content"),
+            Some(&json!("latest news"))
+        );
+    }
+
+    #[test]
     fn provider_body_uses_only_declared_function_tools() {
         let request = ModelRequest {
             kind: ProviderKind::ChatCompletions,
@@ -583,6 +755,7 @@ mod tests {
             }],
             tools: Vec::new(),
             previous_response_id: None,
+            native_web_search: false,
         };
         let body = chat_body(&request);
         assert!(body.get("tools").is_none());

@@ -14,6 +14,7 @@ pub enum ConversationItem {
     Message { role: Role, content: String },
     ThinkingSummary { content: String },
     Context { label: String, content: String },
+    ProviderItem { item: Value },
     AssistantToolCalls { calls: Vec<ToolCall> },
     ToolOutput { call_id: String, output: String },
 }
@@ -47,6 +48,7 @@ pub struct ModelRequest {
     pub items: Vec<ConversationItem>,
     pub tools: Vec<ToolDefinition>,
     pub previous_response_id: Option<String>,
+    pub native_web_search: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +64,7 @@ pub enum ModelEvent {
     WebSearchCompleted {
         count: usize,
     },
+    ProviderItem(Value),
     TextDelta(String),
     ToolCallDelta {
         slot: String,
