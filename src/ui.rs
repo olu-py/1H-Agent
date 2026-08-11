@@ -1,3 +1,7 @@
+use pulldown_cmark::{
+    Alignment as MarkdownAlignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options,
+    Parser, Tag, TagEnd,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -6,6 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -256,140 +261,576 @@ fn render_visual_line(
 }
 
 fn render_markdown(text: &str, base: Style) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut in_code = false;
-    for raw in text.split('\n') {
-        let raw = raw.strip_suffix('\r').unwrap_or(raw);
-        let trimmed = raw.trim_start();
-        if is_code_fence(trimmed) {
-            let marker = if in_code {
-                "[end code]".to_owned()
-            } else {
-                let language = trimmed[3..].trim();
-                if language.is_empty() {
-                    "[code]".to_owned()
-                } else {
-                    format!("[code: {language}]")
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM;
+    MarkdownRenderer::new(base).render(Parser::new_ext(text, options).into_offset_iter(), text)
+}
+
+struct MarkdownRenderer {
+    base: Style,
+    lines: Vec<Line<'static>>,
+    current: Vec<Span<'static>>,
+    styles: Vec<Style>,
+    quote_depth: usize,
+    lists: Vec<ListState>,
+    assets: Vec<InlineAsset>,
+    table: Option<TableState>,
+    table_row: Option<TableRow>,
+    table_cell: Option<Vec<Span<'static>>>,
+    table_head: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ListState {
+    Unordered,
+    Ordered(u64),
+}
+
+enum InlineAsset {
+    Link(String),
+    Image(String),
+}
+
+struct TableState {
+    alignments: Vec<MarkdownAlignment>,
+    rows: Vec<TableRow>,
+}
+
+struct TableRow {
+    header: bool,
+    cells: Vec<Vec<Span<'static>>>,
+}
+
+impl MarkdownRenderer {
+    fn new(base: Style) -> Self {
+        Self {
+            base,
+            lines: Vec::new(),
+            current: Vec::new(),
+            styles: vec![base],
+            quote_depth: 0,
+            lists: Vec::new(),
+            assets: Vec::new(),
+            table: None,
+            table_row: None,
+            table_cell: None,
+            table_head: false,
+        }
+    }
+
+    fn render<'a, I>(mut self, events: I, source: &str) -> Vec<Line<'static>>
+    where
+        I: IntoIterator<Item = (Event<'a>, Range<usize>)>,
+    {
+        for (event, range) in events {
+            self.event_spacing(source, range.start, &event);
+            self.event(event);
+        }
+        self.flush_line(false);
+        self.lines
+    }
+
+    fn event_spacing(&mut self, source: &str, offset: usize, event: &Event<'_>) {
+        let is_block_start = matches!(
+            event,
+            Event::Start(
+                Tag::Paragraph
+                    | Tag::Heading { .. }
+                    | Tag::BlockQuote(_)
+                    | Tag::CodeBlock(_)
+                    | Tag::List(_)
+                    | Tag::FootnoteDefinition(_)
+                    | Tag::Table(_)
+                    | Tag::HtmlBlock
+            )
+        );
+        if !is_block_start || self.lines.is_empty() || !self.current.is_empty() {
+            return;
+        }
+        let trailing_newlines = source[..offset.min(source.len())]
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\n')
+            .count();
+        for _ in 1..trailing_newlines {
+            self.lines.push(Line::default());
+        }
+    }
+
+    fn event<'a>(&mut self, event: Event<'a>) {
+        match event {
+            Event::Start(tag) => self.start(tag),
+            Event::End(tag) => self.end(tag),
+            Event::Text(text) => {
+                let style = self.current_style();
+                self.append_text(text.as_ref(), style);
+            }
+            Event::Code(text) => self.append_text(text.as_ref(), code_style()),
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                self.append_text(text.as_ref(), code_style());
+            }
+            Event::Html(text) | Event::InlineHtml(text) => {
+                self.append_text(text.as_ref(), raw_html_style());
+            }
+            Event::FootnoteReference(label) => {
+                let style = self.current_style();
+                self.append_text(&format!("[^{label}]"), style);
+            }
+            Event::SoftBreak | Event::HardBreak => self.flush_line(true),
+            Event::Rule => {
+                self.flush_line(false);
+                self.lines.push(Line::from(Span::styled(
+                    "────────",
+                    self.base.fg(Color::DarkGray),
+                )));
+            }
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "[x] " } else { "[ ] " };
+                self.append_text(marker, self.current_style());
+            }
+        }
+    }
+
+    fn start(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {
+                if self.table_cell.is_none() {
+                    self.ensure_prefix();
                 }
-            };
-            in_code = !in_code;
-            lines.push(Line::from(Span::styled(marker, code_fence_style())));
-        } else if in_code {
-            lines.push(Line::from(Span::styled(raw.to_owned(), code_style())));
+            }
+            Tag::Heading { level, .. } => {
+                self.flush_line(false);
+                let style = heading_style(self.base, level);
+                self.push_style(style);
+                self.ensure_prefix();
+            }
+            Tag::BlockQuote(kind) => {
+                if self.table_cell.is_none() {
+                    self.flush_line(false);
+                    self.quote_depth = self.quote_depth.saturating_add(1);
+                    let quote_style = self
+                        .current_style()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                    self.push_style(quote_style);
+                    if let Some(kind) = kind {
+                        self.ensure_quote_prefix();
+                        self.append_span(Span::styled(
+                            alert_label(kind),
+                            Style::default()
+                                .fg(alert_color(kind))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        self.flush_line(false);
+                    }
+                }
+            }
+            Tag::CodeBlock(kind) => {
+                if self.table_cell.is_none() {
+                    self.flush_line(false);
+                    self.push_style(code_style());
+                    self.ensure_prefix();
+                    let label = match kind {
+                        CodeBlockKind::Fenced(language) if !language.is_empty() => {
+                            format!("[code: {language}]")
+                        }
+                        _ => "[code]".to_owned(),
+                    };
+                    self.current.push(Span::styled(label, code_fence_style()));
+                    self.flush_line(false);
+                }
+            }
+            Tag::List(start) => {
+                if self.table_cell.is_none() {
+                    self.lists.push(match start {
+                        Some(number) => ListState::Ordered(number),
+                        None => ListState::Unordered,
+                    });
+                }
+            }
+            Tag::Item => {
+                if self.table_cell.is_none() {
+                    self.flush_line(false);
+                    self.ensure_quote_prefix();
+                    let indent = "  ".repeat(self.lists.len().saturating_sub(1));
+                    let marker = match self.lists.last_mut() {
+                        Some(ListState::Unordered) => "• ".to_owned(),
+                        Some(ListState::Ordered(number)) => {
+                            let marker = format!("{number}. ");
+                            *number = number.saturating_add(1);
+                            marker
+                        }
+                        None => String::new(),
+                    };
+                    self.current.push(Span::styled(
+                        format!("{indent}{marker}"),
+                        self.base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            Tag::FootnoteDefinition(label) => {
+                self.flush_line(false);
+                self.append_span(Span::styled(
+                    format!("[^{label}]: "),
+                    self.base.fg(Color::DarkGray),
+                ));
+            }
+            Tag::Table(alignments) => {
+                self.flush_line(false);
+                self.table = Some(TableState {
+                    alignments,
+                    rows: Vec::new(),
+                });
+            }
+            Tag::TableHead => {
+                self.table_head = true;
+                self.table_row = Some(TableRow {
+                    header: true,
+                    cells: Vec::new(),
+                });
+                self.push_style(self.current_style().add_modifier(Modifier::BOLD));
+            }
+            Tag::TableRow => {
+                self.table_row = Some(TableRow {
+                    header: self.table_head,
+                    cells: Vec::new(),
+                });
+            }
+            Tag::TableCell => {
+                self.table_cell = Some(Vec::new());
+            }
+            Tag::Emphasis => self.push_style(self.current_style().add_modifier(Modifier::ITALIC)),
+            Tag::Strong => self.push_style(self.current_style().add_modifier(Modifier::BOLD)),
+            Tag::Strikethrough => {
+                self.push_style(self.current_style().add_modifier(Modifier::CROSSED_OUT));
+            }
+            Tag::Superscript | Tag::Subscript => {
+                self.push_style(self.current_style());
+            }
+            Tag::Link { dest_url, .. } => {
+                self.assets.push(InlineAsset::Link(dest_url.to_string()));
+                self.push_style(
+                    self.current_style()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+            }
+            Tag::Image { dest_url, .. } => {
+                self.assets.push(InlineAsset::Image(dest_url.to_string()));
+                self.push_style(self.current_style().fg(Color::Cyan));
+            }
+            Tag::HtmlBlock => {
+                self.flush_line(false);
+                self.push_style(raw_html_style());
+            }
+            Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::MetadataBlock(_) => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                if self.table_cell.is_none() {
+                    self.flush_line(true);
+                }
+            }
+            TagEnd::Heading(_) => {
+                if self.table_cell.is_none() {
+                    self.flush_line(true);
+                }
+                self.pop_style();
+            }
+            TagEnd::BlockQuote(_) => {
+                if self.table_cell.is_none() {
+                    self.flush_line(false);
+                    self.quote_depth = self.quote_depth.saturating_sub(1);
+                    self.pop_style();
+                }
+            }
+            TagEnd::CodeBlock => {
+                if self.table_cell.is_none() {
+                    self.flush_line(false);
+                    self.current
+                        .push(Span::styled("[end code]", code_fence_style()));
+                    self.flush_line(false);
+                    self.pop_style();
+                }
+            }
+            TagEnd::List(_) => {
+                if self.table_cell.is_none() {
+                    self.flush_line(false);
+                    self.lists.pop();
+                }
+            }
+            TagEnd::Item => {
+                if self.table_cell.is_none() {
+                    self.flush_line(false);
+                }
+            }
+            TagEnd::FootnoteDefinition => self.flush_line(false),
+            TagEnd::TableHead => {
+                self.table_head = false;
+                if let Some(row) = self.table_row.take()
+                    && let Some(table) = &mut self.table
+                {
+                    table.rows.push(row);
+                }
+                self.pop_style();
+            }
+            TagEnd::TableRow => {
+                if let Some(row) = self.table_row.take()
+                    && let Some(table) = &mut self.table
+                {
+                    table.rows.push(row);
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(cell) = self.table_cell.take()
+                    && let Some(row) = &mut self.table_row
+                {
+                    row.cells.push(cell);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.lines.extend(render_table(table));
+                }
+            }
+            TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript => self.pop_style(),
+            TagEnd::Link | TagEnd::Image => {
+                self.pop_style();
+                if let Some(asset) = self.assets.pop() {
+                    let destination = match asset {
+                        InlineAsset::Link(destination) | InlineAsset::Image(destination) => {
+                            destination
+                        }
+                    };
+                    self.append_span(Span::styled(
+                        format!(" ({destination})"),
+                        self.base.fg(Color::DarkGray),
+                    ));
+                }
+            }
+            TagEnd::HtmlBlock => {
+                self.flush_line(false);
+                self.pop_style();
+            }
+            TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::MetadataBlock(_) => {}
+        }
+    }
+
+    fn current_style(&self) -> Style {
+        self.styles.last().copied().unwrap_or(self.base)
+    }
+
+    fn push_style(&mut self, style: Style) {
+        self.styles.push(style);
+    }
+
+    fn pop_style(&mut self) {
+        if self.styles.len() > 1 {
+            self.styles.pop();
+        }
+    }
+
+    fn append_text(&mut self, text: &str, style: Style) {
+        if self.table_cell.is_some() {
+            let text = text.replace(['\r', '\n'], " ");
+            if !text.is_empty() {
+                self.append_span(Span::styled(text, style));
+            }
+            return;
+        }
+        for (index, part) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.flush_line(true);
+            }
+            if !part.is_empty() {
+                self.ensure_prefix();
+                self.append_span(Span::styled(part.to_owned(), style));
+            }
+        }
+    }
+
+    fn append_span(&mut self, span: Span<'static>) {
+        if let Some(cell) = &mut self.table_cell {
+            cell.push(span);
         } else {
-            lines.push(render_markdown_line(raw, base));
+            self.current.push(span);
+        }
+    }
+
+    fn ensure_quote_prefix(&mut self) {
+        if self.current.is_empty() && self.quote_depth > 0 {
+            self.current.push(Span::styled(
+                "│ ".repeat(self.quote_depth),
+                self.base.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ));
+        }
+    }
+
+    fn ensure_prefix(&mut self) {
+        if self.table_cell.is_some() || !self.current.is_empty() {
+            return;
+        }
+        self.ensure_quote_prefix();
+        if self.current.is_empty() && !self.lists.is_empty() {
+            self.current.push(Span::raw("  ".repeat(self.lists.len())));
+        }
+    }
+
+    fn flush_line(&mut self, force: bool) {
+        if !self.current.is_empty() || force {
+            self.lines
+                .push(Line::from(std::mem::take(&mut self.current)));
+        }
+    }
+}
+
+fn render_table(table: TableState) -> Vec<Line<'static>> {
+    const MAX_TABLE_CELL_WIDTH: usize = 24;
+    let alignments = table.alignments;
+    let column_count = table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or(0);
+    if column_count == 0 {
+        return Vec::new();
+    }
+    let mut widths = vec![3; column_count];
+    for row in &table.rows {
+        for (column, cell) in row.cells.iter().enumerate() {
+            let width = cell
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>();
+            widths[column] = widths[column].max(width.min(MAX_TABLE_CELL_WIDTH));
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut rendered_header = false;
+    for row in table.rows {
+        let mut spans = vec![Span::styled("| ", table_border_style())];
+        for (column, width) in widths.iter().enumerate() {
+            let cell = row.cells.get(column).cloned().unwrap_or_default();
+            let alignment = alignments
+                .get(column)
+                .copied()
+                .unwrap_or(MarkdownAlignment::None);
+            spans.extend(render_table_cell(cell, *width, alignment));
+            spans.push(Span::styled(" | ", table_border_style()));
+        }
+        lines.push(Line::from(spans));
+        if row.header && !rendered_header {
+            rendered_header = true;
+            let mut separator = vec![Span::styled("| ", table_border_style())];
+            for (column, width) in widths.iter().enumerate() {
+                let alignment = alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(MarkdownAlignment::None);
+                separator.push(Span::styled(
+                    table_separator(*width, alignment),
+                    table_border_style(),
+                ));
+                separator.push(Span::styled(" | ", table_border_style()));
+            }
+            lines.push(Line::from(separator));
         }
     }
     lines
 }
 
-fn render_markdown_line(raw: &str, base: Style) -> Line<'static> {
-    let trimmed = raw.trim_start();
-    let indent = &raw[..raw.len().saturating_sub(trimmed.len())];
-    if trimmed.is_empty() {
-        return Line::default();
-    }
-    if let Some((level, body)) = heading_parts(trimmed) {
-        let heading_style = base
-            .fg(if level <= 2 { Color::Cyan } else { Color::Blue })
-            .add_modifier(Modifier::BOLD);
-        let mut spans = vec![Span::styled(indent.to_owned(), heading_style)];
-        spans.extend(render_inline(body, heading_style));
-        return Line::from(spans);
-    }
-    if let Some(body) = unordered_list_body(trimmed) {
-        let marker_style = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-        let mut spans = vec![Span::styled(format!("{indent}• "), marker_style)];
-        spans.extend(render_inline(body, base));
-        return Line::from(spans);
-    }
-    if let Some((marker, body)) = ordered_list_parts(trimmed) {
-        let marker_style = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-        let mut spans = vec![Span::styled(format!("{indent}{marker} "), marker_style)];
-        spans.extend(render_inline(body, base));
-        return Line::from(spans);
-    }
-    if let Some(body) = trimmed.strip_prefix('>') {
-        let body = body.strip_prefix(' ').unwrap_or(body);
-        let quote_style = base.fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-        let mut spans = vec![Span::styled(format!("{indent}│ "), quote_style)];
-        spans.extend(render_inline(body, quote_style));
-        return Line::from(spans);
-    }
-    if is_horizontal_rule(trimmed) {
-        return Line::from(Span::styled(raw.to_owned(), base.fg(Color::DarkGray)));
-    }
-    Line::from(render_inline(raw, base))
-}
-
-fn render_inline(value: &str, base: Style) -> Vec<Span<'static>> {
+fn render_table_cell(
+    cell: Vec<Span<'static>>,
+    target_width: usize,
+    alignment: MarkdownAlignment,
+) -> Vec<Span<'static>> {
+    let cell_width = cell
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let extra = target_width.saturating_sub(cell_width);
+    let (left, right) = match alignment {
+        MarkdownAlignment::Right => (extra, 0),
+        MarkdownAlignment::Center => {
+            let left = extra / 2;
+            (left, extra.saturating_sub(left))
+        }
+        MarkdownAlignment::Left | MarkdownAlignment::None => (0, extra),
+    };
     let mut spans = Vec::new();
-    let mut plain_start = 0;
-    let mut index = 0;
-    while index < value.len() {
-        let remainder = &value[index..];
-        if let Some(stripped) = remainder.strip_prefix('[') {
-            if let Some(label_end) = stripped.find("](") {
-                let label_end = index + 1 + label_end;
-                let url_start = label_end + 2;
-                if let Some(url_end) = value[url_start..].find(')') {
-                    let url_end = url_start + url_end;
-                    if url_end > url_start {
-                        push_plain(&mut spans, value, plain_start, index, base);
-                        let link_style = base.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
-                        spans.push(Span::styled(
-                            value[index + 1..label_end].to_owned(),
-                            link_style,
-                        ));
-                        spans.push(Span::styled(
-                            format!(" ({})", &value[url_start..url_end]),
-                            base.fg(Color::DarkGray),
-                        ));
-                        index = url_end + 1;
-                        plain_start = index;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        let marker = if remainder.starts_with("**") || remainder.starts_with("__") {
-            Some((2, &remainder[..2], base.add_modifier(Modifier::BOLD)))
-        } else if remainder.starts_with("~~") {
-            Some((2, "~~", base.add_modifier(Modifier::CROSSED_OUT)))
-        } else if remainder.starts_with('`') {
-            Some((1, "`", code_style()))
-        } else if remainder.starts_with('*') || remainder.starts_with('_') {
-            Some((1, &remainder[..1], base.add_modifier(Modifier::ITALIC)))
-        } else {
-            None
-        };
-        let Some((marker_len, marker, style)) = marker else {
-            let character_len = remainder.chars().next().map(char::len_utf8).unwrap_or(1);
-            index += character_len;
-            continue;
-        };
-        let body_start = index + marker_len;
-        if let Some(end_offset) = value[body_start..].find(marker) {
-            let end = body_start + end_offset;
-            if end > body_start {
-                push_plain(&mut spans, value, plain_start, index, base);
-                spans.push(Span::styled(value[body_start..end].to_owned(), style));
-                index = end + marker_len;
-                plain_start = index;
-                continue;
-            }
-        }
-        index += marker_len;
+    if left > 0 {
+        spans.push(Span::styled(" ".repeat(left), table_border_style()));
     }
-    push_plain(&mut spans, value, plain_start, value.len(), base);
+    spans.extend(cell);
+    if right > 0 {
+        spans.push(Span::styled(" ".repeat(right), table_border_style()));
+    }
     spans
 }
 
-fn push_plain(spans: &mut Vec<Span<'static>>, value: &str, start: usize, end: usize, style: Style) {
-    if start < end {
-        spans.push(Span::styled(value[start..end].to_owned(), style));
+fn table_separator(width: usize, alignment: MarkdownAlignment) -> String {
+    let dashes = "-".repeat(width);
+    match alignment {
+        MarkdownAlignment::Left => format!(":{dashes}"),
+        MarkdownAlignment::Center => format!(":{dashes}:"),
+        MarkdownAlignment::Right => format!("{dashes}:"),
+        MarkdownAlignment::None => dashes,
     }
+}
+
+fn heading_style(base: Style, level: HeadingLevel) -> Style {
+    base.fg(if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+        Color::Cyan
+    } else {
+        Color::Blue
+    })
+    .add_modifier(Modifier::BOLD)
+}
+
+fn alert_label(kind: BlockQuoteKind) -> &'static str {
+    match kind {
+        BlockQuoteKind::Note => "NOTE",
+        BlockQuoteKind::Tip => "TIP",
+        BlockQuoteKind::Important => "IMPORTANT",
+        BlockQuoteKind::Warning => "WARNING",
+        BlockQuoteKind::Caution => "CAUTION",
+    }
+}
+
+fn alert_color(kind: BlockQuoteKind) -> Color {
+    match kind {
+        BlockQuoteKind::Note => Color::Cyan,
+        BlockQuoteKind::Tip => Color::Green,
+        BlockQuoteKind::Important => Color::Magenta,
+        BlockQuoteKind::Warning => Color::Yellow,
+        BlockQuoteKind::Caution => Color::Red,
+    }
+}
+
+fn raw_html_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn table_border_style() -> Style {
+    Style::default().fg(Color::DarkGray)
 }
 
 fn render_tool_call(name: &str, arguments: &Value) -> Vec<Line<'static>> {
@@ -469,68 +910,6 @@ fn render_diff(diff: &str) -> Vec<Line<'static>> {
             Line::from(Span::styled(line.to_owned(), Style::default().fg(color)))
         })
         .collect()
-}
-
-fn heading_parts(value: &str) -> Option<(usize, &str)> {
-    let level = value.bytes().take_while(|byte| *byte == b'#').count();
-    if (1..=6).contains(&level)
-        && value
-            .as_bytes()
-            .get(level)
-            .is_some_and(u8::is_ascii_whitespace)
-    {
-        Some((level, value[level..].trim_start()))
-    } else {
-        None
-    }
-}
-
-fn unordered_list_body(value: &str) -> Option<&str> {
-    ["- ", "* ", "+ "]
-        .iter()
-        .find_map(|marker| value.strip_prefix(marker))
-}
-
-fn ordered_list_parts(value: &str) -> Option<(&str, &str)> {
-    let mut end = 0;
-    for (index, character) in value.char_indices() {
-        if character.is_ascii_digit() {
-            end = index + character.len_utf8();
-        } else {
-            break;
-        }
-    }
-    if end == 0
-        || value
-            .as_bytes()
-            .get(end)
-            .is_none_or(|byte| *byte != b'.' && *byte != b')')
-    {
-        return None;
-    }
-    let body_start = end + 1;
-    if !value
-        .as_bytes()
-        .get(body_start)
-        .is_some_and(u8::is_ascii_whitespace)
-    {
-        return None;
-    }
-    Some((&value[..body_start], value[body_start..].trim_start()))
-}
-
-fn is_code_fence(value: &str) -> bool {
-    value.starts_with("```") || value.starts_with("~~~")
-}
-
-fn is_horizontal_rule(value: &str) -> bool {
-    let mut characters = value.chars();
-    let Some(first) = characters.next() else {
-        return false;
-    };
-    matches!(first, '-' | '*' | '_')
-        && value.chars().count() >= 3
-        && value.chars().all(|character| character == first)
 }
 
 fn code_style() -> Style {
@@ -1190,6 +1569,140 @@ mod tests {
         assert_eq!(text[4], "let value = 1;");
         assert_eq!(text[5], "[end code]");
         assert!(lines[1].spans.len() >= 4);
+    }
+
+    fn markdown_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn markdown_renders_nested_lists_tasks_tables_and_footnotes() {
+        let lines = render_markdown(
+            "> outer quote\n>\n> > nested **text**\n\n1. first\n   - nested\n   - [x] done\n\n| 名称 | 值 |\n| :--- | ---: |\n| 中文 | 🙂 |\n\n引用[^1]\n\n[^1]: 脚注内容",
+            Style::default(),
+        );
+        let text = markdown_text(&lines);
+        assert!(text.contains("│ outer quote"));
+        assert!(text.contains("│ │ nested text"));
+        assert!(text.contains("1. first"));
+        assert!(text.contains("  • nested"));
+        assert!(text.contains("  • [x] done"));
+        assert!(text.contains("| 名称"));
+        assert!(text.contains("| ---"));
+        assert!(text.contains("| 中文"));
+        assert!(text.contains("引用[^1]"));
+        assert!(text.contains("[^1]: 脚注内容"));
+    }
+
+    #[test]
+    fn markdown_renders_gfm_alert_labels_and_nested_quotes() {
+        let lines = render_markdown(
+            "> [!NOTE]\n> note body\n\n> [!TIP]\n> tip body\n\n> [!IMPORTANT]\n> important body\n\n> [!WARNING]\n> warning body\n\n> [!CAUTION]\n> caution body\n\n> ordinary\n> > [!NOTE]\n> > nested note\n\nafter",
+            Style::default(),
+        );
+        let text = markdown_text(&lines);
+        for label in ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"] {
+            assert!(
+                text.contains(&format!("│ {label}")),
+                "missing {label} in {text}"
+            );
+        }
+        assert!(text.contains("│ note body"));
+        assert!(text.contains("│ │ NOTE"));
+        assert!(text.contains("│ │ nested note"));
+        assert!(text.contains("after"));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content == "WARNING" && span.style.fg == Some(Color::Yellow))
+        }));
+    }
+
+    #[test]
+    fn markdown_table_uses_alignment_padding_and_visible_delimiters() {
+        let lines = render_markdown(
+            "| Left | Center | Right |\n| :--- | :---: | ---: |\n| a | b | c |",
+            Style::default(),
+        );
+        let text = markdown_text(&lines);
+        assert!(text.contains("| :---- | :------: | -----: |"));
+        assert!(text.contains("| a    |   b    |     c |"));
+    }
+
+    #[test]
+    fn markdown_renders_links_images_nested_styles_and_html_as_text() {
+        let lines = render_markdown(
+            r#"**粗 *体*** ~~删~~ `代码` [链接](https://example.test/a) ![图片](https://example.test/i.png) <span>HTML</span> \*字面星号\* 中文🙂"#,
+            Style::default(),
+        );
+        let text = markdown_text(&lines);
+        assert!(text.contains("粗 体"));
+        assert!(text.contains("删"));
+        assert!(text.contains("代码"));
+        assert!(text.contains("链接 (https://example.test/a)"));
+        assert!(text.contains("图片 (https://example.test/i.png)"));
+        assert!(text.contains("<span>HTML</span>"));
+        assert!(text.contains("*字面星号* 中文🙂"));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.add_modifier(Modifier::BOLD) == span.style)
+        }));
+    }
+
+    #[test]
+    fn markdown_handles_code_variants_soft_breaks_and_incomplete_streams() {
+        let lines = render_markdown(
+            "before\nsoft break\n\n    indented code\n\n~~~text\nfenced\n~~~\n\n**incomplete",
+            Style::default(),
+        );
+        let text = markdown_text(&lines);
+        assert!(text.contains("before"));
+        assert!(text.contains("soft break"));
+        assert!(text.contains("indented code"));
+        assert!(text.contains("[code: text]"));
+        assert!(text.contains("fenced"));
+        assert!(text.contains("[end code]"));
+        assert!(text.contains("incomplete"));
+
+        let hard_break = markdown_text(&render_markdown("one  \ntwo", Style::default()));
+        assert_eq!(hard_break, "one\ntwo");
+        let paragraph_gap = markdown_text(&render_markdown("first\n\nsecond", Style::default()));
+        assert_eq!(paragraph_gap, "first\n\nsecond");
+    }
+
+    #[test]
+    fn markdown_lines_feed_message_layout_without_losing_copy_text() {
+        let lines = render_markdown(
+            r#"| A | B |
+| --- | --- |
+| **中文** | *🙂* |
+| 长文本 | [链接](https://example.test) |
+| 组合 é | Emoji 👩‍💻 |"#,
+            Style::default(),
+        );
+        let layout = MessageLayout::new(lines, Rect::new(0, 0, 12, 10), 0);
+        let selection = OutputSelection {
+            anchor: 0,
+            active: layout.text.len(),
+            dragging: false,
+        };
+        assert_eq!(layout.selected_text(selection), Some(layout.text.as_str()));
+        assert!(layout.text.contains("中文"));
+        assert!(layout.text.contains("🙂"));
+        assert!(layout.text.contains("长文本"));
+        assert!(layout.text.contains("https://example.test"));
+        assert!(layout.text.contains("e\u{301}"));
+        assert!(layout.text.contains("👩‍💻"));
     }
 
     #[test]

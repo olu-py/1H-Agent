@@ -710,6 +710,7 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Op
 }
 
 fn update_drag_position(app: &mut App, column: u16, row: u16) {
+    update_edge_scroll(app, column, row);
     let Some(offset) = app.message_layout.as_ref().and_then(|layout| {
         let clamped_row = row
             .max(layout.viewport.y)
@@ -718,7 +719,6 @@ fn update_drag_position(app: &mut App, column: u16, row: u16) {
     }) else {
         return;
     };
-    update_edge_scroll(app, column, row);
     if let Some(selection) = &mut app.output_selection {
         selection.active = offset;
     }
@@ -728,13 +728,7 @@ fn update_edge_scroll(app: &mut App, column: u16, row: u16) {
     let Some(layout) = &app.message_layout else {
         return;
     };
-    let direction = if row < layout.viewport.y {
-        -1
-    } else if row >= layout.viewport.bottom() {
-        1
-    } else {
-        0
-    };
+    let direction = edge_scroll_direction(row, layout.viewport);
     app.edge_scroll = EdgeScroll { direction, column };
 }
 
@@ -787,6 +781,25 @@ fn output_mouse_event_allowed(
 
 fn relative_output_column(column: u16, viewport: ratatui::layout::Rect) -> usize {
     column.saturating_sub(viewport.x) as usize
+}
+
+const EDGE_SCROLL_ROWS: u16 = 1;
+
+fn edge_scroll_direction(row: u16, viewport: ratatui::layout::Rect) -> i8 {
+    if viewport.height == 0 {
+        return 0;
+    }
+    let top_edge = viewport
+        .y
+        .saturating_add(EDGE_SCROLL_ROWS.saturating_sub(1));
+    let bottom_edge = viewport.bottom().saturating_sub(EDGE_SCROLL_ROWS);
+    if row <= top_edge {
+        -1
+    } else if row >= bottom_edge {
+        1
+    } else {
+        0
+    }
 }
 
 fn clear_output_selection(app: &mut App) {
@@ -846,11 +859,7 @@ fn scroll_messages(app: &mut App, delta: isize) {
         .output_scroll_top
         .unwrap_or(layout.scroll)
         .min(max_scroll);
-    let next = if delta > 0 {
-        current.saturating_add(delta as usize).min(max_scroll)
-    } else {
-        current.saturating_sub(delta.unsigned_abs())
-    };
+    let next = next_output_scroll_top(current, max_scroll, delta);
     if delta < 0 && next == max_scroll {
         app.output_scroll_top = None;
         app.follow_output = true;
@@ -859,6 +868,15 @@ fn scroll_messages(app: &mut App, delta: isize) {
         app.output_scroll_top = Some(next);
         app.follow_output = false;
         app.message_scroll = max_scroll.saturating_sub(next);
+    }
+}
+
+fn next_output_scroll_top(current: usize, max_scroll: usize, delta: isize) -> usize {
+    let current = current.min(max_scroll);
+    if delta > 0 {
+        current.saturating_sub(delta as usize)
+    } else {
+        current.saturating_add(delta.unsigned_abs()).min(max_scroll)
     }
 }
 
@@ -2074,6 +2092,46 @@ mod tests {
         assert_eq!(relative_output_column(35, sidebar_offset), 5);
         assert_eq!(relative_output_column(29, sidebar_offset), 0);
         assert_eq!(relative_output_column(55, sidebar_offset), 25);
+    }
+
+    #[test]
+    fn top_based_scroll_translates_existing_scroll_semantics() {
+        assert_eq!(next_output_scroll_top(5, 10, 2), 3);
+        assert_eq!(next_output_scroll_top(5, 10, -2), 7);
+        assert_eq!(next_output_scroll_top(0, 10, 3), 0);
+        assert_eq!(next_output_scroll_top(10, 10, -3), 10);
+        assert_eq!(next_output_scroll_top(99, 10, 0), 10);
+    }
+
+    #[test]
+    fn edge_scroll_starts_on_the_first_visible_edge_row() {
+        let viewport = Rect::new(30, 10, 40, 5);
+        assert_eq!(edge_scroll_direction(9, viewport), -1);
+        assert_eq!(edge_scroll_direction(10, viewport), -1);
+        assert_eq!(edge_scroll_direction(11, viewport), 0);
+        assert_eq!(edge_scroll_direction(13, viewport), 0);
+        assert_eq!(edge_scroll_direction(14, viewport), 1);
+        assert_eq!(edge_scroll_direction(15, viewport), 1);
+    }
+
+    #[test]
+    fn edge_scroll_handles_zero_and_one_row_viewports() {
+        assert_eq!(edge_scroll_direction(0, Rect::new(0, 0, 20, 0)), 0);
+        assert_eq!(edge_scroll_direction(0, Rect::new(0, 0, 20, 1)), -1);
+        assert_eq!(edge_scroll_direction(1, Rect::new(0, 0, 20, 1)), 1);
+    }
+
+    #[test]
+    fn edge_scroll_direction_maps_to_top_based_motion() {
+        let viewport = Rect::new(30, 10, 40, 5);
+        let top_direction = edge_scroll_direction(10, viewport);
+        let bottom_direction = edge_scroll_direction(14, viewport);
+        assert_eq!(top_direction, -1);
+        assert_eq!(bottom_direction, 1);
+        assert_eq!(next_output_scroll_top(5, 10, 1), 4);
+        assert_eq!(next_output_scroll_top(5, 10, -1), 6);
+        assert_eq!(next_output_scroll_top(0, 10, 1), 0);
+        assert_eq!(next_output_scroll_top(10, 10, -1), 10);
     }
 
     #[test]

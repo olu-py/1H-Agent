@@ -296,7 +296,7 @@ impl Config {
 impl ProviderConfig {
     pub fn resolved_context_window_tokens(&self) -> Option<u64> {
         self.context_window_tokens
-            .or_else(|| known_context_window(&self.model))
+            .or_else(|| Some(known_context_window(self.preset, &self.model)))
     }
 
     pub fn validate(&mut self) -> Result<()> {
@@ -403,21 +403,376 @@ impl ProviderPreset {
     }
 }
 
-fn known_context_window(model: &str) -> Option<u64> {
-    let model = model.to_ascii_lowercase();
-    if model.starts_with("gpt-5") {
-        Some(400_000)
-    } else if model.starts_with("gpt-4.1") {
-        Some(1_047_576)
-    } else if model.starts_with("gpt-4o")
-        || model.starts_with("o1")
-        || model.starts_with("o3")
-        || matches!(model.as_str(), "deepseek-chat" | "deepseek-reasoner")
-    {
-        Some(128_000)
-    } else {
-        None
-    }
+const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 258_000;
+
+#[derive(Clone, Copy)]
+struct ModelRule {
+    model: &'static str,
+    context_window_tokens: u64,
+}
+
+const OPENAI_EXACT_MODELS: &[ModelRule] = &[
+    ModelRule {
+        model: "o1-mini",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "o1-preview",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "o1",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "o3",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "o4-mini",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "gpt-5.6-sol",
+        context_window_tokens: 1_050_000,
+    },
+    ModelRule {
+        model: "gpt-5.6-terra",
+        context_window_tokens: 1_050_000,
+    },
+    ModelRule {
+        model: "gpt-5.6-luna",
+        context_window_tokens: 1_050_000,
+    },
+];
+
+const OPENAI_PREFIX_MODELS: &[ModelRule] = &[
+    ModelRule {
+        model: "o1-mini",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "o1-preview",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "o1",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "o3",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "o4-mini",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "gpt-5.6-sol",
+        context_window_tokens: 1_050_000,
+    },
+    ModelRule {
+        model: "gpt-5.6-terra",
+        context_window_tokens: 1_050_000,
+    },
+    ModelRule {
+        model: "gpt-5.6-luna",
+        context_window_tokens: 1_050_000,
+    },
+    ModelRule {
+        model: "gpt-4.1",
+        context_window_tokens: 1_047_576,
+    },
+    ModelRule {
+        model: "gpt-4o",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "gpt-5",
+        context_window_tokens: 400_000,
+    },
+];
+
+const DEEPSEEK_EXACT_MODELS: &[ModelRule] = &[
+    ModelRule {
+        model: "deepseek-chat",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "deepseek-reasoner",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "deepseek-v4-pro",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "deepseek-v4-flash",
+        context_window_tokens: 1_000_000,
+    },
+];
+
+const DEEPSEEK_PREFIX_MODELS: &[ModelRule] = &[
+    ModelRule {
+        model: "deepseek-r1",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "deepseek-v3",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "deepseek-v4-pro",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "deepseek-v4-flash",
+        context_window_tokens: 1_000_000,
+    },
+];
+
+const QWEN_EXACT_MODELS: &[ModelRule] = &[
+    ModelRule {
+        model: "qwen-max",
+        context_window_tokens: 32_768,
+    },
+    ModelRule {
+        model: "qwen-plus",
+        context_window_tokens: 131_072,
+    },
+    ModelRule {
+        model: "qwen-turbo",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen-long",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.8-max",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.7-max",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.7-plus",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.7-flash",
+        context_window_tokens: 1_000_000,
+    },
+];
+
+const QWEN_PREFIX_MODELS: &[ModelRule] = &[
+    ModelRule {
+        model: "qwen-max",
+        context_window_tokens: 32_768,
+    },
+    ModelRule {
+        model: "qwen-plus",
+        context_window_tokens: 131_072,
+    },
+    ModelRule {
+        model: "qwen-turbo",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen-long",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.8-max",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.7-max",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.7-plus",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen3.7-flash",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "qwen2.5",
+        context_window_tokens: 131_072,
+    },
+    ModelRule {
+        model: "qwen3",
+        context_window_tokens: 131_072,
+    },
+];
+
+const VOLCANO_PREFIX_MODELS: &[ModelRule] = &[
+    ModelRule {
+        model: "doubao-seed",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "deepseek-v4-flash",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "glm-5.2",
+        context_window_tokens: 1_000_000,
+    },
+    ModelRule {
+        model: "deepseek-v4-pro",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "glm-4.7",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "minimax-m2.7",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "minimax-m2.5",
+        context_window_tokens: 200_000,
+    },
+    ModelRule {
+        model: "doubao-seed-2.0-pro",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-seed-2.0-code",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-seed-2.0-lite",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "kimi-k2.6",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "kimi-k2.5",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-1-5-pro-32k",
+        context_window_tokens: 32_000,
+    },
+    ModelRule {
+        model: "doubao-1-5-lite-32k",
+        context_window_tokens: 32_000,
+    },
+    ModelRule {
+        model: "doubao-1-5-pro-128k",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "doubao-1-5-lite-128k",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "doubao-1-5-pro-256k",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-1-5-lite-256k",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-1-6-pro-32k",
+        context_window_tokens: 32_000,
+    },
+    ModelRule {
+        model: "doubao-1-6-lite-32k",
+        context_window_tokens: 32_000,
+    },
+    ModelRule {
+        model: "doubao-1-6-pro-128k",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "doubao-1-6-lite-128k",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "doubao-1-6-pro-256k",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-1-6-lite-256k",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-pro-32k",
+        context_window_tokens: 32_000,
+    },
+    ModelRule {
+        model: "doubao-lite-32k",
+        context_window_tokens: 32_000,
+    },
+    ModelRule {
+        model: "doubao-pro-128k",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "doubao-lite-128k",
+        context_window_tokens: 128_000,
+    },
+    ModelRule {
+        model: "doubao-pro-256k",
+        context_window_tokens: 256_000,
+    },
+    ModelRule {
+        model: "doubao-lite-256k",
+        context_window_tokens: 256_000,
+    },
+];
+
+fn known_context_window(preset: ProviderPreset, model: &str) -> u64 {
+    let model = model.trim().to_ascii_lowercase();
+    let matched = match preset {
+        ProviderPreset::OpenAi => {
+            lookup_model_window(&model, OPENAI_EXACT_MODELS, OPENAI_PREFIX_MODELS)
+        }
+        ProviderPreset::DeepSeek => {
+            lookup_model_window(&model, DEEPSEEK_EXACT_MODELS, DEEPSEEK_PREFIX_MODELS)
+        }
+        ProviderPreset::Qwen => lookup_model_window(&model, QWEN_EXACT_MODELS, QWEN_PREFIX_MODELS),
+        ProviderPreset::Volcano => lookup_model_window(&model, &[], VOLCANO_PREFIX_MODELS),
+        ProviderPreset::Custom => {
+            lookup_model_window(&model, OPENAI_EXACT_MODELS, OPENAI_PREFIX_MODELS)
+                .or_else(|| {
+                    lookup_model_window(&model, DEEPSEEK_EXACT_MODELS, DEEPSEEK_PREFIX_MODELS)
+                })
+                .or_else(|| lookup_model_window(&model, QWEN_EXACT_MODELS, QWEN_PREFIX_MODELS))
+                .or_else(|| lookup_model_window(&model, &[], VOLCANO_PREFIX_MODELS))
+        }
+    };
+    matched.unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+}
+
+fn lookup_model_window(model: &str, exact: &[ModelRule], prefixes: &[ModelRule]) -> Option<u64> {
+    exact
+        .iter()
+        .find(|rule| model == rule.model)
+        .or_else(|| {
+            prefixes
+                .iter()
+                .filter(|rule| model_family_matches(model, rule.model))
+                .max_by_key(|rule| rule.model.len())
+        })
+        .map(|rule| rule.context_window_tokens)
+}
+
+fn model_family_matches(model: &str, family: &str) -> bool {
+    model == family
+        || model
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with(['-', '.', ':']))
 }
 
 impl ProviderKind {
@@ -467,13 +822,121 @@ mod tests {
     }
 
     #[test]
-    fn context_window_uses_registry_without_guessing_unknown_models() {
+    fn context_window_uses_provider_aware_registry_and_default() {
         let mut provider = ProviderPreset::DeepSeek.defaults();
-        provider.model = "deepseek-chat".into();
+        provider.model = "  DEEPSEEK-V3-0324  ".into();
         assert_eq!(provider.resolved_context_window_tokens(), Some(128_000));
 
         provider.model = "deepseek-v4-flash".into();
-        assert_eq!(provider.resolved_context_window_tokens(), None);
+        assert_eq!(provider.resolved_context_window_tokens(), Some(1_000_000));
+    }
+
+    #[test]
+    fn context_window_registry_covers_each_provider() {
+        let cases = [
+            (ProviderPreset::OpenAi, "gpt-5-mini", 400_000),
+            (ProviderPreset::OpenAi, "gpt-5.6-sol", 1_050_000),
+            (ProviderPreset::OpenAi, "gpt-5.6-terra", 1_050_000),
+            (ProviderPreset::OpenAi, "gpt-5.6-luna", 1_050_000),
+            (ProviderPreset::OpenAi, "gpt-4.1-mini", 1_047_576),
+            (ProviderPreset::OpenAi, "gpt-4o-mini", 128_000),
+            (ProviderPreset::OpenAi, "o1-mini", 128_000),
+            (ProviderPreset::OpenAi, "o1-mini-2024-09-12", 128_000),
+            (ProviderPreset::OpenAi, "o1", 200_000),
+            (ProviderPreset::OpenAi, "o3", 200_000),
+            (ProviderPreset::OpenAi, "o3-2025-04-16", 200_000),
+            (ProviderPreset::OpenAi, "o4-mini", 200_000),
+            (ProviderPreset::DeepSeek, "deepseek-chat", 128_000),
+            (ProviderPreset::DeepSeek, "deepseek-reasoner", 128_000),
+            (ProviderPreset::DeepSeek, "deepseek-r1-0528", 128_000),
+            (ProviderPreset::DeepSeek, "deepseek-v4-pro", 1_000_000),
+            (ProviderPreset::DeepSeek, "deepseek-v4-flash", 1_000_000),
+            (ProviderPreset::Qwen, "qwen-max", 32_768),
+            (ProviderPreset::Qwen, "qwen-plus", 131_072),
+            (ProviderPreset::Qwen, "qwen-plus-latest", 131_072),
+            (ProviderPreset::Qwen, "qwen-turbo", 1_000_000),
+            (ProviderPreset::Qwen, "qwen-turbo-2025-xx", 1_000_000),
+            (ProviderPreset::Qwen, "qwen-long", 1_000_000),
+            (ProviderPreset::Qwen, "qwen3-235b-a22b", 131_072),
+            (ProviderPreset::Qwen, "qwen3.8-max", 1_000_000),
+            (ProviderPreset::Qwen, "qwen3.7-max", 1_000_000),
+            (ProviderPreset::Qwen, "qwen3.7-plus", 1_000_000),
+            (ProviderPreset::Qwen, "qwen3.7-flash", 1_000_000),
+            (
+                ProviderPreset::Volcano,
+                "doubao-seed-2-1-pro-260628",
+                256_000,
+            ),
+            (ProviderPreset::Volcano, "doubao-pro-32k-250115", 32_000),
+            (ProviderPreset::Volcano, "deepseek-v4-flash", 1_000_000),
+            (ProviderPreset::Volcano, "glm-5.2", 1_000_000),
+            (ProviderPreset::Volcano, "deepseek-v4-pro", 200_000),
+            (ProviderPreset::Volcano, "glm-4.7", 200_000),
+            (ProviderPreset::Volcano, "minimax-m2.7", 200_000),
+            (ProviderPreset::Volcano, "minimax-m2.5", 200_000),
+            (ProviderPreset::Volcano, "doubao-seed-2.0-pro", 256_000),
+            (ProviderPreset::Volcano, "doubao-seed-2.0-code", 256_000),
+            (ProviderPreset::Volcano, "doubao-seed-2.0-lite", 256_000),
+            (ProviderPreset::Volcano, "kimi-k2.6", 256_000),
+            (ProviderPreset::Volcano, "kimi-k2.5", 256_000),
+            (ProviderPreset::Volcano, "other-model-256k", 258_000),
+            (ProviderPreset::Custom, "gpt-5-mini", 400_000),
+            (ProviderPreset::Custom, "deepseek-chat", 128_000),
+            (ProviderPreset::Custom, "qwen3-32b", 131_072),
+            (
+                ProviderPreset::Custom,
+                "doubao-seed-2-1-pro-260628",
+                256_000,
+            ),
+            (ProviderPreset::Custom, "deepseek-v4-flash", 1_000_000),
+            (ProviderPreset::Custom, "vendor-model-128k", 258_000),
+        ];
+        for (preset, model, expected) in cases {
+            let mut provider = preset.defaults();
+            provider.model = model.into();
+            assert_eq!(provider.resolved_context_window_tokens(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn exact_model_rules_win_and_prefixes_use_longest_match() {
+        assert_eq!(
+            known_context_window(ProviderPreset::OpenAi, "O1-MINI"),
+            128_000
+        );
+        assert_eq!(
+            known_context_window(ProviderPreset::OpenAi, "gpt-4.1-mini"),
+            1_047_576
+        );
+        assert_eq!(
+            known_context_window(ProviderPreset::DeepSeek, "deepseek-r1"),
+            128_000
+        );
+        assert_eq!(known_context_window(ProviderPreset::Qwen, "qwen3"), 131_072);
+        assert_eq!(
+            known_context_window(ProviderPreset::OpenAi, "o3foobar"),
+            258_000
+        );
+        assert_eq!(
+            known_context_window(ProviderPreset::Qwen, "qwen-plusfake"),
+            258_000
+        );
+        assert_eq!(
+            known_context_window(ProviderPreset::OpenAi, "gpt-5fake"),
+            258_000
+        );
+    }
+
+    #[test]
+    fn custom_only_uses_explicit_known_vendor_families() {
+        assert_eq!(
+            known_context_window(ProviderPreset::Custom, "gpt-5"),
+            400_000
+        );
+        assert_eq!(
+            known_context_window(ProviderPreset::Custom, "unknown-32k"),
+            258_000
+        );
     }
 
     #[test]

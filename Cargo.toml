@@ -25,6 +25,7 @@ html2text = "0.15"
 ignore = "0.4"
 keyring = { version = "3", default-features = false }
 libc = "0.2"
+pulldown-cmark = "0.13"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
