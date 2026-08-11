@@ -1,121 +1,77 @@
 # 1H-Agent
 
-`1H` 指氕（protium），即氢元素最轻、最常见的氢-1 同位素；项目名称表达
-轻量、基础而高效的 Agent 核心，而不是泛指的“1 小时”。
+`1H` 指氕（protium），即氢-1 同位素。1H-Agent 是面向 Linux、macOS 和 Windows 的轻量、权限感知终端 Agent：单 Rust 二进制、流式对话、工具审批与本地会话持久化。
 
-1H-Agent is a lightweight, permission-aware terminal agent for Linux, macOS,
-and Windows. It uses a native Rust TUI and supports both OpenAI Chat
-Completions and Responses endpoints.
+## 获取与启动
 
-## Status
+GitHub Releases 提供 Linux x86_64、Windows x86_64、macOS Intel 和 macOS Apple Silicon 的原生包，并附带 `SHA256SUMS.txt` 用于校验。
 
-This repository contains a working lightweight TUI implementation. The
-security model is intentionally conservative: file access is constrained to
-the selected workspace and commands, shell, mutations, browser interactions,
-and remote Git operations require approval.
-
-## Requirements
-
-- Rust stable for building
-- Git for Git tools
-- A UTF-8 terminal
-- `OPENAI_API_KEY` for OpenAI requests
-
-## Download a release
-
-GitHub Releases provide ready-to-run archives for Linux x86_64, Windows x86_64,
-macOS Intel, and macOS Apple Silicon. Each archive contains the native
-`1h-agent` executable, the example configuration, README, and license. Verify
-downloads with the published `SHA256SUMS.txt` file.
-
-On Windows, extract the zip and run in PowerShell:
+Windows 解压后在 PowerShell 运行：
 
 ```powershell
 .\1h-agent.exe --workspace C:\path\to\project
 ```
 
-On macOS, choose `macos-aarch64` for Apple Silicon or `macos-x86_64` for an
-Intel Mac, extract the archive, and run in Terminal:
+macOS 请按芯片选择 `macos-aarch64` 或 `macos-x86_64`，解压后运行：
 
 ```bash
 ./1h-agent --workspace /path/to/project
 ```
 
-Release binaries are currently unsigned. If macOS quarantine blocks the first
-launch, review the downloaded file and remove only its quarantine attribute:
+当前 macOS 二进制未签名。若系统阻止首次运行，确认文件来源后可移除下载隔离属性：
 
 ```bash
 xattr -d com.apple.quarantine ./1h-agent
 ```
 
-## Run
+从源码开发运行：
 
 ```bash
 cargo run -- --workspace /path/to/project
 ```
 
-Open Provider Settings with `Ctrl+S`. Use the arrow keys to select OpenAI,
-DeepSeek, Qwen/Bailian, Volcano Ark, or a custom OpenAI-compatible endpoint.
-Use `Tab` to move between fields, edit the Base URL/model/API Key, and press
-`Enter` to apply immediately. `Esc` closes the panel without saving.
+构建 release 二进制：
 
-The API Key is stored under a provider-specific account in the OS keyring. If
-secure storage is unavailable, the key remains usable only for the current
-process. Environment variables remain supported for unattended use:
+```bash
+cargo build --release
+./target/release/1h-agent --workspace /path/to/project
+```
 
-| Preset | Environment variable | Default model |
+## 配置 Provider
+
+按 `Ctrl+S` 打开 Provider 设置，使用方向键选择 Provider，`Tab` 切换字段，`Enter` 应用，`Esc` 取消。非密钥配置保存到 TOML；API Key 保存到系统钥匙串，钥匙串不可用时仅保留到当前进程结束。
+
+| Provider | API Key 环境变量 | 默认模型 |
 | --- | --- | --- |
 | OpenAI | `OPENAI_API_KEY` | `gpt-5-mini` |
 | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` |
 | Qwen/Bailian | `DASHSCOPE_API_KEY` | `qwen3.8-max` |
 | Volcano Ark | `ARK_API_KEY` | `doubao-seed-2-1-pro-260628` |
-| Custom | `AGENT_API_KEY` | editable |
+| Custom | `AGENT_API_KEY` | 自行设置 |
 
-Qwen's current China-compatible endpoint contains an account-specific
-`WorkspaceId`. Replace the placeholder in Provider Settings before saving.
+配置示例见 [`config/config.example.toml`](config/config.example.toml)。`AGENT_API_BASE`、`AGENT_MODEL`、`AGENT_PROVIDER` 可覆盖 Provider 字段，`AGENT_DATA_DIR` 可指定会话数据库目录。Qwen/Bailian 的 URL 必须替换其中的 `WorkspaceId`。
 
-Configuration can be copied from `config/config.example.toml`. Environment
-variables override the file. The TUI keeps the main controls visible in its
-footer: `Enter` sends, `Ctrl+S` opens provider settings, `Alt+Up/Down` switches
-sessions, `Ctrl+N` creates a session, `Esc` cancels an active request, and
-`Ctrl+C` quits. OpenCode-style controls are also available: `Ctrl+X` is the
-leader key, `Ctrl+P` opens the command palette, `/` runs slash commands, `@`
-offers workspace file references, `!` runs an approved workspace shell command,
-`PageUp/PageDown` scroll messages, and `Ctrl+O` folds tool details. Use `Y` or
-`N` when a tool approval dialog is open.
+DeepSeek 的 Responses 模式默认启用 Provider 原生联网搜索。设置以下配置可关闭它，并回退到本地文本搜索与网页抓取：
 
-The two-line activity display keeps operating mode, Agent phase, and model
-stream state separate. Thinking summaries are bounded progress descriptions,
-not raw chain-of-thought. Assistant text and tool calls retain their event
-order (`text -> tool -> text`), including after a session is reloaded. Approval
-dialogs translate common tool arguments into paths, commands, sizes, risk, and
-other readable fields while redacting secret-like values.
+```toml
+[provider]
+native_web_search = "disabled"
+```
 
-The TUI uses Simplified Chinese labels and includes a bounded context-window
-ring below the Agent/model state. The limit is resolved from an explicit
-`provider.context_window_tokens` override or a small built-in registry of known
-model limits. Unknown models display an unknown limit instead of assuming
-128,000 tokens. Provider input-token usage takes precedence over the local
-allocation-free estimate. At 85% it recommends `/compact`.
+## 常用操作
 
-DeepSeek's Responses API supports provider-hosted web search for
-`deepseek-v4-flash`. The DeepSeek preset uses Responses and enables the native
-`web_search` tool by default; set `provider.native_web_search = "disabled"` to
-turn it off. Chat Completions and other providers retain 1H-Agent's lightweight
-bounded text-search function plus `web_fetch`. No browser runtime is required.
+| 操作 | 快捷键/语法 |
+| --- | --- |
+| 发送 / 换行 | `Enter` / `Shift+Enter` 或 `Ctrl+J` |
+| 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` |
+| 命令面板 / 命令 | `Ctrl+P` / `/` |
+| 引用文件 / 执行命令 | `@path` / `!command`（命令须审批） |
+| 滚动 / 回到底部 | `PageUp`、`PageDown` / `Ctrl+L` |
+| 工具详情 / 审批 | `Ctrl+O` / `Y`、`N` |
+| 取消 / 退出 | `Esc` / `Ctrl+C` |
 
-Built-in slash commands include `/help`, `/new`, `/sessions`, `/rename`,
-`/delete`, `/fork`, `/undo`, `/redo`, `/compact`, `/export`, `/diff`,
-`/model`, `/provider`, `/agent`, `/plan`, `/build`, `/explore`, `/clear`, and
-`/quit`. Custom prompt templates, per-tool permissions, external browser
-bridges, and local stdio MCP tool servers are configured in TOML. These are
-user-supplied processes; 1H-Agent does not bundle a browser runtime or plugin
-ABI.
+文件操作限定在 `--workspace` 内；写入、删除、命令、浏览器交互和变更型 Git 操作会按策略要求审批。
 
-`AGENT_DATA_DIR` overrides the platform data directory, which is useful in
-portable or sandboxed environments.
+## AI 维护文档
 
-## Documentation
-
-- [Development plan](PLAN.md)
-- [Technical design](TECHNICAL_DESIGN.md)
+维护或开发本项目的 AI Agent 请读取 [AGENT.md](AGENT.md)。该文档提供架构、源码路由、安全边界、资源上限、验证和发布规则。
