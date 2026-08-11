@@ -1,8 +1,10 @@
 pub mod agent;
 pub mod app;
+pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod input;
+pub mod output;
 pub mod prompt;
 pub mod provider;
 pub mod secrets;

@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::pending,
     io,
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
     time::Instant,
 };
@@ -9,10 +11,11 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
@@ -29,6 +32,7 @@ use crate::{
     commands::{self, AgentMode, Command},
     config::{Config, ProviderConfig, ProviderKind, ProviderPreset},
     input::InputBuffer,
+    output::{EdgeScroll, MessageLayout, OutputSelection},
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
     secrets,
     security::Workspace,
@@ -184,6 +188,10 @@ pub struct App {
     pub file_selected: usize,
     pub message_scroll: usize,
     pub follow_output: bool,
+    pub output_scroll_top: Option<usize>,
+    pub output_selection: Option<OutputSelection>,
+    pub message_layout: Option<MessageLayout>,
+    pub edge_scroll: EdgeScroll,
     pub session_id: String,
     pub sessions: Vec<SessionSummary>,
     conversation: Vec<ConversationItem>,
@@ -279,6 +287,10 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         file_selected: 0,
         message_scroll: 0,
         follow_output: true,
+        output_scroll_top: None,
+        output_selection: None,
+        message_layout: None,
+        edge_scroll: EdgeScroll::default(),
         session_id,
         sessions,
         conversation,
@@ -295,21 +307,43 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    if let Err(error) = terminal.clear() {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
+        return Err(error.into());
+    }
 
     let result = event_loop(&mut terminal, &mut app).await;
 
-    disable_raw_mode()?;
-    execute!(
+    let raw_mode_result = disable_raw_mode();
+    let screen_result = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    result
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
+    let cursor_result = terminal.show_cursor();
+    result?;
+    raw_mode_result?;
+    screen_result?;
+    cursor_result?;
+    Ok(())
 }
 
 async fn event_loop(
@@ -317,13 +351,46 @@ async fn event_loop(
     app: &mut App,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
+    let mut edge_scroll_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     terminal.draw(|frame| ui::draw(frame, app))?;
 
     while !app.should_quit {
+        if app
+            .output_selection
+            .is_some_and(|selection| selection.dragging)
+            && app.edge_scroll.direction != 0
+            && edge_scroll_timer.is_none()
+        {
+            edge_scroll_timer = Some(Box::pin(tokio::time::sleep(
+                std::time::Duration::from_millis(80),
+            )));
+        }
+        if !app
+            .output_selection
+            .is_some_and(|selection| selection.dragging)
+            || app.edge_scroll.direction == 0
+        {
+            edge_scroll_timer = None;
+        }
+        let edge_scroll_tick = async {
+            if let Some(timer) = edge_scroll_timer.as_mut() {
+                timer.await;
+            } else {
+                pending::<()>().await;
+            }
+        };
+        let mut did_edge_scroll = false;
         tokio::select! {
+            _ = edge_scroll_tick => {
+                did_edge_scroll = true;
+            }
             terminal_event = terminal_events.next() => {
                 match terminal_event {
-                    Some(Ok(event)) => handle_terminal_event(app, event).await?,
+                    Some(Ok(event)) => {
+                        if let Some(sequence) = handle_terminal_event(app, event).await? {
+                            execute!(terminal.backend_mut(), Print(sequence))?;
+                        }
+                    }
                     Some(Err(error)) => return Err(error.into()),
                     None => break,
                 }
@@ -333,6 +400,10 @@ async fn event_loop(
                     handle_agent_event(app, event);
                 }
             }
+        }
+        if did_edge_scroll {
+            edge_scroll_timer = None;
+            auto_scroll_selection(app);
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
     }
@@ -347,41 +418,42 @@ async fn event_loop(
     Ok(())
 }
 
-async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
+async fn handle_terminal_event(app: &mut App, event: Event) -> Result<Option<String>> {
     if let Event::Paste(text) = &event {
         if !app.busy && app.settings.is_none() && app.palette.is_none() {
             app.input.insert_str(text);
             update_file_suggestions(app);
         }
-        return Ok(());
+        return Ok(None);
     }
     if let Event::Mouse(mouse) = event {
-        if !app.busy && app.settings.is_none() && app.palette.is_none() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => scroll_messages(app, 5),
-                MouseEventKind::ScrollDown => scroll_messages(app, -5),
-                _ => {}
-            }
+        if output_mouse_event_allowed(
+            mouse.kind,
+            app.settings.is_some(),
+            app.palette.is_some(),
+            app.pending_approval.is_some(),
+        ) {
+            return Ok(handle_output_mouse(app, mouse));
         }
-        return Ok(());
+        return Ok(None);
     }
     let Event::Key(key) = event else {
-        return Ok(());
+        return Ok(None);
     };
     if key.kind != KeyEventKind::Press {
-        return Ok(());
+        return Ok(None);
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
-        return Ok(());
+        return Ok(None);
     }
     if app.settings.is_some() {
         handle_settings_key(app, key.code, key.modifiers);
-        return Ok(());
+        return Ok(None);
     }
     if app.palette.is_some() {
         handle_palette_key(app, key.code, key.modifiers);
-        return Ok(());
+        return Ok(None);
     }
     if app.pending_approval.is_some() {
         match key.code {
@@ -390,7 +462,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
             KeyCode::Esc => cancel_active_request(app),
             _ => {}
         }
-        return Ok(());
+        return Ok(None);
     }
     match key.code {
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
@@ -406,6 +478,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
                 .iter()
                 .rposition(|entry| matches!(entry.kind, DisplayKind::Tool))
             {
+                app.clear_output_selection();
                 if !app.expanded_tools.insert(index) {
                     app.expanded_tools.remove(&index);
                 }
@@ -483,7 +556,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
                 app.agent_phase = AgentPhase::Idle;
                 app.model_phase = ModelPhase::Idle;
                 app.status = "已取消".into();
-                app.entries.push(DisplayEntry {
+                app.push_entry(DisplayEntry {
                     kind: DisplayKind::System,
                     content: DisplayContent::Markdown("请求已取消。".into()),
                 });
@@ -564,7 +637,176 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<()> {
         }
         _ => {}
     }
-    Ok(())
+    Ok(None)
+}
+
+fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Option<String> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => scroll_messages(app, 5),
+        MouseEventKind::ScrollDown => scroll_messages(app, -5),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(offset) = app
+                .message_layout
+                .as_ref()
+                .and_then(|layout| layout.hit_test(mouse.column, mouse.row))
+            else {
+                app.clear_output_selection();
+                return None;
+            };
+            if app.follow_output {
+                app.output_scroll_top = app.message_layout.as_ref().map(|layout| layout.scroll);
+                if let Some(layout) = &app.message_layout {
+                    app.message_scroll = layout.max_scroll().saturating_sub(layout.scroll);
+                }
+            }
+            app.follow_output = false;
+            app.output_selection = Some(OutputSelection::new(offset));
+            update_edge_scroll(app, mouse.column, mouse.row);
+        }
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+            if app
+                .output_selection
+                .is_some_and(|selection| selection.dragging)
+            {
+                update_drag_position(app, mouse.column, mouse.row);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.edge_scroll = EdgeScroll::default();
+            let mut selection = app.output_selection?;
+            selection.dragging = false;
+            let Some((start, end)) = selection.range() else {
+                app.output_selection = None;
+                return None;
+            };
+            app.output_selection = Some(selection);
+            let Some(text) = app
+                .message_layout
+                .as_ref()
+                .and_then(|layout| layout.text.get(start..end))
+                .map(str::to_owned)
+            else {
+                app.status = "复制失败：选区位置已失效".into();
+                return None;
+            };
+            return match crate::clipboard::copy_text(&text) {
+                crate::clipboard::CopyResult::Native => {
+                    app.status = "系统剪贴板已复制".into();
+                    None
+                }
+                crate::clipboard::CopyResult::Osc52Requested(sequence) => {
+                    app.status = "已向终端发送复制请求".into();
+                    Some(sequence)
+                }
+                crate::clipboard::CopyResult::Error(error) => {
+                    app.status = format!("复制失败：{error}");
+                    None
+                }
+            };
+        }
+        _ => {}
+    }
+    None
+}
+
+fn update_drag_position(app: &mut App, column: u16, row: u16) {
+    let Some(offset) = app.message_layout.as_ref().and_then(|layout| {
+        let clamped_row = row
+            .max(layout.viewport.y)
+            .min(layout.viewport.bottom().saturating_sub(1));
+        layout.hit_test(column, clamped_row)
+    }) else {
+        return;
+    };
+    update_edge_scroll(app, column, row);
+    if let Some(selection) = &mut app.output_selection {
+        selection.active = offset;
+    }
+}
+
+fn update_edge_scroll(app: &mut App, column: u16, row: u16) {
+    let Some(layout) = &app.message_layout else {
+        return;
+    };
+    let direction = if row < layout.viewport.y {
+        -1
+    } else if row >= layout.viewport.bottom() {
+        1
+    } else {
+        0
+    };
+    app.edge_scroll = EdgeScroll { direction, column };
+}
+
+fn auto_scroll_selection(app: &mut App) {
+    let direction = app.edge_scroll.direction;
+    if direction == 0
+        || !app
+            .output_selection
+            .is_some_and(|selection| selection.dragging)
+    {
+        return;
+    }
+    scroll_messages(app, if direction < 0 { 1 } else { -1 });
+    let Some(layout) = &app.message_layout else {
+        return;
+    };
+    let scroll = app.output_scroll_top.unwrap_or(layout.scroll);
+    let row = if direction < 0 {
+        scroll
+    } else {
+        scroll.saturating_add(layout.viewport.height.saturating_sub(1) as usize)
+    };
+    let column = relative_output_column(app.edge_scroll.column, layout.viewport);
+    if let Some(offset) = layout.position_at_visual_row(row, column)
+        && let Some(selection) = &mut app.output_selection
+    {
+        selection.active = offset;
+    }
+}
+
+fn output_mouse_event_allowed(
+    kind: MouseEventKind,
+    settings_open: bool,
+    palette_open: bool,
+    approval_open: bool,
+) -> bool {
+    !settings_open
+        && !palette_open
+        && !approval_open
+        && matches!(
+            kind,
+            MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+                | MouseEventKind::Moved
+        )
+}
+
+fn relative_output_column(column: u16, viewport: ratatui::layout::Rect) -> usize {
+    column.saturating_sub(viewport.x) as usize
+}
+
+fn clear_output_selection(app: &mut App) {
+    app.output_selection = None;
+    app.edge_scroll = EdgeScroll::default();
+}
+
+fn push_entry(app: &mut App, entry: DisplayEntry) {
+    clear_output_selection(app);
+    app.entries.push(entry);
+}
+
+impl App {
+    fn clear_output_selection(&mut self) {
+        clear_output_selection(self);
+    }
+
+    fn push_entry(&mut self, entry: DisplayEntry) {
+        push_entry(self, entry);
+    }
 }
 
 fn cancel_active_request(app: &mut App) {
@@ -580,27 +822,50 @@ fn cancel_active_request(app: &mut App) {
     app.agent_phase = AgentPhase::Idle;
     app.model_phase = ModelPhase::Idle;
     app.status = "已取消当前请求".into();
-    app.entries.push(DisplayEntry {
+    app.push_entry(DisplayEntry {
         kind: DisplayKind::System,
         content: DisplayContent::Markdown("当前请求已取消。".into()),
     });
 }
 
 fn scroll_messages(app: &mut App, delta: isize) {
-    if delta > 0 {
-        app.message_scroll = app.message_scroll.saturating_add(delta as usize);
-        app.follow_output = false;
-    } else {
-        app.message_scroll = app.message_scroll.saturating_sub(delta.unsigned_abs());
-        if app.message_scroll == 0 {
-            app.follow_output = true;
+    let Some(layout) = &app.message_layout else {
+        if delta > 0 {
+            app.message_scroll = app.message_scroll.saturating_add(delta as usize);
+            app.follow_output = false;
+        } else {
+            app.message_scroll = app.message_scroll.saturating_sub(delta.unsigned_abs());
+            if app.message_scroll == 0 {
+                app.follow_output = true;
+            }
         }
+        return;
+    };
+    let max_scroll = layout.max_scroll();
+    let current = app
+        .output_scroll_top
+        .unwrap_or(layout.scroll)
+        .min(max_scroll);
+    let next = if delta > 0 {
+        current.saturating_add(delta as usize).min(max_scroll)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    };
+    if delta < 0 && next == max_scroll {
+        app.output_scroll_top = None;
+        app.follow_output = true;
+        app.message_scroll = 0;
+    } else {
+        app.output_scroll_top = Some(next);
+        app.follow_output = false;
+        app.message_scroll = max_scroll.saturating_sub(next);
     }
 }
 
 fn scroll_to_bottom(app: &mut App) {
     app.message_scroll = 0;
     app.follow_output = true;
+    app.output_scroll_top = None;
 }
 
 fn submit_input(app: &mut App) -> Result<()> {
@@ -627,7 +892,7 @@ fn submit_input(app: &mut App) -> Result<()> {
             return submit_input(app);
         }
         app.input.clear();
-        app.entries.push(DisplayEntry {
+        app.push_entry(DisplayEntry {
             kind: DisplayKind::Error,
             content: DisplayContent::Markdown(format!("未知命令，请使用 /help 查看命令：{input}")),
         });
@@ -639,9 +904,11 @@ fn submit_input(app: &mut App) -> Result<()> {
     };
     app.input.clear();
     app.file_suggestions.clear();
+    app.clear_output_selection();
     app.message_scroll = 0;
     app.follow_output = true;
-    app.entries.push(DisplayEntry {
+    app.output_scroll_top = None;
+    app.push_entry(DisplayEntry {
         kind: DisplayKind::User,
         content: DisplayContent::Markdown(input.clone()),
     });
@@ -658,7 +925,7 @@ fn submit_input(app: &mut App) -> Result<()> {
         });
         app.storage
             .append_context(&app.session_id, &label, &content)?;
-        app.entries.push(DisplayEntry {
+        app.push_entry(DisplayEntry {
             kind: DisplayKind::System,
             content: DisplayContent::Markdown(format!("已附加文件 @{label}")),
         });
@@ -853,7 +1120,7 @@ fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
 fn execute_command(app: &mut App, command: Command) -> Result<()> {
     match command {
         Command::Help => {
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(
                     "## 命令\n\n`/new` `/sessions` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 命令面板 | Ctrl+X 快捷键 | @ 文件 | ! Shell"
@@ -878,7 +1145,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(if listing.is_empty() {
                     "暂无会话".into()
@@ -914,7 +1181,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                     // sent as the stable system prefix on the next request.
                     app.storage.clear_response_id(&app.session_id)?;
                     app.status = format!("Agent：{} | 模式：{}", name, app.mode);
-                    app.entries.push(DisplayEntry {
+                    app.push_entry(DisplayEntry {
                         kind: DisplayKind::System,
                         content: DisplayContent::Markdown(format!(
                             "Agent 模式已切换为 **{}**。下一次模型请求将使用 {} 执行约束。",
@@ -935,7 +1202,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             let _ = app.storage.set_session_mode(&app.session_id, mode.as_str());
             app.storage.clear_response_id(&app.session_id)?;
             app.status = format!("模式已切换为 {}", mode.as_str().to_ascii_uppercase());
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(format!(
                     "Agent 模式已切换为 **{}**。下一次模型请求将使用 {} 执行约束。",
@@ -946,6 +1213,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         }
         Command::Clear => {
             app.entries.clear();
+            app.clear_output_selection();
             app.status = "显示已清空，会话历史仍保留".into();
         }
         Command::Quit => app.should_quit = true,
@@ -1249,7 +1517,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             app.agent_phase = AgentPhase::Thinking;
             app.model_phase = ModelPhase::Idle;
             app.thinking_summary = truncate_text(&summary, MAX_SUMMARY_BYTES);
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::Thinking,
                 content: DisplayContent::Markdown(app.thinking_summary.clone()),
             });
@@ -1269,7 +1537,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
                 )
             });
             if !already_open {
-                app.entries.push(DisplayEntry {
+                app.push_entry(DisplayEntry {
                     kind: DisplayKind::Tool,
                     content: DisplayContent::ToolCall {
                         name: "web_search".into(),
@@ -1285,7 +1553,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             snippet,
         } => {
             let context = format!("{url}\n{snippet}");
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::Tool,
                 content: DisplayContent::ToolResult {
                     name: format!("web_search: {title}"),
@@ -1322,7 +1590,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             {
                 text.push_str(&delta);
             } else {
-                app.entries.push(DisplayEntry {
+                app.push_entry(DisplayEntry {
                     kind: DisplayKind::Assistant,
                     content: DisplayContent::Markdown(delta),
                 });
@@ -1348,7 +1616,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             app.agent_phase = AgentPhase::ToolRunning;
             app.model_phase = ModelPhase::Idle;
             app.status = format!("正在执行 {}……", call.name);
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::Tool,
                 content: DisplayContent::ToolCall {
                     name: call.name,
@@ -1358,7 +1626,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::ToolFinished { call, result } => {
             app.agent_phase = AgentPhase::Thinking;
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::Tool,
                 content: DisplayContent::ToolResult {
                     name: call.name,
@@ -1387,7 +1655,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             };
         }
         AgentEvent::Failed(error) => {
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::Error,
                 content: DisplayContent::Markdown(secrets::redact(&error)),
             });
@@ -1403,7 +1671,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::LocalCommandFinished { command, result } => {
             if command == "/diff" {
-                app.entries.push(DisplayEntry {
+                app.push_entry(DisplayEntry {
                     kind: DisplayKind::Tool,
                     content: DisplayContent::Diff(result),
                 });
@@ -1415,7 +1683,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
                 trim_app_entries(app);
                 return;
             }
-            app.entries.push(DisplayEntry {
+            app.push_entry(DisplayEntry {
                 kind: DisplayKind::Tool,
                 content: DisplayContent::ToolResult {
                     name: format!("! {command}"),
@@ -1478,7 +1746,7 @@ fn resolve_approval(app: &mut App, approved: bool) {
                             .await;
                     }));
                 } else {
-                    app.entries.push(DisplayEntry {
+                    app.push_entry(DisplayEntry {
                         kind: DisplayKind::System,
                         content: DisplayContent::Markdown("Shell 命令已拒绝。".into()),
                     });
@@ -1563,8 +1831,10 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     app.input.clear();
     app.file_suggestions.clear();
     app.expanded_tools.clear();
+    app.clear_output_selection();
     app.message_scroll = 0;
     app.follow_output = true;
+    app.output_scroll_top = None;
     app.usage = Usage::default();
     app.context_used_tokens = estimate_context_tokens(&app.conversation);
     app.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
@@ -1674,6 +1944,7 @@ fn trim_app_entries(app: &mut App) {
     trim_entries(&mut app.entries);
     if before != app.entries.len() {
         app.expanded_tools.clear();
+        app.clear_output_selection();
     }
 }
 
@@ -1751,6 +2022,8 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::layout::Rect;
+
     use super::*;
 
     #[test]
@@ -1791,5 +2064,46 @@ mod tests {
             }]),
             2
         );
+    }
+
+    #[test]
+    fn edge_scroll_column_is_relative_to_output_viewport() {
+        let left_aligned = Rect::new(0, 4, 20, 6);
+        let sidebar_offset = Rect::new(30, 4, 20, 6);
+        assert_eq!(relative_output_column(5, left_aligned), 5);
+        assert_eq!(relative_output_column(35, sidebar_offset), 5);
+        assert_eq!(relative_output_column(29, sidebar_offset), 0);
+        assert_eq!(relative_output_column(55, sidebar_offset), 25);
+    }
+
+    #[test]
+    fn modal_popups_ignore_all_output_mouse_events() {
+        let events = [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ];
+        for (settings_open, palette_open, approval_open) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            for event in events {
+                assert!(!output_mouse_event_allowed(
+                    event,
+                    settings_open,
+                    palette_open,
+                    approval_open
+                ));
+            }
+        }
+        assert!(output_mouse_event_allowed(
+            MouseEventKind::ScrollDown,
+            false,
+            false,
+            false
+        ));
     }
 }

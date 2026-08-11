@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -14,9 +15,10 @@ use crate::{
         SettingsField, SettingsState,
     },
     commands,
+    output::{MessageLayout, OutputSelection, VisualLine},
 };
 
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let horizontal = if area.width >= 90 {
         Layout::default()
@@ -119,7 +121,7 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut lines = Vec::new();
     for (entry_index, entry) in app.entries.iter().enumerate() {
         let (label, color) = match &entry.kind {
@@ -172,21 +174,85 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         lines.push(Line::default());
     }
-    let visible_height = area.height.saturating_sub(1) as usize;
-    let max_scroll = wrapped_height(&lines, area.width as usize).saturating_sub(visible_height);
-    let scroll = if app.follow_output {
-        max_scroll
-    } else {
-        max_scroll.saturating_sub(app.message_scroll)
-    }
-    .min(u16::MAX as usize) as u16;
+    let viewport = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    let initial_layout = MessageLayout::new(lines, viewport, 0);
+    let max_scroll = initial_layout.max_scroll();
+    let scroll = app
+        .output_scroll_top
+        .unwrap_or_else(|| {
+            if app.follow_output {
+                max_scroll
+            } else {
+                max_scroll.saturating_sub(app.message_scroll)
+            }
+        })
+        .min(max_scroll);
+    let layout = MessageLayout::new(
+        initial_layout
+            .lines
+            .iter()
+            .map(|line| line.styled.clone())
+            .collect(),
+        viewport,
+        scroll,
+    );
+    let selection = app.output_selection;
+    let visible_lines = layout
+        .visual_lines
+        .iter()
+        .skip(layout.scroll)
+        .take(layout.viewport.height as usize)
+        .map(|line| render_visual_line(&layout, line, selection))
+        .collect::<Vec<_>>();
+    app.message_layout = Some(layout);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(visible_lines)
             .block(Block::default().title(" 任务 ").borders(Borders::BOTTOM))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_visual_line(
+    layout: &MessageLayout,
+    visual: &VisualLine,
+    selection: Option<OutputSelection>,
+) -> Line<'static> {
+    let Some(line) = layout.lines.get(visual.logical_line) else {
+        return Line::default();
+    };
+    let local_start = visual.start.saturating_sub(line.start);
+    let local_end = visual.end.saturating_sub(line.start);
+    let selected_range = selection.and_then(OutputSelection::range);
+    let mut spans = Vec::new();
+    let mut span_offset = 0usize;
+    for source in &line.styled.spans {
+        let source_text = source.content.as_ref();
+        for (offset, grapheme) in source_text.grapheme_indices(true) {
+            let grapheme_start = span_offset + offset;
+            let grapheme_end = grapheme_start + grapheme.len();
+            if grapheme_end <= local_start || grapheme_start >= local_end {
+                continue;
+            }
+            let global_start = line.start + grapheme_start;
+            let global_end = line.start + grapheme_end;
+            let is_selected =
+                selected_range.is_some_and(|(start, end)| start < global_end && end > global_start);
+            let style = if is_selected {
+                source.style.fg(Color::Black).bg(Color::Cyan)
+            } else {
+                source.style
+            };
+            spans.push(Span::styled(grapheme.to_owned(), style));
+        }
+        span_offset += source_text.len();
+    }
+    Line::from(spans)
 }
 
 fn render_markdown(text: &str, base: Style) -> Vec<Line<'static>> {
@@ -403,21 +469,6 @@ fn render_diff(diff: &str) -> Vec<Line<'static>> {
             Line::from(Span::styled(line.to_owned(), Style::default().fg(color)))
         })
         .collect()
-}
-
-fn wrapped_height(lines: &[Line<'static>], width: usize) -> usize {
-    let width = width.max(1);
-    lines
-        .iter()
-        .map(|line| {
-            let line_width = line
-                .spans
-                .iter()
-                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                .sum::<usize>();
-            line_width.max(1).div_ceil(width)
-        })
-        .sum()
 }
 
 fn heading_parts(value: &str) -> Option<(usize, &str)> {

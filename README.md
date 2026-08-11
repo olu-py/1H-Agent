@@ -67,6 +67,8 @@ native_web_search = "disabled"
 | 命令面板 / 命令 | `Ctrl+P` / `/` |
 | 引用文件 / 执行命令 | `@path` / `!command`（命令须审批） |
 | 滚动 / 回到底部 | `PageUp`、`PageDown` / `Ctrl+L` |
+| 输出选择 / 复制 | 在任务输出区按住鼠标左键拖选，松开后自动复制 |
+| 粘贴 | 由终端环境决定（例如 `Cmd+V`、`Ctrl+Shift+V`） |
 | 工具详情 / 审批 | `Ctrl+O` / `Y`、`N` |
 | 取消 / 退出 | `Esc` / `Ctrl+C` |
 

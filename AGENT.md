@@ -67,6 +67,7 @@ terminal event -> app::App -> agent::AgentRunner -> provider::OpenAiClient
 | 输入与历史 | 512 KiB；仅内存，最多 50 条 |
 | 显示与对话窗口 | 1,000 条或约 2 MiB；200 项或约 1 MiB |
 | 思考摘要 / `@` 文件 | 1,024 B；单文件 64 KiB、总计 256 KiB |
+| 输出剪贴板 / 边缘滚动 | 单次文本最多 256 KiB；约 80 ms 自动滚动计时器仅在拖拽期间存在 |
 | Agent/tool | 默认最多 8 turn；命令 60 秒；工具输出 1 MiB |
 | Web | 最多 5 次重定向；连接 10 秒、请求 30 秒；抓取默认 10 MiB |
 | 浏览器桥接 | 默认关闭；30 秒、2 MiB、空闲 30 秒；配置最大 3,600 秒、8 MiB |
@@ -95,6 +96,7 @@ terminal event -> app::App -> agent::AgentRunner -> provider::OpenAiClient
 ## 7. 维护检查
 
 - 新能力是否保持事件驱动、无空闲重绘、无无界 `Vec`/channel/输出？
+- 输出选择是否保持单次剪贴板文本不超过 256 KiB，且边缘自动滚动计时器只在拖拽期间存在？
 - 新工具是否经过 `ToolRegistry`、workspace/SSRF 校验、mode、审批和进程清理？
 - 新 Provider 事件是否先规范化，并明确持久化与恢复语义？
 - 新文档事实是否只在本文件出现一次，并能回溯到源码、示例配置或工作流？
