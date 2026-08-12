@@ -68,6 +68,7 @@ priority = "optional"
 assets = [
   ["target/release/1h-agent", "usr/bin/", "755"],
   ["README.md", "usr/share/doc/1h-agent/README.md", "644"],
+  ["THIRD_PARTY_NOTICES.md", "usr/share/doc/1h-agent/THIRD_PARTY_NOTICES.md", "644"],
   ["config/config.example.toml", "usr/share/doc/1h-agent/config.example.toml", "644"],
 ]
 

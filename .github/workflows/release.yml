@@ -83,7 +83,7 @@ jobs:
           package="1h-agent-${GITHUB_REF_NAME}-${{ matrix.slug }}"
           mkdir -p "dist/${package}"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${package}/"
-          cp README.md LICENSE config/config.example.toml "dist/${package}/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md config/config.example.toml "dist/${package}/"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
 
       - name: Package Windows archive
@@ -93,7 +93,7 @@ jobs:
           $package = "1h-agent-${{ github.ref_name }}-${{ matrix.slug }}"
           New-Item -ItemType Directory -Path "dist/$package" -Force
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$package/"
-          Copy-Item README.md, LICENSE, config/config.example.toml "dist/$package/"
+          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md, config/config.example.toml "dist/$package/"
           Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
 
       - name: Package macOS archive
@@ -103,7 +103,7 @@ jobs:
           package="1h-agent-${GITHUB_REF_NAME}-${{ matrix.slug }}"
           mkdir -p "dist/${package}"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${package}/"
-          cp README.md LICENSE config/config.example.toml "dist/${package}/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md config/config.example.toml "dist/${package}/"
           tar -czf "dist/${package}.tar.gz" -C dist "${package}"
 
       - name: Upload release archive
@@ -170,6 +170,8 @@ jobs:
         with:
           path: release-artifacts
           merge-multiple: true
+      - name: Add third-party notices to release assets
+        run: cp THIRD_PARTY_NOTICES.md release-artifacts/THIRD_PARTY_NOTICES.md
       - name: Generate checksums
         working-directory: release-artifacts
         run: find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
