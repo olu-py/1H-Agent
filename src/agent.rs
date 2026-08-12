@@ -5,9 +5,12 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    config::{NativeWebSearch, ProviderConfig, ProviderKind, ProviderPreset, RuntimeConfig},
+    config::{NativeWebSearch, ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability},
     prompt,
-    provider::{ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ToolCall, Usage},
+    provider::{
+        ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ThinkingMode, ToolCall,
+        Usage,
+    },
     security::PolicyDecision,
     storage::Storage,
     tools::SharedToolRegistry,
@@ -15,7 +18,7 @@ use crate::{
 
 #[derive(Debug)]
 pub enum AgentEvent {
-    ThinkingSummary(String),
+    ReasoningDelta(String),
     ModelStreaming,
     WebSearchStarted {
         query: String,
@@ -55,7 +58,6 @@ pub enum AgentEvent {
 pub struct AgentRunner {
     provider: OpenAiClient,
     provider_config: ProviderConfig,
-    runtime: RuntimeConfig,
     tools: SharedToolRegistry,
     storage: Storage,
     session_id: String,
@@ -72,7 +74,6 @@ impl AgentRunner {
     pub fn new(
         provider: OpenAiClient,
         provider_config: ProviderConfig,
-        runtime: RuntimeConfig,
         tools: SharedToolRegistry,
         storage: Storage,
         session_id: String,
@@ -80,7 +81,6 @@ impl AgentRunner {
         Self {
             provider,
             provider_config,
-            runtime,
             tools,
             storage,
             session_id,
@@ -125,25 +125,11 @@ impl AgentRunner {
         } else {
             0
         };
-        let mut next_summary = format!(
-            "正在以 {} 模式分析请求，并选择下一项安全操作。",
-            self.tools.mode().as_str().to_ascii_uppercase()
-        );
         let native_web_search = self.provider_config.preset == ProviderPreset::DeepSeek
             && self.provider_config.kind == ProviderKind::Responses
             && self.provider_config.native_web_search != NativeWebSearch::Disabled;
-        for _turn in 0..self.runtime.max_agent_turns {
-            let summary = next_summary.clone();
-            ui_events
-                .send(AgentEvent::ThinkingSummary(summary.clone()))
-                .await
-                .map_err(|_| "UI event receiver closed".to_owned())?;
-            items.push(ConversationItem::ThinkingSummary {
-                content: summary.clone(),
-            });
-            self.storage
-                .append_thinking_summary(&self.session_id, &summary)
-                .map_err(|error| error.to_string())?;
+        let mut executed_tool_calls = HashSet::<String>::new();
+        loop {
             let request_items = if previous_response_id.is_some() {
                 items[request_cursor..].to_vec()
             } else {
@@ -169,6 +155,7 @@ impl AgentRunner {
                 tools: self.tools.definitions(),
                 previous_response_id: previous_response_id.clone(),
                 native_web_search,
+                thinking_mode: thinking_mode_for(&self.provider_config),
             };
             let (model_tx, mut model_rx) = mpsc::channel(128);
             ui_events
@@ -239,10 +226,18 @@ impl AgentRunner {
                             .map_err(|error| format!("invalid provider item: {error}"))?;
                         if encoded.len() <= 64 * 1024 {
                             items.push(ConversationItem::ProviderItem { item: item.clone() });
-                            self.storage
-                                .append_provider_item(&self.session_id, &item)
-                                .map_err(|error| error.to_string())?;
+                            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                                self.storage
+                                    .append_provider_item(&self.session_id, &item)
+                                    .map_err(|error| error.to_string())?;
+                            }
                         }
+                    }
+                    ModelEvent::ReasoningDelta(delta) => {
+                        ui_events
+                            .send(AgentEvent::ReasoningDelta(delta))
+                            .await
+                            .map_err(|_| "UI event receiver closed".to_owned())?;
                     }
                     ModelEvent::TextDelta(delta) => {
                         assistant_text.push_str(&delta);
@@ -351,15 +346,29 @@ impl AgentRunner {
             self.storage
                 .append_tool_calls(&self.session_id, &completed_calls)
                 .map_err(|error| error.to_string())?;
-            let tool_names = completed_calls
-                .iter()
-                .map(|call| call.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
             // When Responses server state is enabled, the response already owns the
             // assistant text and tool calls. Only subsequent tool outputs are new.
             request_cursor = items.len();
             for call in completed_calls {
+                let signature = tool_call_signature(&call);
+                if executed_tool_calls.contains(&signature) {
+                    let result = "Duplicate tool call was not executed. Reuse the previous result or choose a different action.".to_owned();
+                    ui_events
+                        .send(AgentEvent::ToolFinished {
+                            call: call.clone(),
+                            result: result.clone(),
+                        })
+                        .await
+                        .map_err(|_| "UI event receiver closed".to_owned())?;
+                    items.push(ConversationItem::ToolOutput {
+                        call_id: call.id.clone(),
+                        output: result.clone(),
+                    });
+                    self.storage
+                        .append_tool_output(&self.session_id, &call.id, &result)
+                        .map_err(|error| error.to_string())?;
+                    continue;
+                }
                 let decision = self.tools.policy(&call);
                 let approved = match decision {
                     PolicyDecision::Allow => true,
@@ -436,13 +445,9 @@ impl AgentRunner {
                 self.storage
                     .append_tool_output(&self.session_id, &call.id, &result)
                     .map_err(|error| error.to_string())?;
+                executed_tool_calls.insert(signature);
             }
-            next_summary = format!("正在检查 {tool_names} 的结果，并决定下一项安全操作。");
         }
-        Err(format!(
-            "maximum tool turns reached ({})",
-            self.runtime.max_agent_turns
-        ))
     }
 
     async fn run_child(&self, call: &ToolCall) -> Result<String, String> {
@@ -482,6 +487,7 @@ impl AgentRunner {
             native_web_search: provider_config.preset == ProviderPreset::DeepSeek
                 && provider_config.kind == ProviderKind::Responses
                 && provider_config.native_web_search != NativeWebSearch::Disabled,
+            thinking_mode: ThinkingMode::Disabled,
         };
         let (events, mut receiver) = mpsc::channel(512);
         let provider = self.provider.clone();
@@ -499,6 +505,7 @@ impl AgentRunner {
                         output.push_str(&delta[..end]);
                     }
                 }
+                ModelEvent::ReasoningDelta(_) => {}
                 ModelEvent::Done => break,
                 ModelEvent::Usage(_)
                 | ModelEvent::ResponseId(_)
@@ -524,9 +531,326 @@ impl AgentRunner {
     }
 }
 
+fn tool_call_signature(call: &ToolCall) -> String {
+    format!("{}:{}", call.name, canonical_json(&call.arguments))
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(object) => {
+            let mut fields = object.iter().collect::<Vec<_>>();
+            fields.sort_unstable_by_key(|(key, _)| *key);
+            let fields = fields
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("JSON object keys are serializable"),
+                        canonical_json(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{fields}}}")
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => serde_json::to_string(value).expect("JSON values are serializable"),
+    }
+}
+
+fn qwen_thinking_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("qwen-plus")
+        || model.contains("qwen-max")
+        || model.contains("qwen-turbo")
+        || model.contains("qwen3")
+        || model.contains("qwq")
+        || model.contains("qwen-flash")
+}
+
+fn volcano_thinking_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("thinking") || model.contains("reason") || model.contains("seed")
+}
+
+fn thinking_mode_for(config: &ProviderConfig) -> ThinkingMode {
+    let capability = match config.thinking {
+        ThinkingCapability::Auto => None,
+        ThinkingCapability::OpenAi => Some(if config.kind == ProviderKind::Responses {
+            ThinkingMode::OpenAiResponsesSummary
+        } else {
+            ThinkingMode::CompatibleAuto
+        }),
+        ThinkingCapability::DeepSeek => Some(match config.kind {
+            ProviderKind::Responses => ThinkingMode::DeepSeekResponses,
+            ProviderKind::ChatCompletions => ThinkingMode::DeepSeekChat,
+        }),
+        ThinkingCapability::Qwen => Some(if config.kind == ProviderKind::ChatCompletions {
+            ThinkingMode::QwenChat
+        } else {
+            ThinkingMode::CompatibleAuto
+        }),
+        ThinkingCapability::Volcano => Some(if config.kind == ProviderKind::ChatCompletions {
+            ThinkingMode::VolcanoChat
+        } else {
+            ThinkingMode::CompatibleAuto
+        }),
+        ThinkingCapability::Compatible => Some(ThinkingMode::CompatibleAuto),
+        ThinkingCapability::Disabled => Some(ThinkingMode::Disabled),
+    };
+    if let Some(mode) = capability {
+        return mode;
+    }
+    match (config.preset, config.kind) {
+        (ProviderPreset::OpenAi, ProviderKind::Responses) => ThinkingMode::OpenAiResponsesSummary,
+        (ProviderPreset::DeepSeek, ProviderKind::Responses) => ThinkingMode::DeepSeekResponses,
+        (ProviderPreset::DeepSeek, ProviderKind::ChatCompletions) => ThinkingMode::DeepSeekChat,
+        (ProviderPreset::Qwen, ProviderKind::ChatCompletions)
+            if qwen_thinking_model(&config.model) =>
+        {
+            ThinkingMode::QwenChat
+        }
+        (ProviderPreset::Volcano, ProviderKind::ChatCompletions)
+            if volcano_thinking_model(&config.model) =>
+        {
+            ThinkingMode::VolcanoChat
+        }
+        (ProviderPreset::Custom, ProviderKind::ChatCompletions) => ThinkingMode::CompatibleAuto,
+        _ => ThinkingMode::Disabled,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildArgs {
     prompt: String,
     max_turns: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{config::RuntimeConfig, security::Workspace, tools::ToolRegistry};
+
+    #[test]
+    fn enables_thinking_only_for_known_qwen_thinking_families() {
+        assert!(qwen_thinking_model("qwen3.8-max"));
+        assert!(qwen_thinking_model("QWQ-32B"));
+        assert!(qwen_thinking_model("qwen-plus"));
+        assert!(qwen_thinking_model("qwen-max"));
+        assert!(qwen_thinking_model("qwen-turbo"));
+        assert!(!qwen_thinking_model("qwen2.5-coder"));
+        assert!(!qwen_thinking_model("custom-model"));
+    }
+
+    #[test]
+    fn selects_provider_specific_thinking_modes() {
+        let mut config = ProviderPreset::OpenAi.defaults();
+        assert_eq!(
+            thinking_mode_for(&config),
+            ThinkingMode::OpenAiResponsesSummary
+        );
+
+        config = ProviderPreset::DeepSeek.defaults();
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::DeepSeekResponses);
+        config.kind = ProviderKind::ChatCompletions;
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::DeepSeekChat);
+
+        config = ProviderPreset::Qwen.defaults();
+        for model in [
+            "qwen-plus",
+            "qwen-max",
+            "qwen-turbo",
+            "qwen3-max",
+            "qwq-32b",
+        ] {
+            config.model = model.into();
+            assert_eq!(thinking_mode_for(&config), ThinkingMode::QwenChat);
+        }
+        config.model = "unknown-qwen-model".into();
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::Disabled);
+
+        config = ProviderPreset::Volcano.defaults();
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::VolcanoChat);
+
+        config = ProviderPreset::Custom.defaults();
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::CompatibleAuto);
+        config.thinking = ThinkingCapability::Qwen;
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::QwenChat);
+        config.thinking = ThinkingCapability::OpenAi;
+        config.kind = ProviderKind::Responses;
+        assert_eq!(
+            thinking_mode_for(&config),
+            ThinkingMode::OpenAiResponsesSummary
+        );
+        config.thinking = ThinkingCapability::Disabled;
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::Disabled);
+    }
+
+    #[test]
+    fn tool_signatures_normalize_object_keys_but_preserve_values() {
+        let first = ToolCall {
+            id: "call-1".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path":"src/lib.rs","options":{"end":20,"start":1}}),
+        };
+        let reordered = ToolCall {
+            id: "call-2".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"options":{"start":1,"end":20},"path":"src/lib.rs"}),
+        };
+        let different = ToolCall {
+            id: "call-3".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path":"src/lib.rs","options":{"start":2,"end":20}}),
+        };
+
+        assert_eq!(tool_call_signature(&first), tool_call_signature(&reordered));
+        assert_ne!(tool_call_signature(&first), tool_call_signature(&different));
+    }
+
+    #[tokio::test]
+    async fn main_agent_completes_after_one_hundred_tool_rounds() {
+        let mut responses = (0..100)
+            .map(|round| {
+                vec![
+                    ModelEvent::ToolCallComplete(ToolCall {
+                        id: format!("call-{round}"),
+                        name: "file_read".into(),
+                        arguments: serde_json::json!({"path":format!("missing-{round}")}),
+                    }),
+                    ModelEvent::Done,
+                ]
+            })
+            .collect::<Vec<_>>();
+        responses.push(vec![ModelEvent::TextDelta("done".into()), ModelEvent::Done]);
+
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "run tools")
+            .unwrap();
+        let mut provider_config = ProviderPreset::Custom.defaults();
+        provider_config.model = "fixture".into();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let runner = AgentRunner::new(
+            OpenAiClient::scripted(responses).unwrap(),
+            provider_config,
+            tools,
+            storage,
+            session_id,
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "run tools".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+
+        let mut completed = false;
+        let mut failed = None;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::Completed { .. } => completed = true,
+                AgentEvent::Failed(error) => failed = Some(error),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert!(completed);
+        assert!(failed.is_none(), "unexpected failure: {failed:?}");
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_is_skipped_and_conversation_continues() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path":"fixture.txt"}),
+        };
+        let provider = OpenAiClient::scripted(vec![
+            vec![
+                ModelEvent::ToolCallComplete(call("call-1")),
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCallComplete(call("call-2")),
+                ModelEvent::Done,
+            ],
+            vec![ModelEvent::TextDelta("done".into()), ModelEvent::Done],
+        ])
+        .unwrap();
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("fixture.txt"), "fixture result").unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "read fixture")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage,
+            session_id,
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "read fixture".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+
+        let mut starts = 0;
+        let mut duplicate_notice = false;
+        let mut completed = false;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::ToolStarted(_) => starts += 1,
+                AgentEvent::ToolFinished { result, .. } => {
+                    duplicate_notice |= result.starts_with("Duplicate tool call was not executed");
+                }
+                AgentEvent::Completed { .. } => completed = true,
+                AgentEvent::Failed(error) => panic!("unexpected failure: {error}"),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert_eq!(starts, 1);
+        assert!(duplicate_notice);
+        assert!(completed);
+    }
 }

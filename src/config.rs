@@ -37,6 +37,44 @@ pub struct ProviderConfig {
     pub use_previous_response_id: bool,
     pub native_web_search: NativeWebSearch,
     pub context_window_tokens: Option<u64>,
+    pub thinking: ThinkingCapability,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingCapability {
+    #[default]
+    Auto,
+    OpenAi,
+    DeepSeek,
+    Qwen,
+    Volcano,
+    Compatible,
+    Disabled,
+}
+
+impl ThinkingCapability {
+    pub const ALL: [Self; 7] = [
+        Self::Auto,
+        Self::OpenAi,
+        Self::DeepSeek,
+        Self::Qwen,
+        Self::Volcano,
+        Self::Compatible,
+        Self::Disabled,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动",
+            Self::OpenAi => "OpenAI 摘要",
+            Self::DeepSeek => "DeepSeek",
+            Self::Qwen => "Qwen",
+            Self::Volcano => "火山方舟",
+            Self::Compatible => "兼容解析",
+            Self::Disabled => "关闭",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -84,7 +122,6 @@ pub enum ProviderKind {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
-    pub max_agent_turns: usize,
     pub command_timeout_seconds: u64,
     pub max_tool_output_bytes: usize,
     pub max_fetch_bytes: usize,
@@ -195,6 +232,7 @@ impl Default for ProviderConfig {
             use_previous_response_id: false,
             native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
+            thinking: ThinkingCapability::Auto,
         }
     }
 }
@@ -202,7 +240,6 @@ impl Default for ProviderConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            max_agent_turns: 8,
             command_timeout_seconds: 60,
             max_tool_output_bytes: 1024 * 1024,
             max_fetch_bytes: 10 * 1024 * 1024,
@@ -247,9 +284,6 @@ impl Config {
                 anyhow::bail!("provider.context_window_tokens must be at least 4096");
             }
             config.provider.context_window_tokens = Some(limit.min(10_000_000));
-        }
-        if config.runtime.max_agent_turns == 0 || config.runtime.max_agent_turns > 32 {
-            anyhow::bail!("max_agent_turns must be between 1 and 32");
         }
         if config.browser.timeout_seconds == 0 || config.browser.timeout_seconds > 3600 {
             anyhow::bail!("browser timeout must be between 1 and 3600 seconds");
@@ -391,6 +425,7 @@ impl ProviderPreset {
             use_previous_response_id: false,
             native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
+            thinking: ThinkingCapability::Auto,
         }
     }
 
@@ -796,8 +831,20 @@ mod tests {
     fn defaults_are_bounded() {
         let config = Config::default();
         assert_eq!(config.provider.kind, ProviderKind::Responses);
-        assert!(config.runtime.max_agent_turns <= 32);
         assert!(config.runtime.max_fetch_bytes >= config.runtime.max_tool_output_bytes);
+    }
+
+    #[test]
+    fn deprecated_main_agent_turn_limit_is_ignored() {
+        // RuntimeConfig intentionally accepts and ignores this removed key so
+        // existing user configuration continues to load.
+        let runtime: RuntimeConfig = toml::from_str(
+            "max_agent_turns = 8\ncommand_timeout_seconds = 17\nmax_tool_output_bytes = 2048\nmax_fetch_bytes = 4096",
+        )
+        .unwrap();
+        assert_eq!(runtime.command_timeout_seconds, 17);
+        assert_eq!(runtime.max_tool_output_bytes, 2048);
+        assert_eq!(runtime.max_fetch_bytes, 4096);
     }
 
     #[test]

@@ -17,7 +17,6 @@ context_meter = true
 # https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 
 [runtime]
-max_agent_turns = 8
 command_timeout_seconds = 60
 max_tool_output_bytes = 1048576
 max_fetch_bytes = 10485760

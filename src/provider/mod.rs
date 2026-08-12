@@ -49,10 +49,24 @@ pub struct ModelRequest {
     pub tools: Vec<ToolDefinition>,
     pub previous_response_id: Option<String>,
     pub native_web_search: bool,
+    pub thinking_mode: ThinkingMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThinkingMode {
+    OpenAiResponsesSummary,
+    DeepSeekResponses,
+    DeepSeekChat,
+    QwenChat,
+    VolcanoChat,
+    CompatibleAuto,
+    #[default]
+    Disabled,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEvent {
+    ReasoningDelta(String),
     WebSearchStarted {
         query: String,
     },

@@ -17,11 +17,18 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     app::{
         AgentPhase, App, CommandPaletteState, DisplayContent, DisplayKind, ModelPhase,
-        SettingsField, SettingsState,
+        SettingsField, SettingsState, ToolDisplay, ToolDisplayStatus,
     },
     commands,
-    output::{MessageLayout, OutputSelection, VisualLine},
+    output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
+    secrets,
 };
+
+struct RenderedMessageLines {
+    lines: Vec<Line<'static>>,
+    interactions: Vec<Option<InteractionTarget>>,
+    thinking_before: Option<usize>,
+}
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -127,8 +134,140 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let block = Block::default().title(" 任务 ").borders(Borders::BOTTOM);
+    let viewport = block.inner(area);
+    update_message_layout(app, viewport);
+    let thinking_lines = live_thinking_lines(app, viewport.width.max(1) as usize);
+    let Some(layout) = &app.message_layout else {
+        frame.render_widget(
+            Paragraph::new(Vec::<Line<'static>>::new()).block(block),
+            area,
+        );
+        return;
+    };
+    let selection = app.output_selection;
+    let visible_lines = layout
+        .visual_lines
+        .iter()
+        .skip(layout.scroll)
+        .take(layout.viewport.height as usize)
+        .map(|line| render_visual_line(layout, line, selection, &thinking_lines))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(visible_lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
+    let thinking_lines = live_thinking_lines(app, viewport.width.max(1) as usize);
+    let cached_width = app.message_layout.as_ref().map(|layout| layout.width);
+    let viewport_width = viewport.width.max(1) as usize;
+    if app.output_layout_dirty || app.message_layout.is_none() {
+        drop(app.message_layout.take());
+        let rendered = render_message_lines(app, viewport_width);
+        app.message_layout = Some(MessageLayout::new_with_interactions(
+            rendered.lines,
+            rendered.interactions,
+            viewport,
+            0,
+            rendered.thinking_before,
+        ));
+        #[cfg(test)]
+        {
+            app.output_layout_rebuild_count += 1;
+        }
+    } else if cached_width != Some(viewport_width) {
+        let layout = app
+            .message_layout
+            .take()
+            .expect("layout existence was checked above");
+        app.message_layout = Some(layout.reflow(viewport));
+        #[cfg(test)]
+        {
+            app.output_layout_rebuild_count += 1;
+        }
+    } else if let Some(layout) = &mut app.message_layout {
+        layout.update_viewport(viewport);
+    }
+
+    if let Some(layout) = &mut app.message_layout {
+        layout.set_live_thinking_lines(&thinking_lines);
+        let max_scroll = layout.max_scroll();
+        let anchored_scroll =
+            app.layout_restore_anchor
+                .take()
+                .and_then(|(target, relative_row)| {
+                    layout
+                        .visual_lines
+                        .iter()
+                        .position(|line| line.interaction.as_ref() == Some(&target))
+                        .map(|visual_row| visual_row.saturating_sub(relative_row))
+                });
+        let scroll = anchored_scroll
+            .or(app.output_scroll_top)
+            .unwrap_or_else(|| {
+                if app.follow_output {
+                    max_scroll
+                } else {
+                    max_scroll.saturating_sub(app.message_scroll)
+                }
+            })
+            .min(max_scroll);
+        if anchored_scroll.is_some() {
+            app.output_scroll_top = Some(scroll);
+            app.message_scroll = max_scroll.saturating_sub(scroll);
+        }
+        layout.set_scroll(scroll);
+    }
+    app.output_layout_dirty = false;
+}
+
+fn render_message_lines(app: &App, width: usize) -> RenderedMessageLines {
     let mut lines = Vec::new();
+    let mut interactions = Vec::new();
+    let mut thinking_before = None;
+    let mut in_tool_group = false;
     for (entry_index, entry) in app.entries.iter().enumerate() {
+        if app.thinking_anchor == Some(entry_index) {
+            thinking_before = Some(lines.len());
+            in_tool_group = false;
+        }
+        if let DisplayContent::Tool(tool) = &entry.content {
+            if !in_tool_group {
+                push_rendered_line(
+                    &mut lines,
+                    &mut interactions,
+                    Line::from(Span::styled(
+                        "工具",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    None,
+                );
+                in_tool_group = true;
+            }
+            render_tool(
+                tool,
+                app.expanded_tools.contains(&tool.call_id),
+                width,
+                &mut lines,
+                &mut interactions,
+            );
+            let group_ends = app.entries.get(entry_index + 1).is_none_or(|next| {
+                !matches!(next.content, DisplayContent::Tool(_))
+                    || app.thinking_anchor == Some(entry_index + 1)
+            });
+            if group_ends {
+                push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
+                in_tool_group = false;
+            }
+            continue;
+        }
+        in_tool_group = false;
         let (label, color) = match &entry.kind {
             DisplayKind::User => ("用户", Color::Green),
             DisplayKind::Assistant => ("Agent", Color::Cyan),
@@ -137,97 +276,75 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             DisplayKind::Error => ("错误", Color::Red),
             DisplayKind::System => ("系统", Color::DarkGray),
         };
-        lines.push(Line::from(Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
+        push_rendered_line(
+            &mut lines,
+            &mut interactions,
+            Line::from(Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )),
+            None,
+        );
         let content_style = Style::default().fg(color);
         match &entry.content {
             DisplayContent::Markdown(text) => {
                 if text.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "...",
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    push_rendered_line(
+                        &mut lines,
+                        &mut interactions,
+                        Line::from(Span::styled("...", Style::default().fg(Color::DarkGray))),
+                        None,
+                    );
                 } else {
-                    lines.extend(render_markdown(text, content_style));
+                    for line in render_markdown(text, content_style) {
+                        push_rendered_line(&mut lines, &mut interactions, line, None);
+                    }
                 }
             }
             DisplayContent::Diff(diff) => {
-                lines.extend(render_diff(diff));
-            }
-            DisplayContent::ToolCall { name, arguments } => {
-                if app.expanded_tools.contains(&entry_index) {
-                    lines.extend(render_tool_call(name, arguments));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("调用 {name} [已折叠；Ctrl+O 展开]"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                for line in render_diff(diff) {
+                    push_rendered_line(&mut lines, &mut interactions, line, None);
                 }
             }
-            DisplayContent::ToolResult { name, result } => {
-                if app.expanded_tools.contains(&entry_index) {
-                    lines.extend(render_tool_result(name, result));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("结果 {name} [{} 字节；已折叠；Ctrl+O 展开]", result.len()),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
+            DisplayContent::Tool(_) => unreachable!("tool entries are rendered as a group"),
         }
-        lines.push(Line::default());
+        push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
     }
-    let viewport = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: area.height.saturating_sub(1),
-    };
-    let initial_layout = MessageLayout::new(lines, viewport, 0);
-    let max_scroll = initial_layout.max_scroll();
-    let scroll = app
-        .output_scroll_top
-        .unwrap_or_else(|| {
-            if app.follow_output {
-                max_scroll
-            } else {
-                max_scroll.saturating_sub(app.message_scroll)
-            }
-        })
-        .min(max_scroll);
-    let layout = MessageLayout::new(
-        initial_layout
-            .lines
-            .iter()
-            .map(|line| line.styled.clone())
-            .collect(),
-        viewport,
-        scroll,
-    );
-    let selection = app.output_selection;
-    let visible_lines = layout
-        .visual_lines
-        .iter()
-        .skip(layout.scroll)
-        .take(layout.viewport.height as usize)
-        .map(|line| render_visual_line(&layout, line, selection))
-        .collect::<Vec<_>>();
-    app.message_layout = Some(layout);
-    frame.render_widget(
-        Paragraph::new(visible_lines)
-            .block(Block::default().title(" 任务 ").borders(Borders::BOTTOM))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    if app.thinking_anchor.is_some() && thinking_before.is_none() {
+        thinking_before = Some(lines.len());
+    }
+    RenderedMessageLines {
+        lines,
+        interactions,
+        thinking_before,
+    }
+}
+
+fn push_rendered_line(
+    lines: &mut Vec<Line<'static>>,
+    interactions: &mut Vec<Option<InteractionTarget>>,
+    line: Line<'static>,
+    interaction: Option<InteractionTarget>,
+) {
+    lines.push(line);
+    interactions.push(interaction);
 }
 
 fn render_visual_line(
     layout: &MessageLayout,
     visual: &VisualLine,
     selection: Option<OutputSelection>,
+    thinking_lines: &[String],
 ) -> Line<'static> {
+    if visual.synthetic {
+        return Line::from(Span::styled(
+            thinking_lines
+                .get(visual.start)
+                .cloned()
+                .unwrap_or_default(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     let Some(line) = layout.lines.get(visual.logical_line) else {
         return Line::default();
     };
@@ -833,56 +950,216 @@ fn table_border_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn render_tool_call(name: &str, arguments: &Value) -> Vec<Line<'static>> {
-    let arguments =
-        serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string());
-    let mut lines = vec![Line::from(vec![
-        Span::styled("调用 ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            name.to_owned(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])];
-    lines.push(Line::from(Span::styled(
-        "参数",
-        Style::default().fg(Color::DarkGray),
-    )));
-    for line in arguments.lines() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(line.to_owned(), code_style()),
-        ]));
+fn render_tool(
+    tool: &ToolDisplay,
+    expanded: bool,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+    interactions: &mut Vec<Option<InteractionTarget>>,
+) {
+    let marker = match (expanded, &tool.status) {
+        (true, _) => "▾",
+        (false, ToolDisplayStatus::Running) => "◌",
+        (false, _) => "▸",
+    };
+    let status = match tool.status {
+        ToolDisplayStatus::Running => "",
+        ToolDisplayStatus::Completed => "  ✓",
+        ToolDisplayStatus::Failed | ToolDisplayStatus::Rejected => "  ✗",
+    };
+    let name = tool_display_name(&tool.name);
+    let fixed_width = UnicodeWidthStr::width(marker)
+        .saturating_add(1)
+        .saturating_add(UnicodeWidthStr::width(name.as_str()))
+        .saturating_add(UnicodeWidthStr::width(status));
+    let summary = tool_compact_summary(
+        &tool.name,
+        &tool.arguments,
+        width.saturating_sub(fixed_width.saturating_add(2)),
+    );
+    let summary = if summary.is_empty() {
+        String::new()
+    } else {
+        format!("  {summary}")
+    };
+    push_rendered_line(
+        lines,
+        interactions,
+        Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(summary),
+            Span::styled(
+                status,
+                Style::default().fg(match tool.status {
+                    ToolDisplayStatus::Completed => Color::Green,
+                    ToolDisplayStatus::Failed | ToolDisplayStatus::Rejected => Color::Red,
+                    ToolDisplayStatus::Running => Color::Yellow,
+                }),
+            ),
+        ]),
+        Some(InteractionTarget::Tool(tool.call_id.clone())),
+    );
+    if !expanded {
+        return;
     }
-    lines
+    push_rendered_line(lines, interactions, Line::from("  参数"), None);
+    if let Some(arguments) = tool.arguments.as_object() {
+        for (key, value) in arguments {
+            push_rendered_line(
+                lines,
+                interactions,
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        format!("{}：", argument_label(key)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(human_argument(key, value)),
+                ]),
+                None,
+            );
+        }
+    } else {
+        push_rendered_line(lines, interactions, Line::from("    （无）"), None);
+    }
+    push_rendered_line(lines, interactions, Line::from("  结果"), None);
+    match tool.result.as_deref() {
+        Some(result) if !result.is_empty() => {
+            for line in result.lines() {
+                push_rendered_line(
+                    lines,
+                    interactions,
+                    Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(secrets::redact(line), code_style()),
+                    ]),
+                    None,
+                );
+            }
+        }
+        Some(_) => push_rendered_line(lines, interactions, Line::from("    （空）"), None),
+        None => push_rendered_line(lines, interactions, Line::from("    执行中…"), None),
+    }
 }
 
-fn render_tool_result(name: &str, result: &str) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![
-        Span::styled("结果 ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            name.to_owned(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])];
-    lines.push(Line::from(Span::styled(
-        "输出",
-        Style::default().fg(Color::DarkGray),
-    )));
-    if result.is_empty() {
-        lines.push(Line::from(Span::styled("  （空）", code_style())));
-    } else {
-        lines.extend(result.lines().map(|line| {
-            Line::from(vec![
-                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(line.to_owned(), code_style()),
-            ])
-        }));
+pub(crate) fn tool_display_name(name: &str) -> String {
+    let translated = match name {
+        "file_list" => Some("文件列表"),
+        "file_stat" => Some("文件信息"),
+        "file_read" => Some("文件读取"),
+        "file_search" => Some("文件搜索"),
+        "file_mkdir" => Some("新建目录"),
+        "file_write" => Some("文件修改"),
+        "file_copy" => Some("文件复制"),
+        "file_move" => Some("文件移动"),
+        "file_delete" => Some("文件删除"),
+        "web_search" => Some("网络搜索"),
+        "web_fetch" | "webfetch" => Some("网页读取"),
+        "terminal_exec" => Some("命令执行"),
+        "terminal_shell" => Some("Shell 命令"),
+        "agent_spawn" => Some("子 Agent"),
+        "git" => Some("Git 操作"),
+        "git_diff" => Some("差异查看"),
+        "browser_open" => Some("打开网页"),
+        "browser_snapshot" => Some("页面快照"),
+        "browser_click" => Some("页面点击"),
+        "browser_type" => Some("页面输入"),
+        "browser_press" => Some("页面按键"),
+        _ => None,
+    };
+    if let Some(translated) = translated {
+        return translated.to_owned();
     }
-    lines
+    if let Some(external) = name.strip_prefix("mcp:") {
+        let tool = external.rsplit([':', '/']).next().unwrap_or(external);
+        return format!("外部工具：{}", tool.replace('_', " "));
+    }
+    name.replace('_', " ")
+}
+
+fn tool_compact_summary(name: &str, arguments: &Value, width: usize) -> String {
+    let get = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+            .unwrap_or_default()
+    };
+    let raw = match name {
+        "file_read" | "file_write" | "file_stat" | "file_list" | "file_mkdir" | "file_delete" => {
+            get(&["path"]).to_owned()
+        }
+        "file_search" => [get(&["path"]), get(&["query", "pattern"])]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("  "),
+        "web_search" => get(&["query"]).to_owned(),
+        "web_fetch" | "webfetch" | "browser_open" => get(&["url"]).to_owned(),
+        "terminal_exec" => {
+            let mut parts = Vec::new();
+            let program = get(&["program", "command"]);
+            if !program.is_empty() {
+                parts.push(program.to_owned());
+            }
+            if let Some(args) = arguments.get("args").and_then(Value::as_array) {
+                parts.extend(
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .take(4)
+                        .map(str::to_owned),
+                );
+            }
+            parts.join(" ")
+        }
+        "terminal_shell" => get(&["command"]).to_owned(),
+        "git" | "git_diff" => arguments
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default(),
+        "file_move" | "file_copy" => format!(
+            "{} -> {}",
+            get(&["source", "from"]),
+            get(&["destination", "to"])
+        ),
+        "agent_spawn" => get(&["prompt", "task"]).to_owned(),
+        _ => get(&["path", "query", "url"]).to_owned(),
+    };
+    fit_text_tail(&secrets::redact(raw.trim()), width)
+}
+
+fn fit_text_tail(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_owned();
+    }
+    let ellipsis = if width > 1 { "…" } else { "" };
+    let target = width.saturating_sub(UnicodeWidthStr::width(ellipsis));
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for grapheme in value.graphemes(true).rev() {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(grapheme_width) > target {
+            break;
+        }
+        kept.push(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    kept.reverse();
+    format!("{ellipsis}{}", kept.concat())
 }
 
 fn render_diff(diff: &str) -> Vec<Line<'static>> {
@@ -1103,7 +1380,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("Esc 取消请求 | Ctrl+C 退出", "")
     } else {
         (
-            "Enter 发送 | Shift+Enter 换行 | Ctrl+P 命令面板 | Ctrl+O 工具详情",
+            "Enter 发送 | Shift+Enter 换行 | Ctrl+P 命令面板",
             "Ctrl+X 快捷键 | @ 文件 | ! Shell | / 命令 | Ctrl+C 退出",
         )
     };
@@ -1161,7 +1438,7 @@ fn approval_lines(call: &crate::provider::ToolCall, reason: &str) -> Vec<Line<'s
         Line::from(vec![
             Span::styled("工具  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                tool_label(&call.name),
+                tool_display_name(&call.name),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1197,25 +1474,6 @@ fn approval_lines(call: &crate::provider::ToolCall, reason: &str) -> Vec<Line<'s
     lines
 }
 
-fn tool_label(name: &str) -> String {
-    match name {
-        "file_write" => "Write file",
-        "file_delete" => "Delete file",
-        "file_move" => "Move file",
-        "file_copy" => "Copy file",
-        "file_mkdir" => "Create directory",
-        "terminal_exec" => "Run program",
-        "terminal_shell" => "Run shell command",
-        "git" => "Run Git operation",
-        "webfetch" => "Fetch web content",
-        "agent_spawn" => "Start child agent",
-        value if value.starts_with("browser_") => "Control external browser",
-        value if value.starts_with("mcp:") => "Run external MCP tool",
-        _ => name,
-    }
-    .to_owned()
-}
-
 fn tool_risk(name: &str) -> &'static str {
     match name {
         "file_delete" => "HIGH - removes workspace data",
@@ -1232,16 +1490,16 @@ fn tool_risk(name: &str) -> &'static str {
 
 fn argument_label(key: &str) -> &'static str {
     match key {
-        "path" => "Path",
-        "source" | "from" => "Source",
-        "destination" | "to" => "Target",
+        "path" => "路径",
+        "source" | "from" => "来源",
+        "destination" | "to" => "目标",
         "command" => "命令",
-        "args" => "Arguments",
-        "cwd" => "Directory",
+        "args" => "参数",
+        "cwd" => "目录",
         "url" => "URL",
-        "content" => "Content",
-        "max_bytes" => "Max size",
-        "timeout_seconds" => "Timeout",
+        "content" => "内容",
+        "max_bytes" => "最大大小",
+        "timeout_seconds" => "超时",
         "prompt" => "任务",
         _ => "参数",
     }
@@ -1300,7 +1558,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState) {
-    let popup = centered_rect(84, 17, area);
+    let popup = centered_rect(84, 19, area);
     let key = if settings.api_key.is_empty() {
         if settings.has_existing_key {
             "********".to_owned()
@@ -1330,6 +1588,11 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState) {
             SettingsField::Model,
             "模型",
             settings.provider.model.clone(),
+        ),
+        (
+            SettingsField::Thinking,
+            "思考能力",
+            settings.provider.thinking.label().to_owned(),
         ),
         (SettingsField::ApiKey, "API Key", key),
     ];
@@ -1474,6 +1737,110 @@ fn fit_text(value: &str, width: usize) -> String {
     output + "..."
 }
 
+#[cfg(test)]
+pub(crate) fn live_thinking_line(app: &App) -> String {
+    live_thinking_lines_with_braille(app, usize::MAX, crate::app::braille_spinner_supported())
+        .join("\n")
+}
+
+#[cfg(test)]
+pub(crate) fn live_thinking_line_with_braille(app: &App, braille: bool) -> String {
+    live_thinking_lines_with_braille(app, usize::MAX, braille).join("\n")
+}
+
+fn live_thinking_lines(app: &App, width: usize) -> Vec<String> {
+    live_thinking_lines_with_braille(app, width, crate::app::braille_spinner_supported())
+}
+
+fn live_thinking_lines_with_braille(app: &App, width: usize, braille: bool) -> Vec<String> {
+    if app.thinking_anchor.is_none() {
+        return Vec::new();
+    }
+    let status = if app.thinking_active {
+        "思考中"
+    } else {
+        match app.thinking_result {
+            crate::app::ThinkingResult::Completed => "思考完成",
+            crate::app::ThinkingResult::Failed => "思考失败",
+            crate::app::ThinkingResult::Cancelled => "思考已取消",
+        }
+    };
+    if !app.thinking_expanded {
+        let prefix = if app.thinking_active {
+            crate::app::thinking_animation_glyph(app.thinking_animation_frame, braille).to_string()
+        } else {
+            match app.thinking_result {
+                crate::app::ThinkingResult::Completed => "✓",
+                crate::app::ThinkingResult::Failed => "✗",
+                crate::app::ThinkingResult::Cancelled => "■",
+            }
+            .to_owned()
+        };
+        let suffix = app.thinking_last_line.trim();
+        let fixed = format!("{prefix} {status}");
+        let available = width
+            .saturating_sub(UnicodeWidthStr::width(fixed.as_str()))
+            .saturating_sub(2);
+        let suffix = fit_text_tail(suffix, available);
+        return vec![
+            if suffix.is_empty() || (app.thinking_active && suffix == "模型正在思考") {
+                fixed
+            } else {
+                format!("{fixed}  {suffix}")
+            },
+        ];
+    }
+    let expanded_title = if app.thinking_active {
+        format!(
+            "▾ {} {status}",
+            crate::app::thinking_animation_glyph(app.thinking_animation_frame, braille)
+        )
+    } else {
+        format!("▾ {status}")
+    };
+    let mut lines = vec![fit_text_tail(&expanded_title, width)];
+    if app.thinking_buffer_truncated {
+        lines.extend(wrap_grapheme_lines("  [较早思考内容已截断]", width));
+    }
+    let reasoning = app.thinking_buffer.trim();
+    if reasoning.is_empty() {
+        lines.extend(wrap_grapheme_lines(
+            &format!("  {}", app.thinking_last_line),
+            width,
+        ));
+    } else {
+        for line in reasoning.lines() {
+            lines.extend(wrap_grapheme_lines(&format!("  {line}"), width));
+        }
+    }
+    lines
+}
+
+fn wrap_grapheme_lines(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut output = Vec::new();
+    for logical_line in value.split('\n') {
+        if logical_line.is_empty() {
+            output.push(String::new());
+            continue;
+        }
+        let mut row = String::new();
+        let mut used = 0usize;
+        for grapheme in logical_line.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if !row.is_empty() && used.saturating_add(grapheme_width) > width {
+                output.push(row);
+                row = String::new();
+                used = 0;
+            }
+            row.push_str(grapheme);
+            used = used.saturating_add(grapheme_width);
+        }
+        output.push(row);
+    }
+    output
+}
+
 fn input_viewport(input: &str, inner_width: usize) -> (&str, usize) {
     let text_capacity = inner_width.saturating_sub(1);
     let mut visible_width = 0;
@@ -1529,6 +1896,25 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_block_inner_is_the_message_layout_viewport() {
+        let area = Rect::new(30, 0, 80, 20);
+        let block = Block::default().title(" 任务 ").borders(Borders::BOTTOM);
+        let viewport = block.inner(area);
+        assert_eq!(viewport.x, area.x);
+        assert_eq!(viewport.y, area.y + 1);
+        assert_eq!(viewport.height, area.height - 2);
+
+        let layout = MessageLayout::new(vec![Line::from("正文")], viewport, 0);
+        assert_eq!(layout.viewport, block.inner(area));
+
+        let tiny = Block::default()
+            .title(" 任务 ")
+            .borders(Borders::BOTTOM)
+            .inner(Rect::new(0, 0, 1, 1));
+        assert_eq!(tiny.height, 0);
+    }
 
     #[test]
     fn input_cursor_tracks_terminal_columns() {
@@ -1706,25 +2092,60 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_is_structured_and_pretty_printed() {
-        let call = render_tool_call("file_read", &serde_json::json!({"path": "a.txt"}));
-        let result = render_tool_result("file_read", "line one\nline two");
-        assert!(
-            call.iter()
-                .any(|line| { line.spans.iter().any(|span| span.content == "file_read") })
+    fn tool_output_is_merged_translated_and_structured() {
+        let tool = ToolDisplay {
+            call_id: "call-1".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+            status: ToolDisplayStatus::Completed,
+            result: Some("line one\nline two".into()),
+        };
+        let mut lines = Vec::new();
+        let mut interactions = Vec::new();
+        render_tool(&tool, true, 80, &mut lines, &mut interactions);
+        let text = markdown_text(&lines);
+        assert!(text.contains("文件读取"));
+        assert!(text.contains("路径：a.txt"));
+        assert!(text.contains("line two"));
+        assert_eq!(
+            interactions[0],
+            Some(InteractionTarget::Tool("call-1".into()))
         );
-        assert!(call.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content == "  \"path\": \"a.txt\"")
-        }));
-        assert!(result.iter().any(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                == "│ line two"
-        }));
+    }
+
+    #[test]
+    fn all_builtin_tool_names_are_translated_and_unknown_names_stay_readable() {
+        let expected = [
+            ("file_list", "文件列表"),
+            ("file_stat", "文件信息"),
+            ("file_read", "文件读取"),
+            ("file_search", "文件搜索"),
+            ("file_mkdir", "新建目录"),
+            ("file_write", "文件修改"),
+            ("file_copy", "文件复制"),
+            ("file_move", "文件移动"),
+            ("file_delete", "文件删除"),
+            ("web_search", "网络搜索"),
+            ("web_fetch", "网页读取"),
+            ("terminal_exec", "命令执行"),
+            ("terminal_shell", "Shell 命令"),
+            ("agent_spawn", "子 Agent"),
+            ("git", "Git 操作"),
+            ("git_diff", "差异查看"),
+            ("browser_open", "打开网页"),
+            ("browser_snapshot", "页面快照"),
+            ("browser_click", "页面点击"),
+            ("browser_type", "页面输入"),
+            ("browser_press", "页面按键"),
+        ];
+        for (name, translated) in expected {
+            assert_eq!(tool_display_name(name), translated);
+        }
+        assert_eq!(tool_display_name("custom_reader"), "custom reader");
+        assert_eq!(
+            tool_display_name("mcp:server:remote_tool"),
+            "外部工具：remote tool"
+        );
     }
 
     #[test]
@@ -1750,7 +2171,7 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(text.contains("Run shell command"));
+        assert!(text.contains("Shell 命令"));
         assert!(text.contains("HIGH"));
         assert!(text.contains("[redacted]"));
         assert!(!text.contains("secret-value"));
@@ -1763,5 +2184,21 @@ mod tests {
         assert_eq!(context_ring(50), "◑");
         assert_eq!(context_ring(90), "◉");
         assert_eq!(context_ring(100), "●");
+    }
+
+    #[test]
+    fn live_thinking_wraps_all_content_on_grapheme_boundaries() {
+        assert_eq!(
+            wrap_grapheme_lines("「正在检查项目结构」", 10),
+            vec!["「正在检查", "项目结构」"]
+        );
+        assert_eq!(
+            wrap_grapheme_lines("abc👩‍💻e\u{301}尾", 5),
+            vec!["abc👩‍💻", "e\u{301}尾"]
+        );
+        assert_eq!(
+            wrap_grapheme_lines("one\n\ntwo", 20),
+            vec!["one", "", "two"]
+        );
     }
 }

@@ -4,11 +4,13 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Value, json};
+#[cfg(test)]
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use super::{
-    ConversationItem, ModelEvent, ModelRequest, ProviderError, Role, ToolCall, ToolDefinition,
-    Usage,
+    ConversationItem, ModelEvent, ModelRequest, ProviderError, Role, ThinkingMode, ToolCall,
+    ToolDefinition, Usage,
 };
 use crate::config::ProviderKind;
 
@@ -17,6 +19,8 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: String,
     client: reqwest::Client,
+    #[cfg(test)]
+    scripted_events: Option<std::sync::Arc<Mutex<std::collections::VecDeque<Vec<ModelEvent>>>>>,
 }
 
 impl OpenAiClient {
@@ -30,7 +34,16 @@ impl OpenAiClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key,
             client,
+            #[cfg(test)]
+            scripted_events: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(responses: Vec<Vec<ModelEvent>>) -> Result<Self, ProviderError> {
+        let mut client = Self::new("http://127.0.0.1".into(), "test".into())?;
+        client.scripted_events = Some(std::sync::Arc::new(Mutex::new(responses.into())));
+        Ok(client)
     }
 
     pub async fn stream(
@@ -38,6 +51,20 @@ impl OpenAiClient {
         request: ModelRequest,
         events: mpsc::Sender<ModelEvent>,
     ) -> Result<(), ProviderError> {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted_events {
+            let response =
+                scripted.lock().await.pop_front().ok_or_else(|| {
+                    ProviderError::Protocol("scripted provider exhausted".to_owned())
+                })?;
+            for event in response {
+                events
+                    .send(event)
+                    .await
+                    .map_err(|_| ProviderError::ReceiverClosed)?;
+            }
+            return Ok(());
+        }
         let (path, body) = match request.kind {
             ProviderKind::ChatCompletions => ("chat/completions", chat_body(&request)),
             ProviderKind::Responses => ("responses", responses_body(&request)),
@@ -76,7 +103,9 @@ impl OpenAiClient {
                     .map_err(|error| ProviderError::Protocol(error.to_string()))?;
                 let parsed = match request.kind {
                     ProviderKind::ChatCompletions => parse_chat_event(&value),
-                    ProviderKind::Responses => parse_responses_event(&value),
+                    ProviderKind::Responses => {
+                        parse_responses_event_for_mode(&value, request.thinking_mode)
+                    }
                 }?;
                 for model_event in parsed {
                     if matches!(model_event, ModelEvent::Done) {
@@ -115,6 +144,15 @@ fn chat_body(request: &ModelRequest) -> Value {
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
+    }
+    match request.thinking_mode {
+        ThinkingMode::DeepSeekChat | ThinkingMode::VolcanoChat => {
+            body["thinking"] = json!({"type": "enabled"});
+        }
+        ThinkingMode::QwenChat => {
+            body["enable_thinking"] = Value::Bool(true);
+        }
+        _ => {}
     }
     body
 }
@@ -184,6 +222,15 @@ fn responses_body(request: &ModelRequest) -> Value {
         "input": input,
         "stream": true,
     });
+    match request.thinking_mode {
+        ThinkingMode::OpenAiResponsesSummary => {
+            body["reasoning"] = json!({"summary": "auto"});
+        }
+        ThinkingMode::DeepSeekResponses => {
+            body["reasoning"] = json!({"effort": "high"});
+        }
+        _ => {}
+    }
     if let Some(instructions) = instructions {
         body["instructions"] = Value::String(instructions);
     }
@@ -267,6 +314,9 @@ pub(crate) fn parse_chat_event(value: &Value) -> Result<Vec<ModelEvent>, Provide
         .flatten()
     {
         let delta = choice.get("delta").unwrap_or(&Value::Null);
+        if let Some(reasoning) = recognized_reasoning_delta(delta) {
+            events.push(ModelEvent::ReasoningDelta(reasoning.to_owned()));
+        }
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
             events.push(ModelEvent::TextDelta(content.to_owned()));
         }
@@ -293,11 +343,22 @@ pub(crate) fn parse_chat_event(value: &Value) -> Result<Vec<ModelEvent>, Provide
             });
         }
     }
+    if let Some(reasoning) = value.get("delta").and_then(recognized_reasoning_delta) {
+        events.push(ModelEvent::ReasoningDelta(reasoning.to_owned()));
+    }
     append_native_search_events(value, &mut events);
     Ok(events)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, ProviderError> {
+    parse_responses_event_for_mode(value, ThinkingMode::OpenAiResponsesSummary)
+}
+
+pub(crate) fn parse_responses_event_for_mode(
+    value: &Value,
+    thinking_mode: ThinkingMode,
+) -> Result<Vec<ModelEvent>, ProviderError> {
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -313,6 +374,36 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
         "response.output_text.delta" => {
             if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                 events.push(ModelEvent::TextDelta(delta.to_owned()));
+            }
+        }
+        "response.reasoning_summary_text.delta"
+            if matches!(thinking_mode, ThinkingMode::OpenAiResponsesSummary) =>
+        {
+            if let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| safe_reasoning_text(delta))
+            {
+                events.push(ModelEvent::ReasoningDelta(delta.to_owned()));
+            }
+        }
+        "response.reasoning_text.delta"
+        | "response.reasoning_text.done"
+        | "response.reasoning_content.delta"
+        | "response.reasoning.delta"
+            if matches!(thinking_mode, ThinkingMode::DeepSeekResponses) =>
+        {
+            let field = if event_type == "response.reasoning_text.done" {
+                "text"
+            } else {
+                "delta"
+            };
+            if let Some(delta) = value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|delta| safe_reasoning_text(delta))
+            {
+                events.push(ModelEvent::ReasoningDelta(delta.to_owned()));
             }
         }
         "response.output_item.added" => {
@@ -369,7 +460,11 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
                         })?,
                     }));
                 }
-                Some("reasoning" | "web_search_call") => {
+                Some("reasoning") => {
+                    append_reasoning_summary(item, &mut events);
+                    events.push(ModelEvent::ProviderItem(item.clone()));
+                }
+                Some("web_search_call") => {
                     events.push(ModelEvent::ProviderItem(item.clone()));
                 }
                 _ => {}
@@ -406,6 +501,43 @@ pub(crate) fn parse_responses_event(value: &Value) -> Result<Vec<ModelEvent>, Pr
         _ => {}
     }
     Ok(events)
+}
+
+fn recognized_reasoning_delta(delta: &Value) -> Option<&str> {
+    ["reasoning_content", "thinking", "reasoning"]
+        .into_iter()
+        .find_map(|field| delta.get(field).and_then(Value::as_str))
+        .filter(|value| safe_reasoning_text(value))
+}
+
+fn append_reasoning_summary(item: &Value, events: &mut Vec<ModelEvent>) {
+    for text in item
+        .get("summary")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|summary| summary.get("text").and_then(Value::as_str))
+        .filter(|text| safe_reasoning_text(text))
+    {
+        events.push(ModelEvent::ReasoningDelta(text.to_owned()));
+    }
+}
+
+fn safe_reasoning_text(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return false;
+    }
+    let looks_base64 = trimmed.len() >= 32
+        && trimmed.len().rem_euclid(4) == 0
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='));
+    !looks_base64
 }
 
 // DeepSeek Responses follows the OpenAI web-search event and citation shapes.
@@ -694,15 +826,25 @@ mod tests {
     }
 
     #[test]
-    fn preserves_deepseek_provider_items_and_rejects_incomplete_response() {
+    fn parses_reasoning_summary_and_rejects_incomplete_response() {
         let events = parse_responses_event(&json!({
             "type": "response.output_item.done",
-            "item": {"id":"rs_1", "type":"reasoning", "content":[]}
+            "item": {
+                "id":"rs_1",
+                "type":"reasoning",
+                "encrypted_content":"never show",
+                "summary":[{"type":"summary_text", "text":"checked constraints"}]
+            }
         }))
         .unwrap();
-        assert!(
-            matches!(events.first(), Some(ModelEvent::ProviderItem(item)) if item["id"] == "rs_1")
-        );
+        assert!(matches!(
+            events.first(),
+            Some(ModelEvent::ReasoningDelta(text)) if text == "checked constraints"
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(ModelEvent::ProviderItem(item)) if item["id"] == "rs_1"
+        ));
 
         let error = parse_responses_event(&json!({
             "type": "response.incomplete",
@@ -710,6 +852,109 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.to_string().contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn parses_openai_reasoning_summary_delta() {
+        let events = parse_responses_event(&json!({
+            "type":"response.reasoning_summary_text.delta",
+            "item_id":"rs_123",
+            "output_index":0,
+            "summary_index":0,
+            "delta":"working",
+            "sequence_number":7
+        }))
+        .unwrap();
+        assert_eq!(events, vec![ModelEvent::ReasoningDelta("working".into())]);
+    }
+
+    #[test]
+    fn parses_official_deepseek_responses_reasoning_text_events() {
+        let delta = parse_responses_event_for_mode(
+            &json!({
+                "type":"response.reasoning_text.delta",
+                "response_id":"resp_123",
+                "item_id":"rs_123",
+                "output_index":0,
+                "content_index":0,
+                "delta":"检查项目结构"
+            }),
+            ThinkingMode::DeepSeekResponses,
+        )
+        .unwrap();
+        assert_eq!(
+            delta,
+            vec![ModelEvent::ReasoningDelta("检查项目结构".into())]
+        );
+
+        let done = parse_responses_event_for_mode(
+            &json!({
+                "type":"response.reasoning_text.done",
+                "response_id":"resp_123",
+                "item_id":"rs_123",
+                "text":"检查项目结构"
+            }),
+            ThinkingMode::DeepSeekResponses,
+        )
+        .unwrap();
+        assert_eq!(
+            done,
+            vec![ModelEvent::ReasoningDelta("检查项目结构".into())]
+        );
+    }
+
+    fn assert_chat_reasoning(model: &str, field: &str) {
+        let events = parse_chat_event(&json!({
+            "id":"chatcmpl-fixture",
+            "object":"chat.completion.chunk",
+            "created":1770000000,
+            "model":model,
+            "choices":[{
+                "index":0,
+                "delta":{"role":"assistant",(field):"reasoning chunk","content":null},
+                "finish_reason":null
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![ModelEvent::ReasoningDelta("reasoning chunk".into())]
+        );
+    }
+
+    #[test]
+    fn parses_deepseek_reasoning_content() {
+        assert_chat_reasoning("deepseek-reasoner", "reasoning_content");
+    }
+
+    #[test]
+    fn parses_qwen_reasoning_content() {
+        assert_chat_reasoning("qwen-plus", "reasoning_content");
+    }
+
+    #[test]
+    fn parses_volcano_reasoning_content() {
+        assert_chat_reasoning("doubao-seed-2-1-pro", "reasoning_content");
+    }
+
+    #[test]
+    fn parses_only_recognized_custom_reasoning_fields() {
+        assert_chat_reasoning("custom", "thinking");
+        assert_chat_reasoning("custom", "reasoning");
+        let direct = parse_chat_event(&json!({
+            "delta":{"thinking":"direct"}
+        }))
+        .unwrap();
+        assert_eq!(direct, vec![ModelEvent::ReasoningDelta("direct".into())]);
+
+        for value in [
+            json!({"choices":[{"delta":{"encrypted_content":"secret"}}]}),
+            json!({"choices":[{"delta":{"unknown":{"reasoning_content":"hidden"}}}]}),
+            json!({"choices":[{"delta":{"blob":"SGVsbG8="}}]}),
+            json!({"choices":[{"delta":{"reasoning_content":"QUJDREVGR0hJSktMTU5PUFFSU1RVVldY"}}]}),
+        ] {
+            assert!(parse_chat_event(&value).unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -734,6 +979,7 @@ mod tests {
             }],
             previous_response_id: None,
             native_web_search: true,
+            thinking_mode: ThinkingMode::Disabled,
         };
         let body = responses_body(&request);
         assert_eq!(body["instructions"], "stable system prefix");
@@ -756,9 +1002,84 @@ mod tests {
             tools: Vec::new(),
             previous_response_id: None,
             native_web_search: false,
+            thinking_mode: ThinkingMode::Disabled,
         };
         let body = chat_body(&request);
         assert!(body.get("tools").is_none());
         assert_eq!(body.pointer("/messages/0/content"), Some(&json!("search")));
+    }
+
+    #[test]
+    fn qwen_thinking_parameter_is_only_sent_when_enabled() {
+        let mut request = ModelRequest {
+            kind: ProviderKind::ChatCompletions,
+            model: "qwen3-max".into(),
+            items: Vec::new(),
+            tools: Vec::new(),
+            previous_response_id: None,
+            native_web_search: false,
+            thinking_mode: ThinkingMode::QwenChat,
+        };
+        assert_eq!(chat_body(&request)["enable_thinking"], true);
+        request.thinking_mode = ThinkingMode::Disabled;
+        assert!(chat_body(&request).get("enable_thinking").is_none());
+    }
+
+    fn empty_request(kind: ProviderKind, thinking_mode: ThinkingMode) -> ModelRequest {
+        ModelRequest {
+            kind,
+            model: "fixture-model".into(),
+            items: Vec::new(),
+            tools: Vec::new(),
+            previous_response_id: None,
+            native_web_search: false,
+            thinking_mode,
+        }
+    }
+
+    #[test]
+    fn provider_specific_thinking_request_fields_are_isolated() {
+        let openai = responses_body(&empty_request(
+            ProviderKind::Responses,
+            ThinkingMode::OpenAiResponsesSummary,
+        ));
+        assert_eq!(openai["reasoning"], json!({"summary":"auto"}));
+
+        let deepseek_responses = responses_body(&empty_request(
+            ProviderKind::Responses,
+            ThinkingMode::DeepSeekResponses,
+        ));
+        assert_eq!(deepseek_responses["reasoning"], json!({"effort":"high"}));
+
+        for mode in [ThinkingMode::DeepSeekChat, ThinkingMode::VolcanoChat] {
+            assert_eq!(
+                chat_body(&empty_request(ProviderKind::ChatCompletions, mode))["thinking"],
+                json!({"type":"enabled"})
+            );
+        }
+        let compatible = chat_body(&empty_request(
+            ProviderKind::ChatCompletions,
+            ThinkingMode::CompatibleAuto,
+        ));
+        assert!(compatible.get("thinking").is_none());
+        assert!(compatible.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn reasoning_provider_item_is_returned_in_follow_up_input() {
+        let item = json!({
+            "id":"rs_123",
+            "type":"reasoning",
+            "summary":[{"type":"summary_text","text":"summary"}]
+        });
+        let mut request = empty_request(
+            ProviderKind::Responses,
+            ThinkingMode::OpenAiResponsesSummary,
+        );
+        request
+            .items
+            .push(ConversationItem::ProviderItem { item: item.clone() });
+        let body = responses_body(&request);
+        assert_eq!(body.pointer("/input/0"), Some(&item));
     }
 }
