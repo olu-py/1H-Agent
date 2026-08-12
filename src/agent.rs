@@ -5,7 +5,10 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    config::{NativeWebSearch, ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability},
+    config::{
+        NativeWebSearch, ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability,
+        thinking_profile,
+    },
     prompt,
     provider::{
         ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ThinkingMode, ToolCall,
@@ -156,6 +159,13 @@ impl AgentRunner {
                 previous_response_id: previous_response_id.clone(),
                 native_web_search,
                 thinking_mode: thinking_mode_for(&self.provider_config),
+                thinking_level: self.provider_config.thinking_level,
+                thinking_budget_tokens: self.provider_config.thinking_budget_tokens,
+                thinking_profile_kind: thinking_profile(
+                    self.provider_config.preset,
+                    &self.provider_config.model,
+                )
+                .kind,
             };
             let (model_tx, mut model_rx) = mpsc::channel(128);
             ui_events
@@ -459,6 +469,8 @@ impl AgentRunner {
         let mut provider_config = self.provider_config.clone();
         let _max_turns = arguments.max_turns.unwrap_or(3).clamp(1, 3);
         provider_config.use_previous_response_id = false;
+        let thinking_profile_kind =
+            thinking_profile(provider_config.preset, &provider_config.model).kind;
         let request = ModelRequest {
             kind: provider_config.kind,
             model: provider_config.model,
@@ -488,6 +500,9 @@ impl AgentRunner {
                 && provider_config.kind == ProviderKind::Responses
                 && provider_config.native_web_search != NativeWebSearch::Disabled,
             thinking_mode: ThinkingMode::Disabled,
+            thinking_level: provider_config.thinking_level,
+            thinking_budget_tokens: provider_config.thinking_budget_tokens,
+            thinking_profile_kind,
         };
         let (events, mut receiver) = mpsc::channel(512);
         let provider = self.provider.clone();

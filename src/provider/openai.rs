@@ -12,7 +12,7 @@ use super::{
     ConversationItem, ModelEvent, ModelRequest, ProviderError, Role, ThinkingMode, ToolCall,
     ToolDefinition, Usage,
 };
-use crate::config::ProviderKind;
+use crate::config::{ProviderKind, ThinkingLevel, ThinkingProfileKind};
 
 #[derive(Clone)]
 pub struct OpenAiClient {
@@ -145,16 +145,40 @@ fn chat_body(request: &ModelRequest) -> Value {
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    match request.thinking_mode {
-        ThinkingMode::DeepSeekChat | ThinkingMode::VolcanoChat => {
+    apply_chat_thinking(&mut body, request);
+    body
+}
+
+fn apply_chat_thinking(body: &mut Value, request: &ModelRequest) {
+    match request.thinking_profile_kind {
+        ThinkingProfileKind::Qwen38 => {
+            if let Some(effort) = reasoning_effort(request.thinking_level) {
+                body["reasoning_effort"] = Value::String(effort.into());
+            }
+        }
+        ThinkingProfileKind::Qwen37 => {
+            let enabled = request.thinking_level == ThinkingLevel::Enabled;
+            body["enable_thinking"] = Value::Bool(enabled);
+            if enabled && let Some(budget) = request.thinking_budget_tokens {
+                body["thinking_budget"] = Value::Number(budget.into());
+            }
+        }
+        ThinkingProfileKind::DeepSeekPro | ThinkingProfileKind::DeepSeekFlash => {
+            let enabled = request.thinking_level != ThinkingLevel::None;
+            body["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }});
+            if let Some(effort) = deepseek_effort(request) {
+                body["reasoning_effort"] = Value::String(effort.into());
+            }
+        }
+        ThinkingProfileKind::Volcano => {
             body["thinking"] = json!({"type": "enabled"});
         }
-        ThinkingMode::QwenChat => {
-            body["enable_thinking"] = Value::Bool(true);
+        ThinkingProfileKind::OpenAi | ThinkingProfileKind::Compatible => {
+            if let Some(effort) = reasoning_effort(request.thinking_level) {
+                body["reasoning_effort"] = Value::String(effort.into());
+            }
         }
-        _ => {}
     }
-    body
 }
 
 fn chat_item(item: &ConversationItem) -> Option<Value> {
@@ -222,15 +246,7 @@ fn responses_body(request: &ModelRequest) -> Value {
         "input": input,
         "stream": true,
     });
-    match request.thinking_mode {
-        ThinkingMode::OpenAiResponsesSummary => {
-            body["reasoning"] = json!({"summary": "auto"});
-        }
-        ThinkingMode::DeepSeekResponses => {
-            body["reasoning"] = json!({"effort": "high"});
-        }
-        _ => {}
-    }
+    apply_responses_thinking(&mut body, request);
     if let Some(instructions) = instructions {
         body["instructions"] = Value::String(instructions);
     }
@@ -241,6 +257,63 @@ fn responses_body(request: &ModelRequest) -> Value {
         body["previous_response_id"] = Value::String(id.clone());
     }
     body
+}
+
+fn apply_responses_thinking(body: &mut Value, request: &ModelRequest) {
+    match request.thinking_profile_kind {
+        ThinkingProfileKind::DeepSeekPro | ThinkingProfileKind::DeepSeekFlash => {
+            let enabled = request.thinking_level != ThinkingLevel::None;
+            body["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }});
+            if let Some(effort) = deepseek_effort(request) {
+                body["reasoning"] = json!({"effort": effort});
+            }
+        }
+        ThinkingProfileKind::OpenAi => {
+            let mut reasoning = serde_json::Map::new();
+            if request.thinking_level != ThinkingLevel::None {
+                reasoning.insert("summary".into(), Value::String("auto".into()));
+            }
+            if let Some(effort) = reasoning_effort(request.thinking_level) {
+                reasoning.insert("effort".into(), Value::String(effort.into()));
+            }
+            if !reasoning.is_empty() {
+                body["reasoning"] = Value::Object(reasoning);
+            }
+        }
+        ThinkingProfileKind::Compatible => {
+            if let Some(effort) = reasoning_effort(request.thinking_level) {
+                body["reasoning"] = json!({"effort": effort});
+            }
+        }
+        ThinkingProfileKind::Qwen38
+        | ThinkingProfileKind::Qwen37
+        | ThinkingProfileKind::Volcano => {}
+    }
+}
+
+fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
+    match level {
+        ThinkingLevel::Auto | ThinkingLevel::Enabled => None,
+        ThinkingLevel::None => Some("none"),
+        ThinkingLevel::Minimal => Some("minimal"),
+        ThinkingLevel::Low => Some("low"),
+        ThinkingLevel::Medium => Some("medium"),
+        ThinkingLevel::High => Some("high"),
+        ThinkingLevel::XHigh => Some("xhigh"),
+        ThinkingLevel::Max => Some("max"),
+    }
+}
+
+fn deepseek_effort(request: &ModelRequest) -> Option<&'static str> {
+    match request.thinking_level {
+        ThinkingLevel::None => Some("none"),
+        ThinkingLevel::XHigh
+            if request.thinking_profile_kind == ThinkingProfileKind::DeepSeekFlash =>
+        {
+            Some("high")
+        }
+        level => reasoning_effort(level),
+    }
 }
 
 fn responses_item(item: &ConversationItem) -> Vec<Value> {
@@ -980,6 +1053,9 @@ mod tests {
             previous_response_id: None,
             native_web_search: true,
             thinking_mode: ThinkingMode::Disabled,
+            thinking_level: ThinkingLevel::High,
+            thinking_budget_tokens: None,
+            thinking_profile_kind: ThinkingProfileKind::DeepSeekFlash,
         };
         let body = responses_body(&request);
         assert_eq!(body["instructions"], "stable system prefix");
@@ -1003,6 +1079,9 @@ mod tests {
             previous_response_id: None,
             native_web_search: false,
             thinking_mode: ThinkingMode::Disabled,
+            thinking_level: ThinkingLevel::Auto,
+            thinking_budget_tokens: None,
+            thinking_profile_kind: ThinkingProfileKind::Compatible,
         };
         let body = chat_body(&request);
         assert!(body.get("tools").is_none());
@@ -1010,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_thinking_parameter_is_only_sent_when_enabled() {
+    fn qwen37_thinking_switch_and_budget_are_serialized() {
         let mut request = ModelRequest {
             kind: ProviderKind::ChatCompletions,
             model: "qwen3-max".into(),
@@ -1019,10 +1098,20 @@ mod tests {
             previous_response_id: None,
             native_web_search: false,
             thinking_mode: ThinkingMode::QwenChat,
+            thinking_level: ThinkingLevel::Enabled,
+            thinking_budget_tokens: Some(4096),
+            thinking_profile_kind: ThinkingProfileKind::Qwen37,
         };
         assert_eq!(chat_body(&request)["enable_thinking"], true);
-        request.thinking_mode = ThinkingMode::Disabled;
-        assert!(chat_body(&request).get("enable_thinking").is_none());
+        assert_eq!(chat_body(&request)["thinking_budget"], 4096);
+        for budget in [1024, 4096, 8192, 16384, 32768] {
+            request.thinking_budget_tokens = Some(budget);
+            assert_eq!(chat_body(&request)["thinking_budget"], budget);
+        }
+        request.thinking_level = ThinkingLevel::None;
+        let disabled = chat_body(&request);
+        assert_eq!(disabled["enable_thinking"], false);
+        assert!(disabled.get("thinking_budget").is_none());
     }
 
     fn empty_request(kind: ProviderKind, thinking_mode: ThinkingMode) -> ModelRequest {
@@ -1034,29 +1123,56 @@ mod tests {
             previous_response_id: None,
             native_web_search: false,
             thinking_mode,
+            thinking_level: ThinkingLevel::Auto,
+            thinking_budget_tokens: None,
+            thinking_profile_kind: ThinkingProfileKind::Compatible,
         }
     }
 
     #[test]
     fn provider_specific_thinking_request_fields_are_isolated() {
-        let openai = responses_body(&empty_request(
+        let mut openai_request = empty_request(
             ProviderKind::Responses,
             ThinkingMode::OpenAiResponsesSummary,
-        ));
+        );
+        openai_request.thinking_profile_kind = ThinkingProfileKind::OpenAi;
+        let openai = responses_body(&openai_request);
         assert_eq!(openai["reasoning"], json!({"summary":"auto"}));
+        openai_request.thinking_level = ThinkingLevel::High;
+        assert_eq!(
+            responses_body(&openai_request)["reasoning"],
+            json!({"summary":"auto", "effort":"high"})
+        );
 
-        let deepseek_responses = responses_body(&empty_request(
-            ProviderKind::Responses,
-            ThinkingMode::DeepSeekResponses,
-        ));
+        let mut deepseek_request =
+            empty_request(ProviderKind::Responses, ThinkingMode::DeepSeekResponses);
+        deepseek_request.thinking_profile_kind = ThinkingProfileKind::DeepSeekFlash;
+        deepseek_request.thinking_level = ThinkingLevel::XHigh;
+        let deepseek_responses = responses_body(&deepseek_request);
         assert_eq!(deepseek_responses["reasoning"], json!({"effort":"high"}));
+        assert_eq!(deepseek_responses["thinking"], json!({"type":"enabled"}));
+        deepseek_request.thinking_level = ThinkingLevel::Max;
+        let flash_max = responses_body(&deepseek_request);
+        assert_eq!(flash_max["reasoning"], json!({"effort":"max"}));
+        assert_eq!(flash_max["thinking"], json!({"type":"enabled"}));
+        deepseek_request.kind = ProviderKind::ChatCompletions;
+        let flash_max_chat = chat_body(&deepseek_request);
+        assert_eq!(flash_max_chat["reasoning_effort"], "max");
+        assert_eq!(flash_max_chat["thinking"], json!({"type":"enabled"}));
 
-        for mode in [ThinkingMode::DeepSeekChat, ThinkingMode::VolcanoChat] {
-            assert_eq!(
-                chat_body(&empty_request(ProviderKind::ChatCompletions, mode))["thinking"],
-                json!({"type":"enabled"})
-            );
-        }
+        let mut volcano = empty_request(ProviderKind::ChatCompletions, ThinkingMode::VolcanoChat);
+        volcano.thinking_profile_kind = ThinkingProfileKind::Volcano;
+        volcano.thinking_level = ThinkingLevel::High;
+        assert_eq!(chat_body(&volcano)["thinking"], json!({"type":"enabled"}));
+
+        let mut qwen38 = empty_request(ProviderKind::ChatCompletions, ThinkingMode::QwenChat);
+        qwen38.thinking_profile_kind = ThinkingProfileKind::Qwen38;
+        qwen38.thinking_level = ThinkingLevel::XHigh;
+        qwen38.thinking_budget_tokens = Some(8192);
+        let qwen38_body = chat_body(&qwen38);
+        assert_eq!(qwen38_body["reasoning_effort"], "xhigh");
+        assert!(qwen38_body.get("enable_thinking").is_none());
+        assert!(qwen38_body.get("thinking_budget").is_none());
         let compatible = chat_body(&empty_request(
             ProviderKind::ChatCompletions,
             ThinkingMode::CompatibleAuto,

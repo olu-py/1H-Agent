@@ -3,6 +3,9 @@ preset = "open_ai"
 kind = "responses"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5-mini"
+thinking_level = "auto"
+# Qwen 3.7 only: 1024, 4096, 8192, 16384, or 32768.
+# thinking_budget_tokens = 4096
 use_previous_response_id = false
 # auto | enabled | disabled; DeepSeek Responses API only
 native_web_search = "auto"

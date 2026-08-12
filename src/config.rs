@@ -38,6 +38,161 @@ pub struct ProviderConfig {
     pub native_web_search: NativeWebSearch,
     pub context_window_tokens: Option<u64>,
     pub thinking: ThinkingCapability,
+    pub thinking_level: ThinkingLevel,
+    pub thinking_budget_tokens: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingLevel {
+    #[default]
+    Auto,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Enabled,
+}
+
+impl ThinkingLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Enabled => "开启",
+        }
+    }
+
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动",
+            Self::None => "关闭",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Enabled => "开启",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThinkingProfileKind {
+    OpenAi,
+    Qwen38,
+    Qwen37,
+    DeepSeekPro,
+    DeepSeekFlash,
+    Volcano,
+    Compatible,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ThinkingProfile {
+    pub options: &'static [ThinkingLevel],
+    pub default: ThinkingLevel,
+    pub kind: ThinkingProfileKind,
+}
+
+const OPENAI_LEVELS: &[ThinkingLevel] = &[
+    ThinkingLevel::Auto,
+    ThinkingLevel::None,
+    ThinkingLevel::Minimal,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+    ThinkingLevel::XHigh,
+    ThinkingLevel::Max,
+];
+const QWEN38_LEVELS: &[ThinkingLevel] = &[
+    ThinkingLevel::None,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::XHigh,
+];
+const QWEN37_LEVELS: &[ThinkingLevel] = &[ThinkingLevel::None, ThinkingLevel::Enabled];
+const DEEPSEEK_PRO_LEVELS: &[ThinkingLevel] = &[
+    ThinkingLevel::Low,
+    ThinkingLevel::High,
+    ThinkingLevel::XHigh,
+    ThinkingLevel::Max,
+];
+const DEEPSEEK_FLASH_LEVELS: &[ThinkingLevel] = &[
+    ThinkingLevel::Low,
+    ThinkingLevel::High,
+    ThinkingLevel::XHigh,
+    ThinkingLevel::Max,
+];
+const VOLCANO_LEVELS: &[ThinkingLevel] = &[ThinkingLevel::High];
+const COMPATIBLE_LEVELS: &[ThinkingLevel] = &[
+    ThinkingLevel::Auto,
+    ThinkingLevel::None,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+    ThinkingLevel::Max,
+];
+
+pub fn thinking_profile(preset: ProviderPreset, model: &str) -> ThinkingProfile {
+    let model = model
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if preset == ProviderPreset::Qwen && model.contains("qwen38") {
+        ThinkingProfile {
+            options: QWEN38_LEVELS,
+            default: ThinkingLevel::XHigh,
+            kind: ThinkingProfileKind::Qwen38,
+        }
+    } else if preset == ProviderPreset::Qwen && model.contains("qwen37") {
+        ThinkingProfile {
+            options: QWEN37_LEVELS,
+            default: ThinkingLevel::Enabled,
+            kind: ThinkingProfileKind::Qwen37,
+        }
+    } else if preset == ProviderPreset::DeepSeek && model.contains("v4pro") {
+        ThinkingProfile {
+            options: DEEPSEEK_PRO_LEVELS,
+            default: ThinkingLevel::High,
+            kind: ThinkingProfileKind::DeepSeekPro,
+        }
+    } else if preset == ProviderPreset::DeepSeek && model.contains("v4flash") {
+        ThinkingProfile {
+            options: DEEPSEEK_FLASH_LEVELS,
+            default: ThinkingLevel::High,
+            kind: ThinkingProfileKind::DeepSeekFlash,
+        }
+    } else if preset == ProviderPreset::Volcano {
+        ThinkingProfile {
+            options: VOLCANO_LEVELS,
+            default: ThinkingLevel::High,
+            kind: ThinkingProfileKind::Volcano,
+        }
+    } else if preset == ProviderPreset::OpenAi {
+        ThinkingProfile {
+            options: OPENAI_LEVELS,
+            default: ThinkingLevel::Auto,
+            kind: ThinkingProfileKind::OpenAi,
+        }
+    } else {
+        ThinkingProfile {
+            options: COMPATIBLE_LEVELS,
+            default: ThinkingLevel::Auto,
+            kind: ThinkingProfileKind::Compatible,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -233,6 +388,8 @@ impl Default for ProviderConfig {
             native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
             thinking: ThinkingCapability::Auto,
+            thinking_level: ThinkingLevel::Auto,
+            thinking_budget_tokens: None,
         }
     }
 }
@@ -279,6 +436,7 @@ impl Config {
         }
 
         config.provider.validate()?;
+        config.provider.normalize_thinking();
         if let Some(limit) = config.provider.context_window_tokens {
             if limit < 4096 {
                 anyhow::bail!("provider.context_window_tokens must be at least 4096");
@@ -328,6 +486,21 @@ impl Config {
 }
 
 impl ProviderConfig {
+    pub fn normalize_thinking(&mut self) {
+        let profile = thinking_profile(self.preset, &self.model);
+        if !profile.options.contains(&self.thinking_level) {
+            self.thinking_level = profile.default;
+        }
+        if profile.kind != ThinkingProfileKind::Qwen37
+            || self.thinking_level != ThinkingLevel::Enabled
+            || !matches!(
+                self.thinking_budget_tokens,
+                None | Some(1024 | 4096 | 8192 | 16384 | 32768)
+            )
+        {
+            self.thinking_budget_tokens = None;
+        }
+    }
     pub fn resolved_context_window_tokens(&self) -> Option<u64> {
         self.context_window_tokens
             .or_else(|| Some(known_context_window(self.preset, &self.model)))
@@ -417,7 +590,7 @@ impl ProviderPreset {
                 "model-name",
             ),
         };
-        ProviderConfig {
+        let mut config = ProviderConfig {
             preset: self,
             kind,
             base_url: base_url.into(),
@@ -426,7 +599,11 @@ impl ProviderPreset {
             native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
             thinking: ThinkingCapability::Auto,
-        }
+            thinking_level: ThinkingLevel::Auto,
+            thinking_budget_tokens: None,
+        };
+        config.normalize_thinking();
+        config
     }
 
     pub fn supports_responses(self) -> bool {
@@ -858,6 +1035,91 @@ mod tests {
         assert_eq!(qwen.kind, ProviderKind::ChatCompletions);
         let volcano = ProviderPreset::Volcano.defaults();
         assert!(volcano.base_url.ends_with("/api/v3"));
+    }
+
+    #[test]
+    fn thinking_profiles_match_provider_models_and_defaults() {
+        let cases = [
+            (
+                ProviderPreset::OpenAi,
+                "GPT-5.6-SOL-2026-08",
+                ThinkingProfileKind::OpenAi,
+                ThinkingLevel::Auto,
+            ),
+            (
+                ProviderPreset::Qwen,
+                "deployment-QWEN_3.8-MAX-v2",
+                ThinkingProfileKind::Qwen38,
+                ThinkingLevel::XHigh,
+            ),
+            (
+                ProviderPreset::Qwen,
+                "qwen-3.7-plus-latest",
+                ThinkingProfileKind::Qwen37,
+                ThinkingLevel::Enabled,
+            ),
+            (
+                ProviderPreset::DeepSeek,
+                "DEEPSEEK-V4-PRO-202608",
+                ThinkingProfileKind::DeepSeekPro,
+                ThinkingLevel::High,
+            ),
+            (
+                ProviderPreset::DeepSeek,
+                "tenant-deepseek_v4_flash",
+                ThinkingProfileKind::DeepSeekFlash,
+                ThinkingLevel::High,
+            ),
+            (
+                ProviderPreset::Volcano,
+                "deployment-id",
+                ThinkingProfileKind::Volcano,
+                ThinkingLevel::High,
+            ),
+            (
+                ProviderPreset::Custom,
+                "unknown-model",
+                ThinkingProfileKind::Compatible,
+                ThinkingLevel::Auto,
+            ),
+        ];
+        for (preset, model, kind, default) in cases {
+            let profile = thinking_profile(preset, model);
+            assert_eq!(profile.kind, kind, "{model}");
+            assert_eq!(profile.default, default, "{model}");
+        }
+        assert!(
+            thinking_profile(ProviderPreset::DeepSeek, "deepseek-v4-flash")
+                .options
+                .contains(&ThinkingLevel::Max)
+        );
+        assert_eq!(
+            thinking_profile(ProviderPreset::Volcano, "any").options,
+            &[ThinkingLevel::High]
+        );
+    }
+
+    #[test]
+    fn thinking_config_serializes_and_old_config_uses_model_default() {
+        let mut provider = ProviderPreset::DeepSeek.defaults();
+        provider.thinking_level = ThinkingLevel::Max;
+        let encoded = toml::to_string(&provider).unwrap();
+        assert!(encoded.contains("thinking_level = \"max\""));
+        let decoded: ProviderConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.thinking_level, ThinkingLevel::Max);
+
+        let mut old: ProviderConfig = toml::from_str(
+            r#"
+preset = "qwen"
+kind = "chat_completions"
+base_url = "https://example.com/v1"
+model = "qwen3.7-plus"
+"#,
+        )
+        .unwrap();
+        old.normalize_thinking();
+        assert_eq!(old.thinking_level, ThinkingLevel::Enabled);
+        assert_eq!(old.thinking_budget_tokens, None);
     }
 
     #[test]

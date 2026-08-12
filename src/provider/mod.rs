@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::config::ProviderKind;
+use crate::config::{ProviderKind, ThinkingLevel, ThinkingProfileKind};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -50,6 +50,9 @@ pub struct ModelRequest {
     pub previous_response_id: Option<String>,
     pub native_web_search: bool,
     pub thinking_mode: ThinkingMode,
+    pub thinking_level: ThinkingLevel,
+    pub thinking_budget_tokens: Option<u32>,
+    pub thinking_profile_kind: ThinkingProfileKind,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

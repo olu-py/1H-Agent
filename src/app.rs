@@ -20,7 +20,7 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ignore::WalkBuilder;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use serde_json::Value;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -31,7 +31,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     agent::{AgentEvent, AgentRunner},
     commands::{self, AgentMode, Command},
-    config::{Config, ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability},
+    config::{
+        Config, ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability, ThinkingLevel,
+        ThinkingProfile, thinking_profile,
+    },
     input::InputBuffer,
     output::{EdgeScroll, InteractionTarget, MessageLayout, OutputSelection},
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
@@ -212,6 +215,10 @@ pub struct App {
     pub leader_pending: bool,
     pub expanded_tools: HashSet<String>,
     pub thinking_expanded: bool,
+    pub thinking_menu_open: bool,
+    pub thinking_control_rect: Option<Rect>,
+    pub thinking_menu_rect: Option<Rect>,
+    pub force_full_redraw: bool,
     pub mouse_press_target: Option<InteractionTarget>,
     pub mouse_press_position: Option<(u16, u16)>,
     pub mouse_dragged: bool,
@@ -226,6 +233,10 @@ pub struct App {
     pub output_layout_dirty: bool,
     #[cfg(test)]
     pub output_layout_rebuild_count: usize,
+    #[cfg(test)]
+    pub markdown_parse_count: usize,
+    #[cfg(test)]
+    pub footer_rebuild_count: usize,
     pub edge_scroll: EdgeScroll,
     pub session_id: String,
     pub sessions: Vec<SessionSummary>,
@@ -324,6 +335,10 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         leader_pending: false,
         expanded_tools: HashSet::new(),
         thinking_expanded: false,
+        thinking_menu_open: false,
+        thinking_control_rect: None,
+        thinking_menu_rect: None,
+        force_full_redraw: false,
         mouse_press_target: None,
         mouse_press_position: None,
         mouse_dragged: false,
@@ -338,6 +353,10 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         output_layout_dirty: true,
         #[cfg(test)]
         output_layout_rebuild_count: 0,
+        #[cfg(test)]
+        markdown_parse_count: 0,
+        #[cfg(test)]
+        footer_rebuild_count: 0,
         edge_scroll: EdgeScroll::default(),
         session_id,
         sessions,
@@ -476,13 +495,17 @@ async fn event_loop(
             }
         }
         if redraw {
+            if app.force_full_redraw {
+                terminal.clear()?;
+                app.force_full_redraw = false;
+            }
             terminal.draw(|frame| ui::draw(frame, app))?;
         }
     }
     if let Some(task) = app.active_task.take() {
         task.abort();
     }
-    if let Some(approval) = app.pending_approval.take() {
+    if let Some(approval) = take_pending_approval(app) {
         if let ApprovalAction::Agent(reply) = approval.action {
             let _ = reply.send(false);
         }
@@ -515,6 +538,9 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         return Ok(EventOutcome::default());
     }
     if let Event::Mouse(mouse) = event {
+        if let Some(outcome) = handle_thinking_mouse(app, mouse)? {
+            return Ok(outcome);
+        }
         if output_mouse_event_allowed(
             mouse.kind,
             app.settings.is_some(),
@@ -526,6 +552,13 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         return Ok(EventOutcome::default());
     }
     if matches!(event, Event::Resize(_, _)) {
+        if app.pending_approval.is_some()
+            || app.settings.is_some()
+            || app.palette.is_some()
+            || app.thinking_menu_open
+        {
+            app.force_full_redraw = true;
+        }
         return Ok(EventOutcome::redraw());
     }
     let Event::Key(key) = event else {
@@ -784,6 +817,99 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         redraw,
         osc52: None,
     })
+}
+
+fn handle_thinking_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return Ok(app.thinking_menu_open.then(EventOutcome::default));
+    }
+    if app.thinking_menu_open {
+        let selected = app
+            .thinking_menu_rect
+            .filter(|rect| point_in_rect(mouse.column, mouse.row, *rect))
+            .and_then(|rect| thinking_menu_selection(app, rect, mouse.column, mouse.row));
+        app.thinking_menu_open = false;
+        app.force_full_redraw = true;
+        if let Some((level, budget)) = selected {
+            apply_thinking_selection(app, level, budget)?;
+        }
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    if !app.busy
+        && app.pending_approval.is_none()
+        && app
+            .thinking_control_rect
+            .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
+    {
+        app.thinking_menu_open = true;
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    Ok(None)
+}
+
+fn point_in_rect(column: u16, row: u16, rect: Rect) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+}
+
+fn thinking_menu_selection(
+    app: &App,
+    rect: Rect,
+    column: u16,
+    row: u16,
+) -> Option<(ThinkingLevel, Option<u32>)> {
+    let inner = ratatui::widgets::Block::bordered().inner(rect);
+    if !point_in_rect(column, row, inner) {
+        return None;
+    }
+    let profile = app.thinking_profile();
+    let index = row.saturating_sub(inner.y) as usize;
+    if profile.kind == crate::config::ThinkingProfileKind::Qwen37
+        && column >= inner.x.saturating_add(8)
+    {
+        const BUDGETS: [Option<u32>; 6] = [
+            None,
+            Some(1024),
+            Some(4096),
+            Some(8192),
+            Some(16384),
+            Some(32768),
+        ];
+        return BUDGETS
+            .get(index)
+            .copied()
+            .map(|budget| (ThinkingLevel::Enabled, budget));
+    }
+    profile.options.get(index).copied().map(|level| {
+        let budget = (level == ThinkingLevel::Enabled)
+            .then_some(app.config.provider.thinking_budget_tokens)
+            .flatten();
+        (level, budget)
+    })
+}
+
+fn apply_thinking_selection(
+    app: &mut App,
+    level: ThinkingLevel,
+    budget: Option<u32>,
+) -> Result<()> {
+    app.config.provider.thinking_level = level;
+    app.config.provider.thinking_budget_tokens = budget;
+    app.config.provider.normalize_thinking();
+    rebuild_runner(app)?;
+    app.status = match app.config.save() {
+        Ok(()) => format!(
+            "思考强度已设为 {}",
+            app.config.provider.thinking_level.label()
+        ),
+        Err(error) => format!(
+            "思考强度已更新；配置保存失败：{}",
+            secrets::redact(&error.to_string())
+        ),
+    };
+    Ok(())
 }
 
 fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> EventOutcome {
@@ -1064,6 +1190,26 @@ fn push_entry(app: &mut App, entry: DisplayEntry) {
 }
 
 impl App {
+    pub(crate) fn provider_label(&self) -> &'static str {
+        self.config.provider.preset.label()
+    }
+
+    pub(crate) fn model_name(&self) -> &str {
+        &self.config.provider.model
+    }
+
+    pub(crate) fn thinking_level(&self) -> ThinkingLevel {
+        self.config.provider.thinking_level
+    }
+
+    pub(crate) fn thinking_budget_tokens(&self) -> Option<u32> {
+        self.config.provider.thinking_budget_tokens
+    }
+
+    pub(crate) fn thinking_profile(&self) -> ThinkingProfile {
+        thinking_profile(self.config.provider.preset, &self.config.provider.model)
+    }
+
     fn clear_output_selection(&mut self) {
         clear_output_selection(self);
     }
@@ -1079,7 +1225,7 @@ impl App {
 }
 
 fn cancel_active_request(app: &mut App) {
-    if let Some(approval) = app.pending_approval.take()
+    if let Some(approval) = take_pending_approval(app)
         && let ApprovalAction::Agent(reply) = approval.action
     {
         let _ = reply.send(false);
@@ -1096,6 +1242,14 @@ fn cancel_active_request(app: &mut App) {
         kind: DisplayKind::System,
         content: DisplayContent::Markdown("当前请求已取消。".into()),
     });
+}
+
+fn take_pending_approval(app: &mut App) -> Option<PendingApproval> {
+    let approval = app.pending_approval.take();
+    if approval.is_some() {
+        app.force_full_redraw = true;
+    }
+    approval
 }
 
 fn scroll_messages(app: &mut App, delta: isize) {
@@ -1435,6 +1589,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                     app.status = "模型不能为空".into();
                 } else {
                     app.config.provider.model = model.trim().to_owned();
+                    app.config.provider.normalize_thinking();
                     app.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
                     rebuild_runner(app)?;
                     app.status = format!("模型已设置为 {}", app.config.provider.model);
@@ -1731,6 +1886,7 @@ fn apply_settings(app: &mut App) -> Result<()> {
     let settings = app.settings.as_ref().context("settings are not open")?;
     let mut provider_config = settings.provider.clone();
     provider_config.validate()?;
+    provider_config.normalize_thinking();
     let entered_key = settings.api_key.trim();
     let api_key = if !entered_key.is_empty() {
         entered_key.to_owned()
@@ -1884,7 +2040,11 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             finish_thinking(app, "思考已取消");
             app.busy = false;
             app.active_task = None;
-            app.pending_approval = None;
+            if let Some(approval) = take_pending_approval(app)
+                && let ApprovalAction::Agent(reply) = approval.action
+            {
+                let _ = reply.send(false);
+            }
             app.agent_phase = AgentPhase::Idle;
             app.model_phase = ModelPhase::Idle;
             app.status = if reason.contains("approval") {
@@ -2171,7 +2331,7 @@ fn utf8_tail(value: &str, max_bytes: usize) -> &str {
 }
 
 fn resolve_approval(app: &mut App, approved: bool) {
-    if let Some(approval) = app.pending_approval.take() {
+    if let Some(approval) = take_pending_approval(app) {
         match approval.action {
             ApprovalAction::Agent(reply) => {
                 let _ = reply.send(approved);
@@ -2504,7 +2664,7 @@ fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyEvent, KeyEventState, MouseEvent};
-    use ratatui::layout::Rect;
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use tempfile::TempDir;
 
     use super::*;
@@ -2550,6 +2710,10 @@ mod tests {
             leader_pending: false,
             expanded_tools: HashSet::new(),
             thinking_expanded: false,
+            thinking_menu_open: false,
+            thinking_control_rect: None,
+            thinking_menu_rect: None,
+            force_full_redraw: false,
             mouse_press_target: None,
             mouse_press_position: None,
             mouse_dragged: false,
@@ -2563,6 +2727,8 @@ mod tests {
             message_layout: None,
             output_layout_dirty: true,
             output_layout_rebuild_count: 0,
+            markdown_parse_count: 0,
+            footer_rebuild_count: 0,
             edge_scroll: EdgeScroll::default(),
             session_id,
             sessions,
@@ -2576,6 +2742,384 @@ mod tests {
             agent_rx,
             active_task: None,
             should_quit: false,
+        }
+    }
+
+    fn render_screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn activity_priority_and_contextual_shortcuts_are_stable() {
+        use crate::{
+            ui_layout::{Density, HeightClass},
+            ui_view_model::{ActivityState, UiViewModel, activity_view, contextual_shortcuts},
+        };
+
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        assert_eq!(activity_view(&app).state, ActivityState::Idle);
+
+        app.agent_phase = AgentPhase::StreamingText;
+        assert_eq!(activity_view(&app).text, "正在生成回复");
+        app.agent_phase = AgentPhase::Thinking;
+        assert_eq!(activity_view(&app).text, "正在思考");
+        app.agent_phase = AgentPhase::ToolRunning;
+        assert!(activity_view(&app).text.starts_with("正在执行："));
+        app.agent_phase = AgentPhase::Failed;
+        assert_eq!(activity_view(&app).state, ActivityState::Failed);
+
+        let (reply, _receiver) = oneshot::channel();
+        app.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "approval".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/ui.rs"}),
+            },
+            reason: "test".into(),
+            action: ApprovalAction::Agent(reply),
+            created_at: Instant::now(),
+        });
+        assert_eq!(activity_view(&app).state, ActivityState::Warning);
+        assert_eq!(activity_view(&app).text, "文件修改需要确认");
+        assert_eq!(contextual_shortcuts(&app)[0].key, "Y");
+
+        let view = UiViewModel::from_app(&app, Density::Compact, HeightClass::Normal, 44);
+        assert_eq!(view.footer.primary.left[1].text, "文件修改需要确认");
+        assert!(
+            view.footer
+                .secondary
+                .as_ref()
+                .is_some_and(|line| line.left[0].text.contains("src/ui.rs"))
+        );
+    }
+
+    #[test]
+    fn footer_and_responsive_screens_render_without_overflow() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.context_meter_enabled = true;
+        app.context_used_tokens = 87_000;
+        app.context_limit_tokens = Some(258_000);
+
+        let wide = render_screen(&mut app, 120, 30);
+        assert!(wide[28].contains('○'));
+        assert!(wide[28].contains("Enter"));
+        assert!(wide[28].contains("Ctrl+P"));
+        assert!(wide[29].contains("OpenAI"));
+        assert!(wide[29].contains("33%"));
+        assert!(wide[29].contains("87k/258k"));
+        assert!(wide.iter().any(|line| line.contains("Alt+Up/Down")));
+
+        app.busy = true;
+        app.agent_phase = AgentPhase::Thinking;
+        let narrow = render_screen(&mut app, 60, 20);
+        assert!(narrow[18].contains('●'));
+        assert!(narrow[18].contains("Esc"));
+        assert!(narrow[19].contains("33%"));
+        assert!(!narrow.iter().any(|line| line.contains("Alt+Up/Down")));
+
+        let short = render_screen(&mut app, 44, 14);
+        assert!(short[13].contains('●'));
+        assert!(!short[13].contains("上下文"));
+
+        let tiny = render_screen(&mut app, 2, 2);
+        assert_eq!(tiny.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn thinking_menu_is_mouse_only_bounded_and_does_not_rebuild_output() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.config.provider = ProviderPreset::DeepSeek.defaults();
+        app.config.provider.model = "tenant-deepseek-v4-flash-long-deployment-name".into();
+        crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 60, 12));
+        let rebuilds = app.output_layout_rebuild_count;
+        let parses = app.markdown_parse_count;
+        let screen = render_screen(&mut app, 60, 20);
+        assert!(screen[19].contains("high ▾"));
+        let control = app.thinking_control_rect.unwrap();
+        assert_eq!(
+            control.width as usize,
+            unicode_width::UnicodeWidthStr::width("思考 high ▾")
+        );
+        let click = |column, row| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(
+            handle_terminal_event(&mut app, click(control.x, control.y))
+                .await
+                .unwrap()
+                .redraw
+        );
+        assert!(app.thinking_menu_open);
+        render_screen(&mut app, 60, 20);
+        let menu = app.thinking_menu_rect.unwrap();
+        assert!(menu.right() <= 60 && menu.bottom() <= 20);
+        let inner = ratatui::widgets::Block::bordered().inner(menu);
+        let max_row = app
+            .thinking_profile()
+            .options
+            .iter()
+            .position(|level| *level == ThinkingLevel::Max)
+            .unwrap() as u16;
+        handle_terminal_event(&mut app, click(inner.x, inner.y + max_row))
+            .await
+            .unwrap();
+        assert_eq!(app.thinking_level(), ThinkingLevel::Max);
+        assert!(!app.thinking_menu_open);
+        assert!(app.status.contains("配置保存失败"));
+        assert_eq!(app.output_layout_rebuild_count, rebuilds);
+        assert_eq!(app.markdown_parse_count, parses);
+
+        app.busy = true;
+        render_screen(&mut app, 60, 20);
+        let control = app.thinking_control_rect.unwrap();
+        handle_terminal_event(&mut app, click(control.x, control.y))
+            .await
+            .unwrap();
+        assert!(!app.thinking_menu_open);
+    }
+
+    #[tokio::test]
+    async fn clicking_outside_thinking_menu_closes_it_without_changing_level() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        render_screen(&mut app, 80, 20);
+        let control = app.thinking_control_rect.unwrap();
+        let event = |column, row| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        handle_terminal_event(&mut app, event(control.x, control.y))
+            .await
+            .unwrap();
+        render_screen(&mut app, 80, 20);
+        let previous = app.thinking_level();
+        handle_terminal_event(&mut app, event(0, 0)).await.unwrap();
+        assert!(!app.thinking_menu_open);
+        assert_eq!(app.thinking_level(), previous);
+        assert!(app.force_full_redraw);
+    }
+
+    #[test]
+    fn approval_closure_paths_request_one_full_redraw() {
+        for approved in [true, false] {
+            let temp = TempDir::new().unwrap();
+            let mut app = test_app(&temp);
+            let (reply, _receiver) = oneshot::channel();
+            app.pending_approval = Some(PendingApproval {
+                call: ToolCall {
+                    id: "approval".into(),
+                    name: "file_write".into(),
+                    arguments: serde_json::json!({"path":"src/ui.rs"}),
+                },
+                reason: "risk text".into(),
+                action: ApprovalAction::Agent(reply),
+                created_at: Instant::now(),
+            });
+            resolve_approval(&mut app, approved);
+            assert!(app.pending_approval.is_none());
+            assert!(app.force_full_redraw);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        request_shell_approval(&mut app, "echo ok".into()).unwrap();
+        resolve_approval(&mut app, false);
+        assert!(app.force_full_redraw);
+
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let (reply, _receiver) = oneshot::channel();
+        app.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "cancel".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({}),
+            },
+            reason: "cancel".into(),
+            action: ApprovalAction::Agent(reply),
+            created_at: Instant::now(),
+        });
+        cancel_active_request(&mut app);
+        assert!(app.force_full_redraw);
+
+        let (reply, _receiver) = oneshot::channel();
+        app.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "event-cancel".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({}),
+            },
+            reason: "cancel".into(),
+            action: ApprovalAction::Agent(reply),
+            created_at: Instant::now(),
+        });
+        app.force_full_redraw = false;
+        handle_agent_event(&mut app, AgentEvent::Cancelled("cancelled".into()));
+        assert!(app.force_full_redraw);
+    }
+
+    #[test]
+    fn approval_overlay_clear_restores_underlying_frame() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let (reply, _receiver) = oneshot::channel();
+        app.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "approval".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/ui.rs"}),
+            },
+            reason: "unique-risk-text".into(),
+            action: ApprovalAction::Agent(reply),
+            created_at: Instant::now(),
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        resolve_approval(&mut app, false);
+        assert!(app.force_full_redraw);
+        terminal.clear().unwrap();
+        app.force_full_redraw = false;
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!visible.contains("unique-risk-text"));
+        assert!(!visible.contains("工具权限确认"));
+        assert!(visible.contains("first line"));
+    }
+
+    #[test]
+    fn ordinary_updates_do_not_request_full_redraw() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        scroll_messages(&mut app, 1);
+        assert!(!app.force_full_redraw);
+        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
+        handle_agent_event(&mut app, AgentEvent::ReasoningDelta("真实思考".into()));
+        handle_agent_event(&mut app, AgentEvent::TextDelta("正文".into()));
+        assert!(!app.force_full_redraw);
+    }
+
+    #[test]
+    fn footer_updates_do_not_rebuild_messages_or_parse_markdown() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        render_screen(&mut app, 80, 20);
+        let layout_rebuilds = app.output_layout_rebuild_count;
+        let markdown_parses = app.markdown_parse_count;
+        let footer_rebuilds = app.footer_rebuild_count;
+
+        app.status = "仅 Footer 变化".into();
+        render_screen(&mut app, 80, 20);
+        assert_eq!(app.output_layout_rebuild_count, layout_rebuilds);
+        assert_eq!(app.markdown_parse_count, markdown_parses);
+        assert_eq!(app.footer_rebuild_count, footer_rebuilds + 1);
+    }
+
+    #[test]
+    fn footer_keeps_context_visible_when_model_name_is_long() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.context_meter_enabled = true;
+        app.context_used_tokens = 87_000;
+        app.context_limit_tokens = Some(258_000);
+        app.config.provider.model = "a-very-long-model-name-that-must-not-cover-context".into();
+        let screen = render_screen(&mut app, 70, 20);
+        assert!(screen[19].contains("33%"));
+        assert!(screen[19].contains("87k/258k"));
+    }
+
+    #[test]
+    fn approval_tool_failure_and_context_threshold_screens_are_distinct() {
+        use crate::{
+            ui_layout::{Density, HeightClass},
+            ui_theme::VisualRole,
+            ui_view_model::UiViewModel,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let (reply, _receiver) = oneshot::channel();
+        app.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "approval-screen".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/ui.rs"}),
+            },
+            reason: "将修改工作区文件".into(),
+            action: ApprovalAction::Agent(reply),
+            created_at: Instant::now(),
+        });
+        let approval = render_screen(&mut app, 100, 24);
+        assert!(approval[22].contains('!'));
+        assert!(approval[22].contains('Y'));
+        assert!(approval[22].contains('N'));
+        assert!(approval[23].contains("src/ui.rs"));
+        app.pending_approval = None;
+
+        app.agent_phase = AgentPhase::ToolRunning;
+        app.entries.push(DisplayEntry {
+            kind: DisplayKind::Tool,
+            content: DisplayContent::Tool(ToolDisplay {
+                call_id: "running-screen".into(),
+                name: "file_read".into(),
+                arguments: serde_json::json!({"path":"src/app.rs"}),
+                status: ToolDisplayStatus::Running,
+                result: None,
+            }),
+        });
+        app.invalidate_output_layout();
+        let tool = render_screen(&mut app, 100, 24);
+        assert!(tool[22].contains('●'));
+        assert!(tool.iter().any(|line| line.contains("src/app.rs")));
+
+        app.agent_phase = AgentPhase::Failed;
+        let failed = render_screen(&mut app, 100, 24);
+        assert!(failed[22].contains('×'));
+
+        app.context_meter_enabled = true;
+        app.context_limit_tokens = Some(100);
+        for (used, role) in [
+            (70, VisualRole::Secondary),
+            (85, VisualRole::Warning),
+            (95, VisualRole::Danger),
+        ] {
+            app.context_used_tokens = used;
+            let view = UiViewModel::from_app(&app, Density::Wide, HeightClass::Normal, 100);
+            assert_eq!(view.footer.secondary.as_ref().unwrap().right[0].role, role);
+            let screen = render_screen(&mut app, 100, 24);
+            assert!(screen[23].contains(&format!("{used}%")));
         }
     }
 
@@ -2709,6 +3253,7 @@ mod tests {
         let viewport = Rect::new(0, 0, 8, 3);
         crate::ui::update_message_layout(&mut app, viewport);
         assert_eq!(app.output_layout_rebuild_count, 1);
+        let markdown_parses = app.markdown_parse_count;
 
         let layout = app.message_layout.as_ref().unwrap();
         let text_ptr = layout.text.as_ptr();
@@ -2723,6 +3268,7 @@ mod tests {
 
         let layout = app.message_layout.as_ref().unwrap();
         assert_eq!(app.output_layout_rebuild_count, 1);
+        assert_eq!(app.markdown_parse_count, markdown_parses);
         assert_eq!(layout.text.as_ptr(), text_ptr);
         assert_eq!(layout.lines.as_ptr(), lines_ptr);
         assert_eq!(layout.visual_lines.as_ptr(), visual_lines_ptr);
@@ -2737,11 +3283,13 @@ mod tests {
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 8, 3));
         let text_ptr = app.message_layout.as_ref().unwrap().text.as_ptr();
         let lines_ptr = app.message_layout.as_ref().unwrap().lines.as_ptr();
+        let markdown_parses = app.markdown_parse_count;
 
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 16, 3));
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 16, 3));
         let layout = app.message_layout.as_ref().unwrap();
         assert_eq!(app.output_layout_rebuild_count, 2);
+        assert_eq!(app.markdown_parse_count, markdown_parses);
         assert_eq!(layout.text.as_ptr(), text_ptr);
         assert_eq!(layout.lines.as_ptr(), lines_ptr);
     }
@@ -2775,6 +3323,7 @@ mod tests {
         assert_eq!(app.thinking_last_line, "模型正在思考");
         crate::ui::update_message_layout(&mut app, viewport);
         let rebuilds = app.output_layout_rebuild_count;
+        let markdown_parses = app.markdown_parse_count;
         handle_agent_event(
             &mut app,
             AgentEvent::ReasoningDelta("第一行\n\n最新".into()),
@@ -2812,6 +3361,7 @@ mod tests {
             .unwrap();
         assert!(!copied.contains("最新一行"));
         assert_eq!(app.output_layout_rebuild_count, rebuilds);
+        assert_eq!(app.markdown_parse_count, markdown_parses);
     }
 
     #[test]

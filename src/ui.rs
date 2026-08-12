@@ -4,7 +4,7 @@ use pulldown_cmark::{
 };
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -16,12 +16,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        AgentPhase, App, CommandPaletteState, DisplayContent, DisplayKind, ModelPhase,
-        SettingsField, SettingsState, ToolDisplay, ToolDisplayStatus,
+        App, CommandPaletteState, DisplayContent, DisplayKind, SettingsField, SettingsState,
+        ToolDisplay, ToolDisplayStatus,
     },
     commands,
     output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
     secrets,
+    ui_layout::{Density, HeightClass, compute_layout, message_block},
+    ui_theme::{UiTheme, VisualRole},
+    ui_view_model::{FooterLine, InputView, ThinkingControlView, UiSegment, UiViewModel},
 };
 
 struct RenderedMessageLines {
@@ -32,49 +35,48 @@ struct RenderedMessageLines {
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    let horizontal = if area.width >= 90 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(30), Constraint::Min(40)])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(0), Constraint::Min(1)])
-            .split(area)
-    };
+    let density = Density::from_width(area.width);
+    let height = HeightClass::from_height(area.height);
+    let layout = compute_layout(area, density, height);
+    let view = UiViewModel::from_app(app, density, height, layout.footer.width as usize);
+    #[cfg(test)]
+    {
+        app.footer_rebuild_count += 1;
+    }
+    let theme = UiTheme::default();
 
-    if area.width >= 90 {
-        draw_sessions(frame, horizontal[0], app);
+    if let Some(sessions) = layout.sessions {
+        draw_sessions(frame, sessions, app, &theme);
     }
-    let main = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),
-            Constraint::Length(5),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .split(horizontal[1]);
-    draw_messages(frame, main[0], app);
-    draw_input(frame, main[1], app);
+    draw_messages(
+        frame,
+        layout.messages_outer,
+        layout.messages_inner,
+        app,
+        &theme,
+    );
+    draw_input(frame, layout.input, app, &view.input, &theme);
     if !app.file_suggestions.is_empty() && app.palette.is_none() && app.settings.is_none() {
-        draw_file_suggestions(frame, main[1], app);
+        draw_file_suggestions(frame, layout.input, app);
     }
-    draw_status(frame, main[2], app);
-    draw_help(frame, main[3], app);
+    draw_footer(frame, layout.footer, &view, app, &theme);
+    if app.thinking_menu_open {
+        draw_thinking_menu(frame, area, layout.footer, app, &view.thinking, &theme);
+    } else {
+        app.thinking_menu_rect = None;
+    }
     if app.pending_approval.is_some() {
-        draw_approval(frame, area, app);
+        draw_approval(frame, area, app, &theme);
     }
     if let Some(settings) = &app.settings {
-        draw_settings(frame, area, settings);
+        draw_settings(frame, area, settings, &theme);
     }
     if let Some(palette) = &app.palette {
-        draw_palette(frame, area, palette);
+        draw_palette(frame, area, palette, &theme);
     }
 }
 
-fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) {
     let workspace = app
         .workspace
         .file_name()
@@ -84,18 +86,16 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut items = vec![
         ListItem::new(Line::from(Span::styled(
             "Alt+Up/Down  切换会话",
-            Style::default().fg(Color::DarkGray),
+            theme.style(VisualRole::Muted),
         ))),
         ListItem::new(Line::from(Span::styled(
             "Ctrl+N       新建会话",
-            Style::default().fg(Color::DarkGray),
+            theme.style(VisualRole::Muted),
         ))),
         ListItem::new(Line::default()),
         ListItem::new(Line::from(Span::styled(
             fit_text(&workspace, content_width),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            theme.strong(VisualRole::Accent),
         ))),
     ];
     let visible_sessions = area.height.saturating_sub(6) as usize;
@@ -112,12 +112,9 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let active = session.id == app.session_id;
         let marker = if active { "> " } else { "  " };
         let style = if active {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            theme.selected
         } else {
-            Style::default().fg(Color::White)
+            theme.style(VisualRole::Primary)
         };
         items.push(ListItem::new(Line::from(Span::styled(
             format!(
@@ -133,9 +130,14 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let block = Block::default().title(" 任务 ").borders(Borders::BOTTOM);
-    let viewport = block.inner(area);
+fn draw_messages(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    viewport: Rect,
+    app: &mut App,
+    theme: &UiTheme,
+) {
+    let block = message_block();
     update_message_layout(app, viewport);
     let thinking_lines = live_thinking_lines(app, viewport.width.max(1) as usize);
     let Some(layout) = &app.message_layout else {
@@ -151,7 +153,7 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .iter()
         .skip(layout.scroll)
         .take(layout.viewport.height as usize)
-        .map(|line| render_visual_line(layout, line, selection, &thinking_lines))
+        .map(|line| render_visual_line(layout, line, selection, &thinking_lines, theme))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(visible_lines)
@@ -225,7 +227,16 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
     app.output_layout_dirty = false;
 }
 
-fn render_message_lines(app: &App, width: usize) -> RenderedMessageLines {
+fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
+    #[cfg(test)]
+    {
+        app.markdown_parse_count += app
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.content, DisplayContent::Markdown(_)))
+            .count();
+    }
+    let theme = UiTheme::default();
     let mut lines = Vec::new();
     let mut interactions = Vec::new();
     let mut thinking_before = None;
@@ -240,12 +251,7 @@ fn render_message_lines(app: &App, width: usize) -> RenderedMessageLines {
                 push_rendered_line(
                     &mut lines,
                     &mut interactions,
-                    Line::from(Span::styled(
-                        "工具",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    )),
+                    Line::from(Span::styled("工具", theme.strong(VisualRole::Tool))),
                     None,
                 );
                 in_tool_group = true;
@@ -268,31 +274,48 @@ fn render_message_lines(app: &App, width: usize) -> RenderedMessageLines {
             continue;
         }
         in_tool_group = false;
-        let (label, color) = match &entry.kind {
-            DisplayKind::User => ("用户", Color::Green),
-            DisplayKind::Assistant => ("Agent", Color::Cyan),
-            DisplayKind::Thinking => ("思考摘要", Color::Magenta),
-            DisplayKind::Tool => ("工具", Color::Yellow),
-            DisplayKind::Error => ("错误", Color::Red),
-            DisplayKind::System => ("系统", Color::DarkGray),
+        if let DisplayContent::Markdown(text) = &entry.content
+            && matches!(entry.kind, DisplayKind::System | DisplayKind::Error)
+        {
+            let (prefix, role) = if matches!(entry.kind, DisplayKind::Error) {
+                ("× ", VisualRole::Danger)
+            } else {
+                ("", VisualRole::Muted)
+            };
+            push_rendered_line(
+                &mut lines,
+                &mut interactions,
+                Line::from(Span::styled(
+                    format!("{prefix}{}", text.replace('\n', " ")),
+                    theme.style(role),
+                )),
+                None,
+            );
+            push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
+            continue;
+        }
+        let (label, role) = match &entry.kind {
+            DisplayKind::User => ("用户", VisualRole::User),
+            DisplayKind::Assistant => ("Agent", VisualRole::Accent),
+            DisplayKind::Thinking => ("思考摘要", VisualRole::Thinking),
+            DisplayKind::Tool => ("工具", VisualRole::Tool),
+            DisplayKind::Error => ("错误", VisualRole::Danger),
+            DisplayKind::System => ("系统", VisualRole::Muted),
         };
         push_rendered_line(
             &mut lines,
             &mut interactions,
-            Line::from(Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled(label, theme.strong(role))),
             None,
         );
-        let content_style = Style::default().fg(color);
+        let content_style = theme.style(VisualRole::Primary);
         match &entry.content {
             DisplayContent::Markdown(text) => {
                 if text.is_empty() {
                     push_rendered_line(
                         &mut lines,
                         &mut interactions,
-                        Line::from(Span::styled("...", Style::default().fg(Color::DarkGray))),
+                        Line::from(Span::styled("...", theme.style(VisualRole::Muted))),
                         None,
                     );
                 } else {
@@ -335,6 +358,7 @@ fn render_visual_line(
     visual: &VisualLine,
     selection: Option<OutputSelection>,
     thinking_lines: &[String],
+    theme: &UiTheme,
 ) -> Line<'static> {
     if visual.synthetic {
         return Line::from(Span::styled(
@@ -342,7 +366,7 @@ fn render_visual_line(
                 .get(visual.start)
                 .cloned()
                 .unwrap_or_default(),
-            Style::default().fg(Color::Yellow),
+            theme.style(VisualRole::Thinking),
         ));
     }
     let Some(line) = layout.lines.get(visual.logical_line) else {
@@ -398,6 +422,12 @@ struct MarkdownRenderer {
     table_row: Option<TableRow>,
     table_cell: Option<Vec<Span<'static>>>,
     table_head: bool,
+    code_block: Option<CodeBlockState>,
+}
+
+#[derive(Clone, Debug)]
+struct CodeBlockState {
+    _language: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -435,6 +465,7 @@ impl MarkdownRenderer {
             table_row: None,
             table_cell: None,
             table_head: false,
+            code_block: None,
         }
     }
 
@@ -549,15 +580,14 @@ impl MarkdownRenderer {
                 if self.table_cell.is_none() {
                     self.flush_line(false);
                     self.push_style(code_style());
-                    self.ensure_prefix();
-                    let label = match kind {
-                        CodeBlockKind::Fenced(language) if !language.is_empty() => {
-                            format!("[code: {language}]")
-                        }
-                        _ => "[code]".to_owned(),
-                    };
-                    self.current.push(Span::styled(label, code_fence_style()));
-                    self.flush_line(false);
+                    self.code_block = Some(CodeBlockState {
+                        _language: match kind {
+                            CodeBlockKind::Fenced(language) if !language.is_empty() => {
+                                Some(language.to_string())
+                            }
+                            _ => None,
+                        },
+                    });
                 }
             }
             Tag::List(start) => {
@@ -673,9 +703,7 @@ impl MarkdownRenderer {
             TagEnd::CodeBlock => {
                 if self.table_cell.is_none() {
                     self.flush_line(false);
-                    self.current
-                        .push(Span::styled("[end code]", code_fence_style()));
-                    self.flush_line(false);
+                    self.code_block = None;
                     self.pop_style();
                 }
             }
@@ -1190,28 +1218,32 @@ fn render_diff(diff: &str) -> Vec<Line<'static>> {
 }
 
 fn code_style() -> Style {
-    Style::default().fg(Color::Yellow).bg(Color::Black)
+    UiTheme::default().style(VisualRole::Code)
 }
 
-fn code_fence_style() -> Style {
-    Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD)
-}
-
-fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let style = if app.busy {
-        Style::default().fg(Color::DarkGray)
+fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App, view: &InputView, theme: &UiTheme) {
+    let style = if view.enabled {
+        theme.style(VisualRole::Primary)
     } else {
-        Style::default().fg(Color::White)
+        theme.style(VisualRole::Muted)
+    };
+    let border_style = if view.warning {
+        theme.style(VisualRole::Warning)
+    } else if view.enabled {
+        theme.focus_border
+    } else {
+        theme.inactive_border
     };
     let inner_width = area.width.saturating_sub(2) as usize;
     let (visible_input, cursor_column, cursor_row) =
         input_cursor_viewport(app.input.as_str(), app.input.cursor(), inner_width);
     frame.render_widget(
-        Paragraph::new(visible_input)
-            .style(style)
-            .block(Block::default().title(" 输入 ").borders(Borders::ALL)),
+        Paragraph::new(visible_input).style(style).block(
+            Block::default()
+                .title(view.title.as_str())
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        ),
         area,
     );
     if !app.busy && app.settings.is_none() && app.pending_approval.is_none() {
@@ -1221,188 +1253,181 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let context_line = if app.context_meter_enabled {
-        if let Some(limit) = app.context_limit_tokens {
-            let used = app.context_used_tokens.min(limit.max(1));
-            let percent = used.saturating_mul(100) / limit.max(1);
-            let meter_color = if percent >= 95 {
-                Color::Red
-            } else if percent >= 85 {
-                Color::LightRed
-            } else if percent >= 70 {
-                Color::Yellow
-            } else {
-                Color::Green
-            };
-            let hint = if percent >= 85 {
-                "  建议执行 /compact"
-            } else {
-                ""
-            };
-            Line::from(vec![
-                Span::styled(" 上下文窗口 ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    context_ring(percent),
-                    Style::default()
-                        .fg(meter_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" {percent}%  {used}/{limit} tokens"),
-                    Style::default()
-                        .fg(meter_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(hint, Style::default().fg(Color::Yellow)),
-            ])
+fn draw_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &UiViewModel,
+    app: &mut App,
+    theme: &UiTheme,
+) {
+    let mut lines = vec![footer_line(
+        &view.footer.primary,
+        area.width as usize,
+        theme,
+    )];
+    if area.height > 1
+        && let Some(secondary) = &view.footer.secondary
+    {
+        lines.push(footer_line(secondary, area.width as usize, theme));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+    app.thinking_control_rect = thinking_control_rect(area, view);
+}
+
+fn thinking_control_rect(area: Rect, view: &UiViewModel) -> Option<Rect> {
+    if area.height < 2 || view.footer.secondary.is_none() {
+        return None;
+    }
+    let width = UnicodeWidthStr::width(view.thinking.label.as_str()) as u16;
+    (width > 0 && width <= area.width).then(|| {
+        Rect::new(
+            area.right().saturating_sub(width),
+            area.y.saturating_add(1),
+            width,
+            1,
+        )
+    })
+}
+
+fn draw_thinking_menu(
+    frame: &mut Frame<'_>,
+    screen: Rect,
+    footer: Rect,
+    app: &mut App,
+    view: &ThinkingControlView,
+    theme: &UiTheme,
+) {
+    let rows = view
+        .options
+        .len()
+        .max(if view.qwen37_budgets { 6 } else { 0 });
+    let width = if view.qwen37_budgets { 28 } else { 18 }.min(screen.width);
+    let height = (rows as u16).saturating_add(2).min(screen.height);
+    let control = app
+        .thinking_control_rect
+        .unwrap_or(Rect::new(footer.x, footer.y, 0, 0));
+    let x = control
+        .right()
+        .saturating_sub(width)
+        .min(screen.right().saturating_sub(width));
+    let y = footer.y.saturating_sub(height);
+    let area = Rect::new(x, y, width, height);
+    app.thinking_menu_rect = Some(area);
+
+    let mut lines = Vec::with_capacity(rows);
+    for index in 0..rows {
+        let left = view.options.get(index).map_or_else(String::new, |item| {
+            format!("{} {}", if item.selected { "●" } else { "○" }, item.label)
+        });
+        let text = if view.qwen37_budgets {
+            const BUDGETS: [(Option<u32>, &str); 6] = [
+                (None, "默认"),
+                (Some(1024), "1k"),
+                (Some(4096), "4k"),
+                (Some(8192), "8k"),
+                (Some(16384), "16k"),
+                (Some(32768), "32k"),
+            ];
+            let (budget, label) = BUDGETS.get(index).copied().unwrap_or((None, ""));
+            format!(
+                "{left:<8} {} {label}",
+                if view.budget_tokens == budget
+                    && app.thinking_level() == crate::config::ThinkingLevel::Enabled
+                {
+                    "●"
+                } else {
+                    "○"
+                }
+            )
         } else {
-            Line::from(vec![
-                Span::styled(" 上下文窗口 ", Style::default().fg(Color::DarkGray)),
-                Span::styled("○ --%", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("  已用约 {} tokens / 上限未知", app.context_used_tokens),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
+            left
+        };
+        lines.push(Line::from(Span::styled(
+            text,
+            theme.style(VisualRole::Primary),
+        )));
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" 思考强度 ")
+                .border_style(theme.style(VisualRole::Accent)),
+        ),
+        area,
+    );
+}
+
+fn footer_line(view: &FooterLine, width: usize, theme: &UiTheme) -> Line<'static> {
+    let right = clip_segments(&view.right, width);
+    let right_width = segment_width(&right);
+    let left_budget =
+        width.saturating_sub(right_width.saturating_add(usize::from(right_width > 0)));
+    let left = clip_segments(&view.left, left_budget);
+    let left_width = segment_width(&left);
+    let gap = width.saturating_sub(left_width.saturating_add(right_width));
+    let mut spans = render_segments(&left, theme);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(render_segments(&right, theme));
+    Line::from(spans)
+}
+
+fn clip_segments(segments: &[UiSegment], width: usize) -> Vec<UiSegment> {
+    let mut output = Vec::new();
+    let mut remaining = width;
+    for segment in segments {
+        if remaining == 0 {
+            break;
         }
-    } else {
-        Line::default()
-    };
-    let mode_color = match app.mode {
-        commands::AgentMode::Build => Color::Green,
-        commands::AgentMode::Plan => Color::Blue,
-        commands::AgentMode::Explore => Color::Cyan,
-    };
-    let agent_color = match app.agent_phase {
-        AgentPhase::Idle | AgentPhase::Completed => Color::DarkGray,
-        AgentPhase::Thinking | AgentPhase::StreamingText | AgentPhase::ToolRunning => Color::Yellow,
-        AgentPhase::WaitingApproval | AgentPhase::Failed => Color::Red,
-    };
-    let model_color = match app.model_phase {
-        ModelPhase::Idle | ModelPhase::Completed => Color::DarkGray,
-        ModelPhase::Streaming => Color::Cyan,
-        ModelPhase::Failed => Color::Red,
-    };
-    let bold = Modifier::BOLD;
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(" 模式：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    mode_label(app.mode),
-                    Style::default().fg(mode_color).add_modifier(bold),
-                ),
-                Span::styled(
-                    if app.mode == commands::AgentMode::Plan {
-                        "  只读"
-                    } else {
-                        ""
-                    },
-                    Style::default().fg(mode_color).add_modifier(bold),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" Agent：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    agent_phase_label(app.agent_phase),
-                    Style::default().fg(agent_color).add_modifier(bold),
-                ),
-                Span::styled("   模型：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    model_phase_label(app.model_phase),
-                    Style::default().fg(model_color).add_modifier(bold),
-                ),
-                Span::styled(
-                    format!("   {}", app.status),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            context_line,
-        ]),
-        area,
-    );
-}
-
-fn mode_label(mode: commands::AgentMode) -> &'static str {
-    match mode {
-        commands::AgentMode::Build => "构建",
-        commands::AgentMode::Plan => "计划",
-        commands::AgentMode::Explore => "探索",
+        let segment_width = UnicodeWidthStr::width(segment.text.as_str());
+        if segment_width <= remaining {
+            output.push(segment.clone());
+            remaining -= segment_width;
+            continue;
+        }
+        let mut text = String::new();
+        let mut used = 0usize;
+        for grapheme in segment.text.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if used.saturating_add(grapheme_width) > remaining {
+                break;
+            }
+            text.push_str(grapheme);
+            used = used.saturating_add(grapheme_width);
+        }
+        if !text.is_empty() {
+            output.push(UiSegment {
+                text,
+                role: segment.role,
+            });
+        }
+        break;
     }
+    output
 }
 
-fn agent_phase_label(phase: AgentPhase) -> &'static str {
-    match phase {
-        AgentPhase::Idle => "空闲",
-        AgentPhase::Thinking => "思考中",
-        AgentPhase::StreamingText => "输出正文",
-        AgentPhase::WaitingApproval => "等待确认",
-        AgentPhase::ToolRunning => "执行工具",
-        AgentPhase::Completed => "已完成",
-        AgentPhase::Failed => "失败",
-    }
+fn segment_width(segments: &[UiSegment]) -> usize {
+    segments
+        .iter()
+        .map(|segment| UnicodeWidthStr::width(segment.text.as_str()))
+        .sum()
 }
 
-fn model_phase_label(phase: ModelPhase) -> &'static str {
-    match phase {
-        ModelPhase::Idle => "空闲",
-        ModelPhase::Streaming => "流式输出",
-        ModelPhase::Completed => "已完成",
-        ModelPhase::Failed => "失败",
-    }
+fn render_segments(segments: &[UiSegment], theme: &UiTheme) -> Vec<Span<'static>> {
+    segments
+        .iter()
+        .map(|segment| {
+            let style = if matches!(segment.role, VisualRole::Primary | VisualRole::Shortcut) {
+                theme.strong(segment.role)
+            } else {
+                theme.style(segment.role)
+            };
+            Span::styled(segment.text.clone(), style)
+        })
+        .collect()
 }
 
-fn context_ring(percent: u64) -> &'static str {
-    match percent {
-        0 => "○",
-        1..=12 => "◔",
-        13..=25 => "◔",
-        26..=37 => "◑",
-        38..=50 => "◑",
-        51..=62 => "◒",
-        63..=75 => "◕",
-        76..=87 => "◓",
-        88..=99 => "◉",
-        _ => "●",
-    }
-}
-
-fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (primary, sessions) = if app.settings.is_some() {
-        (
-            "Tab/↑/↓ 切换字段 | ←/→ 修改 | Enter 保存 | Esc 取消",
-            "API Key 已隐藏，不会写入配置文件",
-        )
-    } else if app.pending_approval.is_some() {
-        ("Y 批准 | N/Esc 拒绝 | Ctrl+C 退出", "")
-    } else if app.busy {
-        ("Esc 取消请求 | Ctrl+C 退出", "")
-    } else {
-        (
-            "Enter 发送 | Shift+Enter 换行 | Ctrl+P 命令面板",
-            "Ctrl+X 快捷键 | @ 文件 | ! Shell | / 命令 | Ctrl+C 退出",
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "快捷键  ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(primary),
-            ]),
-            Line::from(format!("      {sessions}")),
-        ])
-        .style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
-}
-
-fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) {
     let popup = centered_rect(76, 18, area);
     let approval = app.pending_approval.as_ref().expect("approval exists");
     let mut lines = approval_lines(&approval.call, &approval.reason);
@@ -1427,7 +1452,7 @@ fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Block::default()
                     .title(" 需要确认 ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(theme.style(VisualRole::Warning)),
             ),
         popup,
     );
@@ -1557,7 +1582,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState) {
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState, theme: &UiTheme) {
     let popup = centered_rect(84, 19, area);
     let key = if settings.api_key.is_empty() {
         if settings.has_existing_key {
@@ -1602,9 +1627,9 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState) {
         let selected = settings.field == field;
         let marker = if selected { ">" } else { " " };
         let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            theme.selected
         } else {
-            Style::default().fg(Color::White)
+            theme.style(VisualRole::Primary)
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} {label:<10}"), style),
@@ -1614,9 +1639,7 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState) {
     }
     lines.push(Line::from(Span::styled(
         "Tab/↑/↓：切换字段   ←/→：修改",
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
+        theme.strong(VisualRole::Success),
     )));
     lines.push(Line::from("Enter：保存   Esc：取消"));
     frame.render_widget(Clear, popup);
@@ -1626,14 +1649,14 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState) {
                 Block::default()
                     .title(" 提供商设置 ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(theme.focus_border),
             )
             .wrap(Wrap { trim: false }),
         popup,
     );
 }
 
-fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState) {
+fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState, theme: &UiTheme) {
     let popup = centered_rect(70, 14, area);
     let matches = commands::matches(&palette.query, 10);
     let mut lines = vec![Line::from(vec![
@@ -1644,9 +1667,9 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
     for (index, item) in matches.iter().enumerate() {
         let selected = index == palette.selected;
         let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            theme.selected
         } else {
-            Style::default().fg(Color::White)
+            theme.style(VisualRole::Primary)
         };
         lines.push(Line::from(Span::styled(
             format!(
@@ -1670,7 +1693,7 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
                 Block::default()
                     .title(" 命令面板 ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(theme.focus_border),
             )
             .wrap(Wrap { trim: false }),
         popup,
@@ -1691,9 +1714,9 @@ fn draw_file_suggestions(frame: &mut Frame<'_>, input_area: Rect, app: &App) {
         .enumerate()
         .map(|(index, value)| {
             let style = if index == app.file_selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                UiTheme::default().selected
             } else {
-                Style::default().fg(Color::White)
+                UiTheme::default().style(VisualRole::Primary)
             };
             ListItem::new(Line::from(Span::styled(
                 format!(
@@ -1710,7 +1733,7 @@ fn draw_file_suggestions(frame: &mut Frame<'_>, input_area: Rect, app: &App) {
             Block::default()
                 .title(" 文件引用 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(UiTheme::default().focus_border),
         ),
         popup,
     );
@@ -1951,10 +1974,67 @@ mod tests {
         assert_eq!(text[0], "Heading");
         assert_eq!(text[1], "• bold text and code");
         assert_eq!(text[2], "│ quote");
-        assert_eq!(text[3], "[code: rust]");
-        assert_eq!(text[4], "let value = 1;");
-        assert_eq!(text[5], "[end code]");
+        assert_eq!(text[3], "let value = 1;");
+        assert!(!text.iter().any(|line| line.contains("[code")));
+        assert!(!text.iter().any(|line| line.contains("[end code]")));
         assert!(lines[1].spans.len() >= 4);
+    }
+
+    #[test]
+    fn fenced_code_preserves_literal_markdown_and_copy_text() {
+        for markdown in [
+            "```bash\n./1h-agent --workspace /Users/yang/Desktop\n```",
+            "~~~bash\n* # [x] <b>中文🙂</b>\n~~~",
+            "    one\n      two\n\n    * literal",
+            "```\n  indented\n\n`backtick` # heading\n```",
+        ] {
+            let lines = render_markdown(markdown, Style::default());
+            let text = markdown_text(&lines);
+            assert!(!text.contains("[code"));
+            assert!(!text.contains("[end code]"));
+            assert!(!text.contains("code:"));
+            assert!(lines.iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.fg == Some(Color::Gray))
+            }));
+        }
+
+        let lines = render_markdown(
+            "```bash\n./1h-agent --workspace /Users/yang/Desktop\n```",
+            Style::default(),
+        );
+        let layout = MessageLayout::new(lines, Rect::new(0, 0, 80, 10), 0);
+        assert!(
+            layout
+                .text
+                .contains("./1h-agent --workspace /Users/yang/Desktop")
+        );
+        assert!(!layout.text.contains("bash"));
+        assert!(!layout.text.contains("[code"));
+    }
+
+    #[test]
+    fn unclosed_streaming_code_is_visible_without_end_marker() {
+        let lines = render_markdown(
+            "```rust\nfn main() {\n  println!(\"中文🙂 * # [x]\");",
+            Style::default(),
+        );
+        let text = markdown_text(&lines);
+        assert!(text.contains("fn main()"));
+        assert!(text.contains("中文🙂 * # [x]"));
+        assert!(!text.contains("[code"));
+        assert!(!text.contains("[end code]"));
+    }
+
+    #[test]
+    fn code_block_keeps_empty_lines_and_nested_indent() {
+        let lines = render_markdown(
+            "```text\nroot\n\n    child\n        grandchild\n```",
+            Style::default(),
+        );
+        let text = markdown_text(&lines);
+        assert!(text.contains("root\n\n    child\n        grandchild"));
     }
 
     fn markdown_text(lines: &[Line<'static>]) -> String {
@@ -2055,9 +2135,9 @@ mod tests {
         assert!(text.contains("before"));
         assert!(text.contains("soft break"));
         assert!(text.contains("indented code"));
-        assert!(text.contains("[code: text]"));
         assert!(text.contains("fenced"));
-        assert!(text.contains("[end code]"));
+        assert!(!text.contains("[code"));
+        assert!(!text.contains("[end code]"));
         assert!(text.contains("incomplete"));
 
         let hard_break = markdown_text(&render_markdown("one  \ntwo", Style::default()));
@@ -2176,14 +2256,6 @@ mod tests {
         assert!(text.contains("[redacted]"));
         assert!(!text.contains("secret-value"));
         assert!(!text.contains("\"command\""));
-    }
-
-    #[test]
-    fn context_ring_tracks_usage_thresholds() {
-        assert_eq!(context_ring(0), "○");
-        assert_eq!(context_ring(50), "◑");
-        assert_eq!(context_ring(90), "◉");
-        assert_eq!(context_ring(100), "●");
     }
 
     #[test]
