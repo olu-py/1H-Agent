@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -383,10 +384,22 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         let _ = disable_raw_mode();
         return Err(error.into());
     }
+    // Best-effort kitty keyboard protocol enhancement. Terminals without
+    // support ignore it and the legacy Windows console API returns
+    // Unsupported, so a failure here must not prevent startup. This makes
+    // Alt+Up/Down arrive as `KeyCode::Up`/`Down` with the ALT modifier set.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     if let Err(error) = terminal.clear() {
         let _ = disable_raw_mode();
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
         let _ = execute!(
             terminal.backend_mut(),
             LeaveAlternateScreen,
@@ -399,6 +412,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
     let result = event_loop(&mut terminal, &mut app).await;
 
     let raw_mode_result = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     let screen_result = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -674,21 +688,11 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             create_session(app)?;
             true
         }
-        KeyCode::Up
-            if !app.busy
-                && key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-        {
+        KeyCode::Up if !app.busy && session_switch_direction(&key) == Some(-1) => {
             switch_session(app, -1)?;
             true
         }
-        KeyCode::Down
-            if !app.busy
-                && key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-        {
+        KeyCode::Down if !app.busy && session_switch_direction(&key) == Some(1) => {
             switch_session(app, 1)?;
             true
         }
@@ -2403,6 +2407,24 @@ fn create_session(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Returns the session switch direction for keys dedicated to moving through
+/// the session list: `Alt+Up`/`Alt+Down` and, for backwards compatibility,
+/// `Ctrl+Up`/`Ctrl+Down`. Bare Up/Down must stay with the input editor, so they
+/// deliberately return `None`.
+fn session_switch_direction(key: &crossterm::event::KeyEvent) -> Option<i32> {
+    let has_switch_modifier = key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+    if !has_switch_modifier {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        _ => None,
+    }
+}
+
 fn switch_session(app: &mut App, direction: i32) -> Result<()> {
     refresh_sessions(app)?;
     if app.sessions.len() < 2 {
@@ -2663,11 +2685,48 @@ fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyEvent, KeyEventState, MouseEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventState, KeyModifiers, MouseEvent};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn session_switch_direction_only_accepts_alt_or_ctrl_arrows() {
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            Some(-1)
+        );
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+            Some(1)
+        );
+        // Keep the pre-existing Ctrl+Up/Down behaviour.
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+            Some(-1)
+        );
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
+            Some(1)
+        );
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
+            None
+        );
+        assert_eq!(
+            session_switch_direction(&KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT)),
+            None
+        );
+    }
 
     fn test_app(temp: &TempDir) -> App {
         let workspace = temp.path().to_path_buf();

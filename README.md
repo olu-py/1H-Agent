@@ -72,6 +72,8 @@ native_web_search = "disabled"
 | 工具详情 / 审批 | 鼠标点击工具摘要 / `Y`、`N` |
 | 取消 / 退出 | `Esc` / `Ctrl+C` |
 
+> `Alt+Up` / `Alt+Down` 依赖 kitty keyboard protocol，请使用支持该协议的终端（如 kitty、WezTerm、Alacritty、foot、iTerm2）。不支持的老终端（例如 macOS 自带 Terminal.app）可能无法区分 `Alt+方向键` 与裸方向键。
+
 文件操作限定在 `--workspace` 内；写入、删除、命令、浏览器交互和变更型 Git 操作会按策略要求审批。
 
 ## AI 维护文档
