@@ -165,6 +165,8 @@ mod tests {
             Some(Command::Rename(Some("my session".into())))
         );
         assert_eq!(parse("/plan"), Some(Command::Mode(AgentMode::Plan)));
+        assert_eq!(parse("/build"), Some(Command::Mode(AgentMode::Build)));
+        assert_eq!(parse("/explore"), Some(Command::Mode(AgentMode::Explore)));
         assert_eq!(parse("/missing"), None);
     }
 

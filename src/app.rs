@@ -219,6 +219,8 @@ pub struct App {
     pub thinking_menu_open: bool,
     pub thinking_control_rect: Option<Rect>,
     pub thinking_menu_rect: Option<Rect>,
+    pub session_panel_rect: Option<Rect>,
+    pub input_mode_rect: Option<Rect>,
     pub force_full_redraw: bool,
     pub mouse_press_target: Option<InteractionTarget>,
     pub mouse_press_position: Option<(u16, u16)>,
@@ -339,6 +341,8 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         thinking_menu_open: false,
         thinking_control_rect: None,
         thinking_menu_rect: None,
+        session_panel_rect: None,
+        input_mode_rect: None,
         force_full_redraw: false,
         mouse_press_target: None,
         mouse_press_position: None,
@@ -555,6 +559,9 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         if let Some(outcome) = handle_thinking_mouse(app, mouse)? {
             return Ok(outcome);
         }
+        if let Some(outcome) = handle_navigation_mouse(app, mouse)? {
+            return Ok(outcome);
+        }
         if output_mouse_event_allowed(
             mouse.kind,
             app.settings.is_some(),
@@ -660,13 +667,14 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         }
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
             app.leader_pending = true;
-            app.status = "快捷键：n 新建 | s 设置 | f 分支 | p 面板 | q 退出".into();
+            app.status = "快捷键：n 新建 | m 模式 | s 设置 | f 分支 | p 面板 | q 退出".into();
             true
         }
         _ if app.leader_pending => {
             app.leader_pending = false;
             match key.code {
                 KeyCode::Char('n') => create_session(app)?,
+                KeyCode::Char('m') => switch_mode(app, next_mode(app.mode))?,
                 KeyCode::Char('s') => open_settings(app),
                 KeyCode::Char('f') => execute_command(app, Command::Fork)?,
                 KeyCode::Char('p') => {
@@ -914,6 +922,51 @@ fn apply_thinking_selection(
         ),
     };
     Ok(())
+}
+
+fn handle_navigation_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left)
+        || app.settings.is_some()
+        || app.palette.is_some()
+        || app.pending_approval.is_some()
+    {
+        return Ok(None);
+    }
+    if let Some(area) = app.session_panel_rect {
+        let current = app
+            .sessions
+            .iter()
+            .position(|session| session.id == app.session_id)
+            .unwrap_or(0);
+        if let Some(index) =
+            ui::session_index_at(area, mouse.column, mouse.row, app.sessions.len(), current)
+        {
+            let session_id = app.sessions[index].id.clone();
+            if session_id == app.session_id {
+                return Ok(Some(EventOutcome::redraw()));
+            }
+            if app.busy {
+                app.status = "请求运行中，无法切换会话".into();
+                return Ok(Some(EventOutcome::redraw()));
+            }
+            activate_session(app, session_id)?;
+            return Ok(Some(EventOutcome::redraw()));
+        }
+    }
+    if let Some(rect) = app.input_mode_rect
+        && point_in_rect(mouse.column, mouse.row, rect)
+    {
+        if app.busy {
+            app.status = "请求运行中，无法切换模式".into();
+            return Ok(Some(EventOutcome::redraw()));
+        }
+        switch_mode(app, next_mode(app.mode))?;
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    Ok(None)
 }
 
 fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> EventOutcome {
@@ -1630,11 +1683,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             }
         }
         Command::Mode(mode) => {
-            app.mode = mode;
-            app.registry.set_mode(mode);
-            let _ = app.storage.set_session_mode(&app.session_id, mode.as_str());
-            app.storage.clear_response_id(&app.session_id)?;
-            app.status = format!("模式已切换为 {}", mode.as_str().to_ascii_uppercase());
+            switch_mode(app, mode)?;
             app.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(format!(
@@ -2407,6 +2456,27 @@ fn create_session(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn next_mode(mode: AgentMode) -> AgentMode {
+    match mode {
+        AgentMode::Build => AgentMode::Plan,
+        AgentMode::Plan => AgentMode::Explore,
+        AgentMode::Explore => AgentMode::Build,
+    }
+}
+
+/// Shared mode-switch entry point for slash commands, the leader `m` shortcut,
+/// and clicking the mode label in the input title. It updates UI state,
+/// tool permissions, persistence, and clears the provider response id so the
+/// next request uses the new mode contract.
+fn switch_mode(app: &mut App, mode: AgentMode) -> Result<()> {
+    app.mode = mode;
+    app.registry.set_mode(mode);
+    let _ = app.storage.set_session_mode(&app.session_id, mode.as_str());
+    app.storage.clear_response_id(&app.session_id)?;
+    app.status = format!("模式已切换为 {}", mode.as_str().to_ascii_uppercase());
+    Ok(())
+}
+
 /// Returns the session switch direction for keys dedicated to moving through
 /// the session list: `Alt+Up`/`Alt+Down` and, for backwards compatibility,
 /// `Ctrl+Up`/`Ctrl+Down`. Bare Up/Down must stay with the input editor, so they
@@ -2692,6 +2762,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn next_mode_cycles_in_build_plan_explore_order() {
+        assert_eq!(next_mode(AgentMode::Build), AgentMode::Plan);
+        assert_eq!(next_mode(AgentMode::Plan), AgentMode::Explore);
+        assert_eq!(next_mode(AgentMode::Explore), AgentMode::Build);
+    }
+
+    #[test]
+    fn switch_mode_updates_registry_storage_and_status() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.storage
+            .save_response_id(&app.session_id, "stale-response")
+            .unwrap();
+        switch_mode(&mut app, AgentMode::Explore).unwrap();
+        assert_eq!(app.mode, AgentMode::Explore);
+        assert!(app.status.contains("EXPLORE"));
+        assert_eq!(
+            app.storage.session_mode(&app.session_id).unwrap(),
+            AgentMode::Explore.as_str()
+        );
+        assert!(app.storage.response_id(&app.session_id).unwrap().is_none());
+    }
+
+    #[test]
     fn session_switch_direction_only_accepts_alt_or_ctrl_arrows() {
         assert_eq!(
             session_switch_direction(&KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
@@ -2772,6 +2866,8 @@ mod tests {
             thinking_menu_open: false,
             thinking_control_rect: None,
             thinking_menu_rect: None,
+            session_panel_rect: None,
+            input_mode_rect: None,
             force_full_redraw: false,
             mouse_press_target: None,
             mouse_press_position: None,

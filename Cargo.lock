@@ -1749,41 +1749,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "one-hour-agent"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "arboard",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "crossterm",
- "dirs",
- "futures-util",
- "html2text",
- "ignore",
- "keyring",
- "libc",
- "pulldown-cmark",
- "ratatui",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "unicode-segmentation",
- "unicode-width 0.2.0",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1976,6 +1941,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "protium-agent"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "futures-util",
+ "html2text",
+ "ignore",
+ "keyring",
+ "libc",
+ "pulldown-cmark",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+ "url",
+ "uuid",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use std::{process::Command, sync::Arc};
 
-use one_hour_agent::{
+use protium_agent::{
     config::RuntimeConfig,
     provider::ToolCall,
     security::{PolicyDecision, Workspace},

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use one_hour_agent::{app, config::Config};
+use protium_agent::{app, config::Config};
 
 #[derive(Debug, Parser)]
 #[command(name = "1h-agent", version, about)]
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "one_hour_agent=info".into()),
+                .unwrap_or_else(|_| "protium_agent=info".into()),
         )
         .with_writer(std::io::stderr)
         .try_init()

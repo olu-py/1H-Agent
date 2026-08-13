@@ -63,7 +63,8 @@ native_web_search = "disabled"
 | 操作 | 快捷键/语法 |
 | --- | --- |
 | 发送 / 换行 | `Enter` / `Shift+Enter` 或 `Ctrl+J` |
-| 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` |
+| 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` / 点击会话行 |
+| 切换模式 | `Ctrl+X` 后按 `m` / `/plan` `/build` `/explore` / 点击输入框标题的模式标签 |
 | 命令面板 / 命令 | `Ctrl+P` / `/` |
 | 引用文件 / 执行命令 | `@path` / `!command`（命令须审批） |
 | 滚动 / 回到底部 | `PageUp`、`PageDown` / `Ctrl+L` |

@@ -19,12 +19,14 @@ use crate::{
         App, CommandPaletteState, DisplayContent, DisplayKind, SettingsField, SettingsState,
         ToolDisplay, ToolDisplayStatus,
     },
-    commands,
+    commands::{self, AgentMode},
     output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
     secrets,
     ui_layout::{Density, HeightClass, compute_layout, message_block},
     ui_theme::{UiTheme, VisualRole},
-    ui_view_model::{FooterLine, InputView, ThinkingControlView, UiSegment, UiViewModel},
+    ui_view_model::{
+        FooterLine, InputView, ThinkingControlView, UiSegment, UiViewModel, mode_label,
+    },
 };
 
 struct RenderedMessageLines {
@@ -47,6 +49,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     if let Some(sessions) = layout.sessions {
         draw_sessions(frame, sessions, app, &theme);
+    } else {
+        app.session_panel_rect = None;
     }
     draw_messages(
         frame,
@@ -76,7 +80,66 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) {
+const SESSIONS_TITLE_OFFSET: u16 = 1;
+const SESSIONS_HEADER_ROWS: u16 = 4;
+const SESSIONS_TRAILING_ROWS: u16 = 1;
+
+/// Number of session rows visible below the panel title and the four-row
+/// header. The `List` block has a title, so its inner area starts one row lower
+/// than the panel rect.
+fn session_visible_slots(area_height: u16) -> usize {
+    area_height
+        .saturating_sub(SESSIONS_TITLE_OFFSET + SESSIONS_HEADER_ROWS + SESSIONS_TRAILING_ROWS)
+        as usize
+}
+
+/// Window start such that the current session stays visible, pinned to the
+/// bottom slot whenever the list has scrolled. Shared by rendering and hit
+/// testing so a click always maps to the same session that was drawn.
+fn session_window_start(total: usize, current: usize, visible_slots: usize) -> usize {
+    current
+        .saturating_add(1)
+        .saturating_sub(visible_slots)
+        .min(total.saturating_sub(visible_slots))
+}
+
+/// Maps a mouse position inside the sessions panel to the session list index,
+/// or `None` when the position is outside the panel, in the header, or in the
+/// trailing blank rows.
+pub(crate) fn session_index_at(
+    area: Rect,
+    column: u16,
+    row: u16,
+    total: usize,
+    current: usize,
+) -> Option<usize> {
+    if area.width < 2 {
+        return None;
+    }
+    let list_top = area.y.saturating_add(SESSIONS_TITLE_OFFSET);
+    let list_right = area.right().saturating_sub(1);
+    if column < area.x || column >= list_right || row < list_top || row >= area.bottom() {
+        return None;
+    }
+    let header_end = list_top.saturating_add(SESSIONS_HEADER_ROWS);
+    if row < header_end {
+        return None;
+    }
+    let visible_slots = session_visible_slots(area.height);
+    if visible_slots == 0 {
+        return None;
+    }
+    let offset = row.saturating_sub(header_end) as usize;
+    if offset >= visible_slots {
+        return None;
+    }
+    let start = session_window_start(total, current, visible_slots);
+    let index = start.saturating_add(offset);
+    (index < total).then_some(index)
+}
+
+fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiTheme) {
+    app.session_panel_rect = Some(area);
     let workspace = app
         .workspace
         .file_name()
@@ -98,16 +161,13 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) 
             theme.strong(VisualRole::Accent),
         ))),
     ];
-    let visible_sessions = area.height.saturating_sub(6) as usize;
+    let visible_sessions = session_visible_slots(area.height);
     let current = app
         .sessions
         .iter()
         .position(|session| session.id == app.session_id)
         .unwrap_or(0);
-    let start = current
-        .saturating_add(1)
-        .saturating_sub(visible_sessions)
-        .min(app.sessions.len().saturating_sub(visible_sessions));
+    let start = session_window_start(app.sessions.len(), current, visible_sessions);
     for session in app.sessions.iter().skip(start).take(visible_sessions) {
         let active = session.id == app.session_id;
         let marker = if active { "> " } else { "  " };
@@ -1221,7 +1281,25 @@ fn code_style() -> Style {
     UiTheme::default().style(VisualRole::Code)
 }
 
-fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App, view: &InputView, theme: &UiTheme) {
+/// Clickable rectangle for the mode portion of the input title, which is
+/// rendered left-aligned on the top border as `" 输入 · {模式} "`.
+fn input_mode_rect(area: Rect, mode: AgentMode) -> Option<Rect> {
+    const PREFIX: &str = " 输入 · ";
+    let label = mode_label(mode);
+    let prefix_width = UnicodeWidthStr::width(PREFIX) as u16;
+    let label_width = UnicodeWidthStr::width(label) as u16;
+    if label_width == 0 {
+        return None;
+    }
+    let x = area.x.saturating_add(1).saturating_add(prefix_width);
+    if x.saturating_add(label_width) > area.right().saturating_sub(1) {
+        return None;
+    }
+    Some(Rect::new(x, area.y, label_width, 1))
+}
+
+fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App, view: &InputView, theme: &UiTheme) {
+    app.input_mode_rect = input_mode_rect(area, app.mode);
     let style = if view.enabled {
         theme.style(VisualRole::Primary)
     } else {
@@ -1937,6 +2015,43 @@ mod tests {
             .borders(Borders::BOTTOM)
             .inner(Rect::new(0, 0, 1, 1));
         assert_eq!(tiny.height, 0);
+    }
+
+    #[test]
+    fn session_window_start_keeps_current_visible_and_bounded() {
+        assert_eq!(session_window_start(3, 0, 4), 0);
+        assert_eq!(session_window_start(10, 0, 4), 0);
+        assert_eq!(session_window_start(10, 3, 4), 0);
+        assert_eq!(session_window_start(10, 4, 4), 1);
+        assert_eq!(session_window_start(10, 9, 4), 6);
+        assert_eq!(session_window_start(2, 1, 4), 0);
+    }
+
+    #[test]
+    fn session_index_at_maps_only_visible_session_rows() {
+        let area = Rect::new(0, 0, 30, 12);
+        // Panel title row 0 and header rows 1..4 are not sessions.
+        assert_eq!(session_index_at(area, 1, 0, 10, 0), None);
+        assert_eq!(session_index_at(area, 1, 1, 10, 0), None);
+        assert_eq!(session_index_at(area, 1, 4, 10, 0), None);
+        // Six session rows are visible (12 - 1 title - 4 header - 1 trailing).
+        assert_eq!(session_index_at(area, 1, 5, 10, 0), Some(0));
+        assert_eq!(session_index_at(area, 1, 10, 10, 0), Some(5));
+        // Trailing blank row and panel border/outside map to None.
+        assert_eq!(session_index_at(area, 1, 11, 10, 0), None);
+        assert_eq!(session_index_at(area, 29, 5, 10, 0), None);
+        assert_eq!(session_index_at(area, 30, 5, 10, 0), None);
+    }
+
+    #[test]
+    fn input_mode_rect_uses_utf8_width_and_rejects_narrow_inputs() {
+        let area = Rect::new(0, 20, 40, 5);
+        assert_eq!(
+            input_mode_rect(area, AgentMode::Build),
+            Some(Rect::new(9, 20, 4, 1))
+        );
+        let narrow = Rect::new(0, 20, 8, 5);
+        assert_eq!(input_mode_rect(narrow, AgentMode::Build), None);
     }
 
     #[test]
