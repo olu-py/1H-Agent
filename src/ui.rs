@@ -45,7 +45,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let view = UiViewModel::from_app(app, density, height, layout.footer.width as usize);
     #[cfg(test)]
     {
-        app.footer_rebuild_count += 1;
+        app.current.footer_rebuild_count += 1;
     }
     let theme = UiTheme::default();
 
@@ -71,7 +71,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         app.thinking_menu_rect = None;
     }
-    if app.pending_approval.is_some() {
+    if app.current.pending_approval.is_some() {
         draw_approval(frame, area, app, &theme);
     }
     if let Some(settings) = &app.settings {
@@ -109,17 +109,19 @@ pub(crate) struct SessionRow {
 
 /// Flattens the session list into depth-first tree order, dropping the
 /// children of collapsed parents. Roots (`parent_id == None`) come first, each
-/// followed by its visible descendants.
+/// followed by its visible descendants. Parents are collapsed by default and
+/// only expand when the user clicks them; the active session does not force an
+/// expansion.
 pub(crate) fn flatten_session_tree(
     sessions: &[SessionSummary],
-    collapsed: &HashSet<String>,
+    expanded: &HashSet<String>,
 ) -> Vec<SessionRow> {
     let mut rows = Vec::new();
     for root in sessions
         .iter()
         .filter(|session| session.parent_id.is_none())
     {
-        push_session_tree(root, 0, sessions, collapsed, &mut rows);
+        push_session_tree(root, 0, sessions, expanded, &mut rows);
     }
     rows
 }
@@ -128,26 +130,26 @@ fn push_session_tree(
     session: &SessionSummary,
     depth: usize,
     all: &[SessionSummary],
-    collapsed: &HashSet<String>,
+    expanded: &HashSet<String>,
     rows: &mut Vec<SessionRow>,
 ) {
     let has_children = all
         .iter()
         .any(|child| child.parent_id.as_deref() == Some(session.id.as_str()));
-    let expanded = has_children && !collapsed.contains(&session.id);
+    let is_expanded = has_children && expanded.contains(&session.id);
     rows.push(SessionRow {
         id: session.id.clone(),
         title: session.title.clone(),
         depth,
         has_children,
-        expanded,
+        expanded: is_expanded,
     });
-    if expanded {
+    if is_expanded {
         for child in all
             .iter()
             .filter(|child| child.parent_id.as_deref() == Some(session.id.as_str()))
         {
-            push_session_tree(child, depth + 1, all, collapsed, rows);
+            push_session_tree(child, depth + 1, all, expanded, rows);
         }
     }
 }
@@ -221,14 +223,14 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiThe
         ))),
     ];
     let visible_sessions = session_visible_slots(area.height);
-    let rows = flatten_session_tree(&app.sessions, &app.collapsed_sessions);
+    let rows = flatten_session_tree(&app.sessions, &app.expanded_sessions);
     let current = rows
         .iter()
-        .position(|row| row.id == app.session_id)
+        .position(|row| row.id == app.current.session_id)
         .unwrap_or(0);
     let start = session_window_start(rows.len(), current, visible_sessions);
     for row in rows.iter().skip(start).take(visible_sessions) {
-        let active = row.id == app.session_id;
+        let active = row.id == app.current.session_id;
         let arrow = if row.has_children {
             if row.expanded { "▾ " } else { "▸ " }
         } else {
@@ -268,14 +270,14 @@ fn draw_messages(
     let block = message_block();
     update_message_layout(app, viewport);
     let thinking_lines = live_thinking_lines(app, viewport.width.max(1) as usize);
-    let Some(layout) = &app.message_layout else {
+    let Some(layout) = &app.current.message_layout else {
         frame.render_widget(
             Paragraph::new(Vec::<Line<'static>>::new()).block(block),
             area,
         );
         return;
     };
-    let selection = app.output_selection;
+    let selection = app.current.output_selection;
     let visible_lines = layout
         .visual_lines
         .iter()
@@ -293,12 +295,16 @@ fn draw_messages(
 
 pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
     let thinking_lines = live_thinking_lines(app, viewport.width.max(1) as usize);
-    let cached_width = app.message_layout.as_ref().map(|layout| layout.width);
+    let cached_width = app
+        .current
+        .message_layout
+        .as_ref()
+        .map(|layout| layout.width);
     let viewport_width = viewport.width.max(1) as usize;
-    if app.output_layout_dirty || app.message_layout.is_none() {
-        drop(app.message_layout.take());
+    if app.current.output_layout_dirty || app.current.message_layout.is_none() {
+        drop(app.current.message_layout.take());
         let rendered = render_message_lines(app, viewport_width);
-        app.message_layout = Some(MessageLayout::new_with_interactions(
+        app.current.message_layout = Some(MessageLayout::new_with_interactions(
             rendered.lines,
             rendered.interactions,
             viewport,
@@ -307,23 +313,24 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
         ));
         #[cfg(test)]
         {
-            app.output_layout_rebuild_count += 1;
+            app.current.output_layout_rebuild_count += 1;
         }
     } else if cached_width != Some(viewport_width) {
         let layout = app
+            .current
             .message_layout
             .take()
             .expect("layout existence was checked above");
-        app.message_layout = Some(layout.reflow(viewport));
+        app.current.message_layout = Some(layout.reflow(viewport));
         #[cfg(test)]
         {
-            app.output_layout_rebuild_count += 1;
+            app.current.output_layout_rebuild_count += 1;
         }
-    } else if let Some(layout) = &mut app.message_layout {
+    } else if let Some(layout) = &mut app.current.message_layout {
         layout.update_viewport(viewport);
     }
 
-    if let Some(layout) = &mut app.message_layout {
+    if let Some(layout) = &mut app.current.message_layout {
         layout.set_live_thinking_lines(&thinking_lines);
         let max_scroll = layout.max_scroll();
         let anchored_scroll =
@@ -337,28 +344,29 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
                         .map(|visual_row| visual_row.saturating_sub(relative_row))
                 });
         let scroll = anchored_scroll
-            .or(app.output_scroll_top)
+            .or(app.current.output_scroll_top)
             .unwrap_or_else(|| {
-                if app.follow_output {
+                if app.current.follow_output {
                     max_scroll
                 } else {
-                    max_scroll.saturating_sub(app.message_scroll)
+                    max_scroll.saturating_sub(app.current.message_scroll)
                 }
             })
             .min(max_scroll);
         if anchored_scroll.is_some() {
-            app.output_scroll_top = Some(scroll);
-            app.message_scroll = max_scroll.saturating_sub(scroll);
+            app.current.output_scroll_top = Some(scroll);
+            app.current.message_scroll = max_scroll.saturating_sub(scroll);
         }
         layout.set_scroll(scroll);
     }
-    app.output_layout_dirty = false;
+    app.current.output_layout_dirty = false;
 }
 
 fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
     #[cfg(test)]
     {
-        app.markdown_parse_count += app
+        app.current.markdown_parse_count += app
+            .current
             .entries
             .iter()
             .filter(|entry| matches!(entry.content, DisplayContent::Markdown(_)))
@@ -369,8 +377,8 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
     let mut interactions = Vec::new();
     let mut thinking_before = None;
     let mut in_tool_group = false;
-    for (entry_index, entry) in app.entries.iter().enumerate() {
-        if app.thinking_anchor == Some(entry_index) {
+    for (entry_index, entry) in app.current.entries.iter().enumerate() {
+        if app.current.thinking_anchor == Some(entry_index) {
             thinking_before = Some(lines.len());
             in_tool_group = false;
         }
@@ -386,14 +394,14 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
             }
             render_tool(
                 tool,
-                app.expanded_tools.contains(&tool.call_id),
+                app.current.expanded_tools.contains(&tool.call_id),
                 width,
                 &mut lines,
                 &mut interactions,
             );
-            let group_ends = app.entries.get(entry_index + 1).is_none_or(|next| {
+            let group_ends = app.current.entries.get(entry_index + 1).is_none_or(|next| {
                 !matches!(next.content, DisplayContent::Tool(_))
-                    || app.thinking_anchor == Some(entry_index + 1)
+                    || app.current.thinking_anchor == Some(entry_index + 1)
             });
             if group_ends {
                 push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
@@ -405,7 +413,7 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
         if let DisplayContent::Thinking(thinking) = &entry.content {
             render_thinking_summary(
                 thinking,
-                app.expanded_thinking.contains(&thinking.id),
+                app.current.expanded_thinking.contains(&thinking.id),
                 width,
                 &mut lines,
                 &mut interactions,
@@ -473,7 +481,7 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
         }
         push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
     }
-    if app.thinking_anchor.is_some() && thinking_before.is_none() {
+    if app.current.thinking_anchor.is_some() && thinking_before.is_none() {
         thinking_before = Some(lines.len());
     }
     RenderedMessageLines {
@@ -1443,7 +1451,7 @@ fn input_mode_rect(area: Rect, mode: AgentMode) -> Option<Rect> {
 }
 
 fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App, view: &InputView, theme: &UiTheme) {
-    app.input_mode_rect = input_mode_rect(area, app.mode);
+    app.input_mode_rect = input_mode_rect(area, app.current.mode);
     let style = if view.enabled {
         theme.style(VisualRole::Primary)
     } else {
@@ -1468,7 +1476,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App, view: &InputView
         ),
         area,
     );
-    if !app.busy && app.settings.is_none() && app.pending_approval.is_none() {
+    if !app.current.busy && app.settings.is_none() && app.current.pending_approval.is_none() {
         let cursor_x = area.x + 1 + cursor_column as u16;
         let cursor_y = area.y + 1 + cursor_row.min(area.height.saturating_sub(3));
         frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), cursor_y));
@@ -1651,7 +1659,11 @@ fn render_segments(segments: &[UiSegment], theme: &UiTheme) -> Vec<Span<'static>
 
 fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) {
     let popup = centered_rect(76, 18, area);
-    let approval = app.pending_approval.as_ref().expect("approval exists");
+    let approval = app
+        .current
+        .pending_approval
+        .as_ref()
+        .expect("approval exists");
     let mut lines = approval_lines(&approval.call, &approval.reason);
     let waited = approval.created_at.elapsed().as_secs();
     lines.push(Line::from(Span::styled(
@@ -2080,59 +2092,60 @@ fn live_thinking_lines(app: &App, width: usize) -> Vec<String> {
 }
 
 fn live_thinking_lines_with_braille(app: &App, width: usize, braille: bool) -> Vec<String> {
-    if app.thinking_anchor.is_none() {
+    if app.current.thinking_anchor.is_none() {
         return Vec::new();
     }
-    let status = if app.thinking_active {
+    let status = if app.current.thinking_active {
         "思考中"
     } else {
-        match app.thinking_result {
+        match app.current.thinking_result {
             crate::app::ThinkingResult::Completed => "思考完成",
             crate::app::ThinkingResult::Failed => "思考失败",
             crate::app::ThinkingResult::Cancelled => "思考已取消",
         }
     };
-    if !app.thinking_expanded {
-        let prefix = if app.thinking_active {
-            crate::app::thinking_animation_glyph(app.thinking_animation_frame, braille).to_string()
+    if !app.current.thinking_expanded {
+        let prefix = if app.current.thinking_active {
+            crate::app::thinking_animation_glyph(app.current.thinking_animation_frame, braille)
+                .to_string()
         } else {
-            match app.thinking_result {
+            match app.current.thinking_result {
                 crate::app::ThinkingResult::Completed => "✓",
                 crate::app::ThinkingResult::Failed => "✗",
                 crate::app::ThinkingResult::Cancelled => "■",
             }
             .to_owned()
         };
-        let suffix = app.thinking_last_line.trim();
+        let suffix = app.current.thinking_last_line.trim();
         let fixed = format!("{prefix} {status}");
         let available = width
             .saturating_sub(UnicodeWidthStr::width(fixed.as_str()))
             .saturating_sub(2);
         let suffix = fit_text_tail(suffix, available);
-        return vec![
-            if suffix.is_empty() || (app.thinking_active && suffix == "模型正在思考") {
-                fixed
-            } else {
-                format!("{fixed}  {suffix}")
-            },
-        ];
+        return vec![if suffix.is_empty()
+            || (app.current.thinking_active && suffix == "模型正在思考")
+        {
+            fixed
+        } else {
+            format!("{fixed}  {suffix}")
+        }];
     }
-    let expanded_title = if app.thinking_active {
+    let expanded_title = if app.current.thinking_active {
         format!(
             "▾ {} {status}",
-            crate::app::thinking_animation_glyph(app.thinking_animation_frame, braille)
+            crate::app::thinking_animation_glyph(app.current.thinking_animation_frame, braille)
         )
     } else {
         format!("▾ {status}")
     };
     let mut lines = vec![fit_text_tail(&expanded_title, width)];
-    if app.thinking_buffer_truncated {
+    if app.current.thinking_buffer_truncated {
         lines.extend(wrap_grapheme_lines("  [较早思考内容已截断]", width));
     }
-    let reasoning = app.thinking_buffer.trim();
+    let reasoning = app.current.thinking_buffer.trim();
     if reasoning.is_empty() {
         lines.extend(wrap_grapheme_lines(
-            &format!("  {}", app.thinking_last_line),
+            &format!("  {}", app.current.thinking_last_line),
             width,
         ));
     } else {
@@ -2337,7 +2350,7 @@ mod tests {
     }
 
     #[test]
-    fn flatten_session_tree_orders_children_and_collapses() {
+    fn flatten_session_tree_defaults_collapsed_only_click_expands() {
         let sessions = vec![
             SessionSummary {
                 id: "root".into(),
@@ -2355,17 +2368,19 @@ mod tests {
                 parent_id: Some("root".into()),
             },
         ];
+        // Default: nothing explicitly expanded -> everything collapsed.
         let rows = flatten_session_tree(&sessions, &HashSet::new());
-        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-        assert_eq!(ids, vec!["root", "child", "other"]);
-        assert_eq!(rows[1].depth, 1);
-        assert!(rows[0].has_children && rows[0].expanded);
-
-        let collapsed: HashSet<String> = ["root".into()].into_iter().collect();
-        let rows = flatten_session_tree(&sessions, &collapsed);
         let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(ids, vec!["root", "other"]);
         assert!(rows[0].has_children && !rows[0].expanded);
+
+        // Explicit (click) expansion shows the children.
+        let expanded: HashSet<String> = ["root".into()].into_iter().collect();
+        let rows = flatten_session_tree(&sessions, &expanded);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["root", "child", "other"]);
+        assert_eq!(rows[1].depth, 1);
+        assert!(rows[0].expanded);
     }
 
     #[test]

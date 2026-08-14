@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::Arc,
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{
     config::{
@@ -16,7 +17,7 @@ use crate::{
     prompt,
     provider::{
         ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ThinkingMode, ToolCall,
-        Usage,
+        ToolDefinition, Usage,
     },
     security::PolicyDecision,
     storage::Storage,
@@ -43,6 +44,69 @@ fn append_reasoning_bounded(buffer: &mut String, delta: &str) {
         .find(|offset| *offset >= minimum)
         .unwrap_or(buffer.len());
     buffer.drain(..start);
+}
+
+/// Appends `delta` to `buffer` without exceeding `max_bytes`, truncating at a
+/// UTF-8 character boundary. Used for bounded child-agent output.
+fn append_text_bounded(buffer: &mut String, delta: &str, max_bytes: usize) {
+    let remaining = max_bytes.saturating_sub(buffer.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut end = delta.len().min(remaining);
+    while end > 0 && !delta.is_char_boundary(end) {
+        end -= 1;
+    }
+    buffer.push_str(&delta[..end]);
+}
+
+/// Whether a child role implies write access. Planning/review roles stay
+/// read-only; implementation/coding roles may write files (subject to the
+/// normal approval policy).
+fn is_implement_role(role: Option<&str>) -> bool {
+    role.is_some_and(|role| {
+        let role = role.to_ascii_lowercase();
+        [
+            "implement",
+            "implementation",
+            "code",
+            "coder",
+            "write",
+            "build",
+            "实施",
+            "编码",
+        ]
+        .iter()
+        .any(|keyword| role.contains(keyword))
+    })
+}
+
+/// Summarizes a child agent's completed tool results so a turn-limited child
+/// does not lose all its intermediate work. Returns the last `max_items`
+/// results, each truncated to `max_bytes`.
+fn summarize_child_trail(items: &[ConversationItem], max_items: usize, max_bytes: usize) -> String {
+    let mut summary = String::new();
+    let mut count = 0usize;
+    for item in items.iter().rev() {
+        let ConversationItem::ToolOutput { output, .. } = item else {
+            continue;
+        };
+        if count >= max_items {
+            break;
+        }
+        let output = output.trim();
+        if output.is_empty() {
+            continue;
+        }
+        count += 1;
+        let end = output.len().min(max_bytes);
+        let mut end = end;
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        summary.insert_str(0, &format!("\n[tool result]: {}\n", &output[..end]));
+    }
+    summary
 }
 
 #[derive(Debug)]
@@ -77,6 +141,7 @@ pub enum AgentEvent {
         items: Vec<ConversationItem>,
     },
     Failed(String),
+    SessionsChanged,
     LocalCommandFinished {
         command: String,
         result: String,
@@ -90,6 +155,7 @@ pub struct AgentRunner {
     tools: SharedToolRegistry,
     storage: Storage,
     session_id: String,
+    approval_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -113,19 +179,12 @@ impl AgentRunner {
             tools,
             storage,
             session_id,
+            approval_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    pub async fn run(
-        &self,
-        mut items: Vec<ConversationItem>,
-        ui_events: mpsc::Sender<AgentEvent>,
-        cluster_mode: bool,
-    ) {
-        if let Err(error) = self
-            .run_at_depth(&mut items, &ui_events, 0, cluster_mode)
-            .await
-        {
+    pub async fn run(&self, mut items: Vec<ConversationItem>, ui_events: mpsc::Sender<AgentEvent>) {
+        if let Err(error) = self.run_at_depth(&mut items, &ui_events, 0).await {
             if error.starts_with("cancelled:") {
                 let _ = ui_events.send(AgentEvent::Cancelled(error)).await;
             } else {
@@ -139,9 +198,8 @@ impl AgentRunner {
         items: &mut Vec<ConversationItem>,
         ui_events: &mpsc::Sender<AgentEvent>,
         depth: usize,
-        cluster_mode: bool,
     ) -> Result<(), String> {
-        self.run_inner(items, ui_events, depth, cluster_mode).await
+        self.run_inner(items, ui_events, depth).await
     }
 
     async fn run_inner(
@@ -149,7 +207,6 @@ impl AgentRunner {
         items: &mut Vec<ConversationItem>,
         ui_events: &mpsc::Sender<AgentEvent>,
         depth: usize,
-        cluster_mode: bool,
     ) -> Result<(), String> {
         let mut previous_response_id = if self.provider_config.use_previous_response_id {
             self.storage
@@ -183,7 +240,6 @@ impl AgentRunner {
                         content: prompt::system_prompt(
                             self.provider_config.preset,
                             self.tools.mode(),
-                            cluster_mode,
                         ),
                     },
                 );
@@ -509,8 +565,12 @@ impl AgentRunner {
                 for call in &spawn_tasks {
                     let runner = self.clone();
                     let call = call.clone();
+                    let ui_events = ui_events.clone();
                     futures.push(async move {
-                        let result = runner.run_child(&call).await.unwrap_or_else(|error| error);
+                        let result = runner
+                            .run_child(&call, &ui_events)
+                            .await
+                            .unwrap_or_else(|error| error);
                         (call.id, result)
                     });
                 }
@@ -560,14 +620,60 @@ impl AgentRunner {
         Ok(())
     }
 
-    async fn run_child(&self, call: &ToolCall) -> Result<String, String> {
+    /// Executes one child-agent tool call, honouring the shared policy. Write
+    /// tools request approval (serialized through `approval_lock` so concurrent
+    /// children cannot interleave approval prompts).
+    async fn execute_child_tool(
+        &self,
+        call: &ToolCall,
+        ui_events: &mpsc::Sender<AgentEvent>,
+    ) -> String {
+        match self.tools.policy(call) {
+            PolicyDecision::Allow => self
+                .tools
+                .execute(call)
+                .await
+                .unwrap_or_else(|error| error.to_string()),
+            PolicyDecision::Deny(reason) => format!("denied by policy: {reason}"),
+            PolicyDecision::RequireApproval(reason) => {
+                let _guard = self.approval_lock.lock().await;
+                let (reply, answer) = oneshot::channel();
+                if ui_events
+                    .send(AgentEvent::Approval {
+                        call: call.clone(),
+                        reason,
+                        reply,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return "approval channel closed".into();
+                }
+                match answer.await {
+                    Ok(true) => self
+                        .tools
+                        .execute(call)
+                        .await
+                        .unwrap_or_else(|error| error.to_string()),
+                    Ok(false) => "rejected by user".into(),
+                    Err(_) => "approval cancelled".into(),
+                }
+            }
+        }
+    }
+
+    async fn run_child(
+        &self,
+        call: &ToolCall,
+        ui_events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<String, String> {
         let arguments: ChildArgs = serde_json::from_value(call.arguments.clone())
             .map_err(|error| format!("invalid child agent arguments: {error}"))?;
         if arguments.prompt.trim().is_empty() {
             return Err("child agent prompt must not be empty".into());
         }
         let mut provider_config = self.provider_config.clone();
-        let _max_turns = arguments.max_turns.unwrap_or(3).clamp(1, 3);
+        let max_turns = arguments.max_turns.unwrap_or(3).clamp(1, 8);
         if let Some(model) = arguments
             .model
             .as_deref()
@@ -575,6 +681,17 @@ impl AgentRunner {
             .filter(|m| !m.is_empty())
         {
             provider_config.model = model.to_owned();
+        }
+        // Reject shorthand/invalid model names up front so the orchestrator can
+        // correct itself instead of surfacing a raw provider HTTP 400.
+        let selectable = provider_config.preset.selectable_models();
+        if !selectable.is_empty() && !selectable.contains(&provider_config.model.as_str()) {
+            return Err(format!(
+                "unknown model \"{}\" for {}; use a full model name such as {}",
+                provider_config.model,
+                provider_config.preset.label(),
+                selectable.join(", ")
+            ));
         }
         provider_config.use_previous_response_id = false;
 
@@ -603,84 +720,197 @@ impl AgentRunner {
         self.storage
             .append_message(&child_id, Role::User, &arguments.prompt)
             .map_err(|error| error.to_string())?;
+        // Let the UI refresh the session tree as soon as the child exists,
+        // rather than waiting for the whole turn to complete.
+        let _ = ui_events.send(AgentEvent::SessionsChanged).await;
 
+        let tools: Vec<ToolDefinition> = self
+            .tools
+            .definitions()
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "file_list"
+                        | "file_stat"
+                        | "file_read"
+                        | "file_search"
+                        | "web_search"
+                        | "web_fetch"
+                        | "git_diff"
+                        | "file_write"
+                        | "file_mkdir"
+                        | "file_copy"
+                        | "file_move"
+                ) && (is_implement_role(arguments.role.as_deref())
+                    || !matches!(
+                        tool.name.as_str(),
+                        "file_write" | "file_mkdir" | "file_copy" | "file_move"
+                    ))
+            })
+            .collect();
         let thinking_profile_kind =
             thinking_profile(provider_config.preset, &provider_config.model).kind;
-        let request = ModelRequest {
-            kind: provider_config.kind,
-            model: provider_config.model,
-            items: vec![ConversationItem::Message {
-                role: Role::User,
-                content: arguments.prompt,
-            }],
-            tools: self
-                .tools
-                .definitions()
-                .into_iter()
-                .filter(|tool| {
-                    matches!(
-                        tool.name.as_str(),
-                        "file_list"
-                            | "file_stat"
-                            | "file_read"
-                            | "file_search"
-                            | "web_search"
-                            | "web_fetch"
-                            | "git_diff"
-                    )
-                })
-                .collect(),
-            previous_response_id: None,
-            native_web_search: provider_config.preset == ProviderPreset::DeepSeek
-                && provider_config.kind == ProviderKind::Responses
-                && provider_config.native_web_search != NativeWebSearch::Disabled,
-            thinking_mode: ThinkingMode::Disabled,
-            thinking_level: provider_config.thinking_level,
-            thinking_budget_tokens: provider_config.thinking_budget_tokens,
-            thinking_profile_kind,
-        };
-        let (events, mut receiver) = mpsc::channel(512);
-        let provider = self.provider.clone();
-        let task = tokio::spawn(async move { provider.stream(request, events).await });
-        let mut output = String::new();
-        while let Some(event) = receiver.recv().await {
-            match event {
-                ModelEvent::TextDelta(delta) => {
-                    let remaining = 256 * 1024usize - output.len();
-                    if remaining > 0 {
-                        let mut end = delta.len().min(remaining);
-                        while end > 0 && !delta.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        output.push_str(&delta[..end]);
+        let native_web_search = provider_config.preset == ProviderPreset::DeepSeek
+            && provider_config.kind == ProviderKind::Responses
+            && provider_config.native_web_search != NativeWebSearch::Disabled;
+
+        // Multi-turn loop: unlike before, actually execute the read-only tools
+        // the child requests, so file-reading subtasks no longer return empty.
+        let mut items = vec![ConversationItem::Message {
+            role: Role::User,
+            content: arguments.prompt.clone(),
+        }];
+        let mut full_output = String::new();
+        let mut tool_call_count = 0usize;
+        let mut remaining_turns = max_turns;
+        loop {
+            if remaining_turns == 0 {
+                let trail = summarize_child_trail(&items, 3, 512);
+                full_output.push_str(&format!("\n[child agent reached its turn limit]{trail}"));
+                break;
+            }
+            remaining_turns -= 1;
+
+            let request = ModelRequest {
+                kind: provider_config.kind,
+                model: provider_config.model.clone(),
+                items: items.clone(),
+                tools: tools.clone(),
+                previous_response_id: None,
+                native_web_search,
+                thinking_mode: ThinkingMode::Disabled,
+                thinking_level: provider_config.thinking_level,
+                thinking_budget_tokens: provider_config.thinking_budget_tokens,
+                thinking_profile_kind,
+            };
+            let (events, mut receiver) = mpsc::channel(512);
+            let provider = self.provider.clone();
+            let task = tokio::spawn(async move { provider.stream(request, events).await });
+
+            let mut assistant_text = String::new();
+            let mut partials: HashMap<String, PartialToolCall> = HashMap::new();
+            let mut completed_calls: Vec<ToolCall> = Vec::new();
+            let mut completed_ids = HashSet::new();
+            let mut saw_done = false;
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    ModelEvent::TextDelta(delta) => {
+                        append_text_bounded(&mut assistant_text, &delta, 256 * 1024);
                     }
+                    ModelEvent::ToolCallDelta {
+                        slot,
+                        id,
+                        name,
+                        arguments_delta,
+                    } => {
+                        let partial = partials.entry(slot).or_default();
+                        if let Some(id) = id {
+                            partial.id = id;
+                        }
+                        if let Some(name) = name {
+                            partial.name = name;
+                        }
+                        partial.arguments.push_str(&arguments_delta);
+                    }
+                    ModelEvent::ToolCallComplete(call) => {
+                        completed_ids.insert(call.id.clone());
+                        completed_calls.push(call);
+                    }
+                    ModelEvent::Done => {
+                        saw_done = true;
+                        break;
+                    }
+                    ModelEvent::ReasoningDelta(_)
+                    | ModelEvent::Usage(_)
+                    | ModelEvent::ResponseId(_)
+                    | ModelEvent::WebSearchStarted { .. }
+                    | ModelEvent::WebSearchResult { .. }
+                    | ModelEvent::WebSearchCompleted { .. }
+                    | ModelEvent::ProviderItem(_) => {}
                 }
-                ModelEvent::ReasoningDelta(_) => {}
-                ModelEvent::Done => break,
-                ModelEvent::Usage(_)
-                | ModelEvent::ResponseId(_)
-                | ModelEvent::WebSearchStarted { .. }
-                | ModelEvent::WebSearchResult { .. }
-                | ModelEvent::WebSearchCompleted { .. }
-                | ModelEvent::ProviderItem(_)
-                | ModelEvent::ToolCallDelta { .. }
-                | ModelEvent::ToolCallComplete(_) => {}
+            }
+            let provider_result = task.await.map_err(|error| error.to_string())?;
+            if let Err(error) = provider_result {
+                append_text_bounded(
+                    &mut full_output,
+                    &format!("\n[child failed: {error}]"),
+                    256 * 1024,
+                );
+                break;
+            }
+            if !saw_done {
+                append_text_bounded(
+                    &mut full_output,
+                    "\n[child stream ended without completion]",
+                    256 * 1024,
+                );
+                break;
+            }
+            append_text_bounded(&mut full_output, &assistant_text, 256 * 1024);
+
+            for partial in partials.into_values() {
+                if completed_ids.contains(&partial.id) || partial.name.is_empty() {
+                    continue;
+                }
+                let arguments: Value = serde_json::from_str(if partial.arguments.is_empty() {
+                    "{}"
+                } else {
+                    &partial.arguments
+                })
+                .map_err(|error| format!("invalid child tool arguments: {error}"))?;
+                completed_calls.push(ToolCall {
+                    id: if partial.id.is_empty() {
+                        format!("call_{}", uuid::Uuid::new_v4())
+                    } else {
+                        partial.id
+                    },
+                    name: partial.name,
+                    arguments,
+                });
+            }
+            if completed_calls.is_empty() {
+                break;
+            }
+
+            if !assistant_text.is_empty() {
+                items.push(ConversationItem::Message {
+                    role: Role::Assistant,
+                    content: assistant_text,
+                });
+            }
+            items.push(ConversationItem::AssistantToolCalls {
+                calls: completed_calls.clone(),
+            });
+            self.storage
+                .append_tool_calls(&child_id, &completed_calls)
+                .map_err(|error| error.to_string())?;
+            for tool_call in completed_calls {
+                tool_call_count += 1;
+                let result = self.execute_child_tool(&tool_call, ui_events).await;
+                self.storage
+                    .append_tool_output(&child_id, &tool_call.id, &result)
+                    .map_err(|error| error.to_string())?;
+                items.push(ConversationItem::ToolOutput {
+                    call_id: tool_call.id.clone(),
+                    output: result,
+                });
             }
         }
-        let result = task
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string());
-        if let Err(error) = result {
-            output.push_str(&format!("\n[child failed: {error}]"));
-        }
-        if output.is_empty() {
-            output.push_str("[child agent returned no text]");
+
+        if full_output.trim().is_empty() {
+            if tool_call_count > 0 {
+                full_output.push_str(&format!(
+                    "[child agent issued {tool_call_count} tool call(s) but returned no text]"
+                ));
+            } else {
+                full_output.push_str("[child agent returned no text]");
+            }
         }
         self.storage
-            .append_message(&child_id, Role::Assistant, &output)
+            .append_message(&child_id, Role::Assistant, &full_output)
             .map_err(|error| error.to_string())?;
-        Ok(output)
+        Ok(full_output)
     }
 }
 
@@ -921,7 +1151,6 @@ mod tests {
                         content: "run tools".into(),
                     }],
                     events,
-                    false,
                 )
                 .await;
         });
@@ -976,7 +1205,6 @@ mod tests {
                         content: "think".into(),
                     }],
                     events,
-                    false,
                 )
                 .await;
         });
@@ -1044,7 +1272,8 @@ mod tests {
             name: "agent_spawn".into(),
             arguments: serde_json::json!({"prompt":"do the plan","role":"plan","model":"gpt-5"}),
         };
-        let result = runner.run_child(&call).await.unwrap();
+        let (ui_events, _receiver) = mpsc::channel(16);
+        let result = runner.run_child(&call, &ui_events).await.unwrap();
         assert_eq!(result, "child result");
 
         let sessions = storage.list_sessions(temp.path()).unwrap();
@@ -1057,6 +1286,151 @@ mod tests {
             "gpt-5"
         );
         assert_eq!(storage.load_messages(&child.id).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn child_agent_rejects_invalid_model_name() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let runner = AgentRunner::new(
+            OpenAiClient::scripted(Vec::new()).unwrap(),
+            ProviderPreset::OpenAi.defaults(),
+            tools,
+            storage,
+            session_id,
+        );
+        let call = ToolCall {
+            id: "bad-model".into(),
+            name: "agent_spawn".into(),
+            arguments: serde_json::json!({"prompt":"x","model":"v4pro"}),
+        };
+        let (ui_events, _receiver) = mpsc::channel(16);
+        let error = runner.run_child(&call, &ui_events).await.unwrap_err();
+        assert!(error.contains("unknown model"));
+        assert!(error.contains("gpt-5-mini"));
+    }
+
+    #[tokio::test]
+    async fn child_agent_executes_read_tools_across_turns() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("plan.txt"), "plan content").unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "parent")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![
+            vec![
+                ModelEvent::ToolCallComplete(ToolCall {
+                    id: "c1".into(),
+                    name: "file_read".into(),
+                    arguments: serde_json::json!({"path":"plan.txt"}),
+                }),
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::TextDelta("read and planned".into()),
+                ModelEvent::Done,
+            ],
+        ])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::OpenAi.defaults(),
+            tools,
+            storage.clone(),
+            session_id.clone(),
+        );
+        let call = ToolCall {
+            id: "spawn".into(),
+            name: "agent_spawn".into(),
+            arguments: serde_json::json!({"prompt":"read plan.txt then plan"}),
+        };
+        let (ui_events, _receiver) = mpsc::channel(16);
+        let result = runner.run_child(&call, &ui_events).await.unwrap();
+        assert!(result.contains("read and planned"));
+
+        let sessions = storage.list_sessions(temp.path()).unwrap();
+        let child = sessions.iter().find(|s| s.id != session_id).unwrap();
+        let messages = storage.load_messages(&child.id).unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|item| matches!(item, ConversationItem::ToolOutput { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn child_agent_implement_role_writes_files_with_approval() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("plan.txt"), "plan").unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "parent")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![
+            vec![
+                ModelEvent::ToolCallComplete(ToolCall {
+                    id: "c1".into(),
+                    name: "file_read".into(),
+                    arguments: serde_json::json!({"path":"plan.txt"}),
+                }),
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCallComplete(ToolCall {
+                    id: "c2".into(),
+                    name: "file_write".into(),
+                    arguments: serde_json::json!({"path":"out.txt","content":"written"}),
+                }),
+                ModelEvent::Done,
+            ],
+            vec![ModelEvent::TextDelta("done".into()), ModelEvent::Done],
+        ])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::OpenAi.defaults(),
+            tools,
+            storage.clone(),
+            session_id.clone(),
+        );
+
+        let (ui_events, mut receiver) = mpsc::channel(16);
+        let approver = tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                if let AgentEvent::Approval { reply, .. } = event {
+                    let _ = reply.send(true);
+                }
+            }
+        });
+
+        let call = ToolCall {
+            id: "impl".into(),
+            name: "agent_spawn".into(),
+            arguments: serde_json::json!({"prompt":"read plan.txt then write out.txt","role":"implement"}),
+        };
+        let result = runner.run_child(&call, &ui_events).await.unwrap();
+        assert!(result.contains("done"));
+        assert!(temp.path().join("out.txt").exists());
+        approver.abort();
     }
 
     #[tokio::test]
@@ -1106,7 +1480,6 @@ mod tests {
                         content: "read fixture".into(),
                     }],
                     events,
-                    false,
                 )
                 .await;
         });

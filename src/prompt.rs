@@ -4,7 +4,7 @@ use crate::{commands::AgentMode, config::ProviderPreset};
 ///
 /// Keep this deterministic and self-contained. Providers can cache the
 /// prefix, while workspace facts and tool results remain conversation data.
-pub fn system_prompt(preset: ProviderPreset, mode: AgentMode, cluster_mode: bool) -> String {
+pub fn system_prompt(preset: ProviderPreset, mode: AgentMode) -> String {
     let mode_rules = match mode {
         AgentMode::Plan => {
             "MODE: PLAN\n- Work read-only. You may inspect files, search, inspect metadata, review diffs, and gather public information.\n- Do not write, move, copy, delete, execute commands, change configuration, or request a mutating tool.\n- Return a concrete plan with the goal, files, implementation steps, risks, and exact verification commands. Mark assumptions and unresolved questions.\n- Do not claim an implementation or verification is complete."
@@ -15,6 +15,9 @@ pub fn system_prompt(preset: ProviderPreset, mode: AgentMode, cluster_mode: bool
         AgentMode::Explore => {
             "MODE: EXPLORE\n- Investigate read-only and keep the turn focused. Search and read the smallest useful set of files, compare evidence, and identify the likely cause.\n- Do not modify files, execute mutating commands, alter configuration, or claim a fix was made.\n- Return concise findings, relevant paths and symbols, constraints, and a practical next step or plan."
         }
+        AgentMode::Cluster => {
+            "MODE: CLUSTER\n- Orchestrate a pipeline of child agents (plan → review → implement) to complete the request. You keep the full toolset and perform verification.\n- Spawn children via agent_spawn with clear roles and models, awaiting each stage's result before the next.\n- Distinguish child output from your own verification when reporting."
+        }
     };
 
     let provider_rules = if preset == ProviderPreset::DeepSeek {
@@ -23,8 +26,8 @@ pub fn system_prompt(preset: ProviderPreset, mode: AgentMode, cluster_mode: bool
         "PROVIDER NOTES\n- Preserve this stable prefix and the declared tool schemas.\n- Treat provider reasoning summaries as private metadata. Never ask for, reconstruct, or expose hidden chain-of-thought."
     };
 
-    let cluster_rules = if cluster_mode {
-        "\n\nCLUSTER MODE (ACTIVE)\n- The user may assign roles to different models (for example, \"use X to plan/review, Y to implement\"). Parse that assignment from the user's message and reflect it in agent_spawn calls.\n- Orchestrate a pipeline: spawn a planning agent first and await its result, then a review/approval agent, then one or more implementation agents.\n- Set each agent_spawn's `role` to a short label (plan/review/implement/...), `model` to the model the user assigned for that role (same provider only), and `title` to a short descriptive name.\n- Independent implementation agents may be spawned together in one turn; dependent steps must be sequenced.\n- Every agent_spawn creates a child session. Keep returned results factual and concise."
+    let cluster_rules = if mode == AgentMode::Cluster {
+        "\n\nCLUSTER MODE (ACTIVE)\n- Parse the user's role→model assignment (for example, \"use X to plan/review, Y to implement\") and reflect it in agent_spawn calls. Use FULL model names such as \"deepseek-v4-pro\", never a shorthand.\n- Orchestrate as plan → review → implement. Sequence dependent steps; only spawn independent implementation agents together in one turn.\n- Give every child enough context: inline the relevant file contents, constraints, and acceptance criteria directly into its `prompt` instead of expecting it to read the workspace. Avoid wasted read rounds.\n\nCHILD AGENT CAPABILITIES\n- `role` decides tool access. Read-only roles (plan/review/audit/...) may use only file_list/file_stat/file_read/file_search/web_search/web_fetch/git_diff.\n- Only implement roles (role containing \"implement\"/\"code\"/\"build\"/\"实施\"/\"编码\") may write files (file_write/file_mkdir/file_copy/file_move); writes require user approval.\n- No child agent has terminal or command access. Never ask a child to run checks, tests, or build steps; the orchestrator performs all verification and reports real results.\n\nCHILD AGENT CONTRACT (avoid losing work)\n- A child's FINAL answer is the ONLY thing returned to the orchestrator. Put every deliverable — plan, spec, code, diff, findings — into the final answer text, never only in intermediate reasoning or tool steps.\n- When a child must read files, read them in at most one round, then immediately produce the deliverable. Do not re-read the same file.\n- Set `max_turns` explicitly to match the task: 1 for pure-text deliverables, 3-8 for read+write+self-check tasks."
     } else {
         ""
     };
@@ -67,10 +70,10 @@ mod tests {
 
     #[test]
     fn prompt_is_stable_and_contains_product_contract() {
-        let prompt = system_prompt(ProviderPreset::DeepSeek, AgentMode::Build, false);
+        let prompt = system_prompt(ProviderPreset::DeepSeek, AgentMode::Build);
         assert_eq!(
             prompt,
-            system_prompt(ProviderPreset::DeepSeek, AgentMode::Build, false)
+            system_prompt(ProviderPreset::DeepSeek, AgentMode::Build)
         );
         assert!(prompt.contains("1H-Agent"));
         assert!(!prompt.contains("OpenCode"));
@@ -90,9 +93,9 @@ mod tests {
 
     #[test]
     fn modes_have_distinct_read_write_contracts() {
-        let plan = system_prompt(ProviderPreset::OpenAi, AgentMode::Plan, false);
-        let build = system_prompt(ProviderPreset::OpenAi, AgentMode::Build, false);
-        let explore = system_prompt(ProviderPreset::OpenAi, AgentMode::Explore, false);
+        let plan = system_prompt(ProviderPreset::OpenAi, AgentMode::Plan);
+        let build = system_prompt(ProviderPreset::OpenAi, AgentMode::Build);
+        let explore = system_prompt(ProviderPreset::OpenAi, AgentMode::Explore);
         assert!(plan.contains("Work read-only"));
         assert!(plan.contains("concrete plan"));
         assert!(build.contains("Implement the user's request"));
@@ -105,11 +108,20 @@ mod tests {
 
     #[test]
     fn deepseek_keeps_search_and_stable_prefix_rules() {
-        let deepseek = system_prompt(ProviderPreset::DeepSeek, AgentMode::Plan, false);
-        let other = system_prompt(ProviderPreset::Custom, AgentMode::Plan, false);
+        let deepseek = system_prompt(ProviderPreset::DeepSeek, AgentMode::Plan);
+        let other = system_prompt(ProviderPreset::Custom, AgentMode::Plan);
         assert!(deepseek.contains("DeepSeek Responses"));
         assert!(deepseek.contains("stable prefix"));
         assert!(deepseek.contains("server-side search"));
         assert!(!other.contains("DeepSeek Responses"));
+    }
+
+    #[test]
+    fn cluster_mode_injects_cluster_rules() {
+        let cluster = system_prompt(ProviderPreset::OpenAi, AgentMode::Cluster);
+        let build = system_prompt(ProviderPreset::OpenAi, AgentMode::Build);
+        assert!(cluster.contains("CLUSTER MODE (ACTIVE)"));
+        assert!(cluster.contains("MODE: CLUSTER"));
+        assert!(!build.contains("CLUSTER MODE (ACTIVE)"));
     }
 }

@@ -63,8 +63,8 @@ native_web_search = "disabled"
 | 操作 | 快捷键/语法 |
 | --- | --- |
 | 发送 / 换行 | `Enter` / `Shift+Enter` 或 `Ctrl+J` |
-| 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` / 点击会话行 |
-| 切换模式 | `Ctrl+X` 后按 `m` / `/plan` `/build` `/explore` / 点击输入框标题的模式标签 |
+| 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` / 点击会话行（父会话点击展开/收起子会话） |
+| 切换模式 | `Ctrl+X` 后按 `m` / `/plan` `/build` `/explore` `/cluster` / 点击输入框标题的模式标签 |
 | 命令面板 / 命令 | `Ctrl+P` / `/` |
 | 引用文件 / 执行命令 | `@path` / `!command`（命令须审批） |
 | 滚动 / 回到底部 | `PageUp`、`PageDown` / `Ctrl+L` |
@@ -76,6 +76,10 @@ native_web_search = "disabled"
 > `Alt+Up` / `Alt+Down` 依赖 kitty keyboard protocol，请使用支持该协议的终端（如 kitty、WezTerm、Alacritty、foot、iTerm2）。不支持的老终端（例如 macOS 自带 Terminal.app）可能无法区分 `Alt+方向键` 与裸方向键。
 
 文件操作限定在 `--workspace` 内；写入、删除、命令、浏览器交互和变更型 Git 操作会按策略要求审批。
+
+## AI 集群模式
+
+切换到 `cluster` 模式（`/cluster` 或输入框模式标签）后，可在对话里用自然语言给不同角色指派不同模型，例如「用 deepseek-v4-pro 做计划与审批，用 deepseek-v4-flash 做实施」。主 Agent 会通过 `agent_spawn` 调度子 Agent 串行/并行执行，每个子 Agent 生成一个**树形子会话**（默认折叠，点击展开），父会话与当前会话在左侧面板高亮显示。子 Agent 的写文件操作仍需用户审批；子 Agent 无终端权限，验证由主 Agent 完成。
 
 ## AI 维护文档
 

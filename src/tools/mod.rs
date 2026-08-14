@@ -63,7 +63,7 @@ impl ToolRegistry {
 
     pub fn policy(&self, call: &ToolCall) -> PolicyDecision {
         let mode = self.mode.read().map(|value| *value).unwrap_or_default();
-        if mode != AgentMode::Build
+        if !matches!(mode, AgentMode::Build | AgentMode::Cluster)
             && matches!(
                 call.name.as_str(),
                 "file_write"
@@ -101,7 +101,7 @@ impl ToolRegistry {
             }
             (_, decision) => decision,
         };
-        if mode != AgentMode::Build
+        if !matches!(mode, AgentMode::Build | AgentMode::Cluster)
             && call.name == "git"
             && matches!(decision, PolicyDecision::RequireApproval(_))
         {
@@ -175,7 +175,7 @@ impl ToolRegistry {
                 "file_read",
                 "Read a UTF-8 text file from the workspace",
                 json!({
-                    "type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false
+                    "type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}},"required":["path"],"additionalProperties":false
                 }),
             ),
             definition(
@@ -232,7 +232,7 @@ impl ToolRegistry {
             definition(
                 "agent_spawn",
                 "Run one bounded child agent for a focused subtask",
-                json!({"type":"object","properties":{"prompt":{"type":"string"},"max_turns":{"type":"integer","minimum":1,"maximum":3},"role":{"type":"string"},"model":{"type":"string"},"title":{"type":"string"}},"required":["prompt"],"additionalProperties":false}),
+                json!({"type":"object","properties":{"prompt":{"type":"string"},"max_turns":{"type":"integer","minimum":1,"maximum":8},"role":{"type":"string"},"model":{"type":"string"},"title":{"type":"string"}},"required":["prompt"],"additionalProperties":false}),
             ),
             definition(
                 "git",

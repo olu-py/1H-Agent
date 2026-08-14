@@ -20,7 +20,6 @@ pub enum Command {
     Agent(Option<String>),
     Mode(AgentMode),
     Clear,
-    Cluster,
     Quit,
 }
 
@@ -31,6 +30,7 @@ pub enum AgentMode {
     Build,
     Plan,
     Explore,
+    Cluster,
 }
 
 impl AgentMode {
@@ -39,6 +39,7 @@ impl AgentMode {
             Self::Build => "build",
             Self::Plan => "plan",
             Self::Explore => "explore",
+            Self::Cluster => "cluster",
         }
     }
 
@@ -47,6 +48,7 @@ impl AgentMode {
             "build" => Some(Self::Build),
             "plan" => Some(Self::Plan),
             "explore" => Some(Self::Explore),
+            "cluster" => Some(Self::Cluster),
             _ => None,
         }
     }
@@ -83,8 +85,8 @@ pub fn parse(input: &str) -> Option<Command> {
         "plan" => Command::Mode(AgentMode::Plan),
         "build" => Command::Mode(AgentMode::Build),
         "explore" => Command::Mode(AgentMode::Explore),
+        "cluster" => Command::Mode(AgentMode::Cluster),
         "clear" => Command::Clear,
-        "cluster" => Command::Cluster,
         "quit" | "exit" | "q" => Command::Quit,
         _ => return None,
     })
@@ -138,6 +140,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "/plan",
     "/build",
     "/explore",
+    "/cluster",
     "/clear",
     "/quit",
 ];

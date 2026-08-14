@@ -10,7 +10,7 @@ meaning: 1H = 氕（protium），不是“一小时”
 goal: 极致轻量化、高性能、权限感知的跨平台终端 Agent
 runtime: 单个 Rust/Tokio 进程，Ratatui + Crossterm，SQLite/WAL
 authority: 源码 > config/config.example.toml > .github/workflows > 本文件
-scope: TUI、模型流、受控工具、会话与跨平台发布
+scope: TUI、模型流、受控工具、会话（多会话后台并发）、AI 集群模式与跨平台发布
 excluded: Web UI、内置浏览器、远程 MCP、动态插件、图片/语音能力
 cache_rule: 稳定规则置前；任务事实按源码路由按需读取
 ```
@@ -21,13 +21,13 @@ cache_rule: 稳定规则置前；任务事实按源码路由按需读取
 
 | 任务 | 首读文件 | 关联文件 |
 | --- | --- | --- |
-| TUI、快捷键、渲染、会话切换 | `src/app.rs` | `src/input.rs`、`src/ui.rs`、`src/commands.rs` |
+| TUI、快捷键、渲染、会话切换 | `src/app.rs` | `src/input.rs`、`src/ui.rs`、`src/commands.rs`、`src/session.rs`、`src/model.rs` |
 | 系统提示词、Agent loop、审批、子 Agent | `src/agent.rs` | `src/prompt.rs`、`src/provider/mod.rs` |
 | Chat/Responses、SSE、DeepSeek 原生搜索 | `src/provider/openai.rs` | `src/provider/mod.rs`、`src/config.rs` |
 | 文件、命令、Git、Web、browser/MCP | `src/tools/mod.rs` | `src/tools/*.rs`、`src/security.rs` |
 | 路径边界、SSRF、工具默认策略 | `src/security.rs` | `src/tools/process.rs`、`src/tools/web.rs` |
 | TOML、环境变量、Provider、资源默认值 | `src/config.rs` | `config/config.example.toml`、`src/secrets.rs` |
-| 会话、分支、迁移、持久化 | `src/storage.rs` | `src/provider/mod.rs` |
+| 会话、分支、迁移、持久化 | `src/storage.rs` | `src/session.rs`、`src/provider/mod.rs` |
 | CI、release、安装包 | `.github/workflows/ci.yml` | `.github/workflows/release.yml`、`Cargo.toml` |
 
 任务只读取涉及的行和直接依赖。发现本文件与事实来源不一致时，以事实来源为准，并在同一改动中更新本文件。
@@ -35,26 +35,28 @@ cache_rule: 稳定规则置前；任务事实按源码路由按需读取
 ## 2. 架构与数据流
 
 ```text
-terminal event -> app::App -> agent::AgentRunner -> provider::OpenAiClient
-                     |              |                    |
-                     |              +-> ToolRegistry <--- ToolCall
-                     +-> Storage(SQLite/WAL) <- events/results
-                                    |
-                               secrets(OS keyring)
+terminal event -> app::App
+                     |-- current: SessionRuntime  +-> agent::AgentRunner -> provider::OpenAiClient
+                     |-- background: SessionRuntime   |            |
+                     |                               +-> ToolRegistry <-> ToolCall
+                     |-- router channel (RoutedEvent) <-- agent events
+                     |-- Storage(SQLite/WAL) <- events/results
+                     |-- secrets(OS keyring)
 ```
 
-- `app` 只维护 UI 状态、调度与持久化入口；`ui` 只渲染快照；`input` 只编辑 UTF-8 文本。
+- `app` 只维护全局 UI 状态、会话运行时注册表（`current`/`background`）与事件路由；`ui` 只渲染快照；`input` 只编辑 UTF-8 文本。
+- `session::SessionRuntime` 持有单个会话的对话、显示条目、runner、流式/思考状态与滚动位置；切换/新建会话不打断后台 agent，结果留在各自会话。
 - `agent` 负责有界多 turn 循环、模型事件、审批和工具结果；`provider` 负责协议/SSE 转换；`tools` 负责分发。
-- 跨模块使用 `ConversationItem`、`ModelRequest`、`ModelEvent`、`ToolCall`、`ToolDefinition`、`Usage`，不要把 Provider 私有 JSON 泄漏到 UI。
-- 正常路径：输入 -> 可选 `@` context -> `ConversationItem` -> 流式 `ModelEvent` -> 文本/工具事件按原顺序显示与持久化 -> 下一 turn。
-- `Esc` 必须取消活跃模型、等待审批和外部进程；恢复会话时按 `head_turn_id` 的父链读取可见消息。
+- 跨模块使用 `ConversationItem`、`ModelRequest`、`ModelEvent`、`ToolCall`、`ToolDefinition`、`Usage`，不要把 Provider 私有 JSON 泄漏到 UI。显示类型集中定义在 `src/model.rs`。
+- 正常路径：输入 -> 可选 `@` context -> `ConversationItem` -> 流式 `ModelEvent` -> 文本/工具事件经路由 channel 按 `session_id` 回送到对应会话 -> 下一 turn。
+- `Esc` 必须取消当前活跃会话的模型、等待审批和外部进程；恢复会话时按 `head_turn_id` 的父链读取可见消息。
 
 ## 3. 安全与权限
 
 - workspace 在启动时 canonicalize。已有目标必须在根目录内；新目标必须验证 canonical parent；拒绝绝对路径、`..` 与符号链接逃逸。
 - Web 仅允许 HTTP/HTTPS；每次重定向均校验地址，默认拒绝 loopback、私网、链路本地、未指定和多播地址。
 - 策略顺序：硬安全/mode 限制 -> browser/MCP 专用规则 -> `security::classify_tool` -> `[permissions.tools]` 精确名或 `*` 覆盖。
-- `build` 可使用完整工具集但危险操作仍审批；`plan`、`explore` 拒绝文件变更、终端和变更型 Git。
+- `build`、`cluster` 可使用完整工具集但危险操作仍审批；`plan`、`explore` 拒绝文件变更、终端和变更型 Git。
 - 默认允许读取、搜索、`web_fetch`、`git_diff`；文件变更、命令、子 Agent 和变更/远程 Git 要求审批；未知工具拒绝。
 - API Key 只来自 Provider 环境变量或服务名 `1h-agent` 的系统钥匙串。密钥不得写入 TOML、SQLite、日志、导出或模型上下文。
 - Unix 外部命令使用独立进程组；Windows 通过 `taskkill /T /F` 清理进程树。新增外部进程必须支持超时、截断和取消。
@@ -63,7 +65,7 @@ terminal event -> app::App -> agent::AgentRunner -> provider::OpenAiClient
 
 | 对象 | 当前实现上限/默认值 |
 | --- | --- |
-| App/模型事件 channel | 各 `128`；子 Agent 模型事件 `512` |
+| 路由/会话/子 Agent 事件 channel | 路由 `256`；会话 agent `128`；子 Agent 模型事件 `512` |
 | 输入与历史 | 512 KiB；仅内存，最多 50 条 |
 | 显示与对话窗口 | 1,000 条或约 2 MiB；200 项或约 1 MiB |
 | 思考摘要 / `@` 文件 | 思考摘要每条持久化 64 KiB（实时显示行 1,024 B）；单文件 64 KiB、总计 256 KiB |
@@ -71,7 +73,7 @@ terminal event -> app::App -> agent::AgentRunner -> provider::OpenAiClient
 | Agent/tool | 默认最多 8 turn；命令 60 秒；工具输出 1 MiB |
 | Web | 最多 5 次重定向；连接 10 秒、请求 30 秒；抓取默认 10 MiB |
 | 浏览器桥接 | 默认关闭；30 秒、2 MiB、空闲 30 秒；配置最大 3,600 秒、8 MiB |
-| 子 Agent | 一层、接口 `max_turns` 1-3、输出最多 256 KiB；当前为一次受限流式请求 |
+| 子 Agent | 一层、接口 `max_turns` 1-8、输出最多 256 KiB；多轮只读/实施（实施角色可写文件，写操作仍审批） |
 
 新增缓存、channel、索引、输出或并发前，必须定义容量、截断、取消与释放路径。未知模型不得假设上下文窗口；使用 `provider.context_window_tokens` 或 `src/config.rs` 的已知模型注册表。
 
@@ -81,7 +83,7 @@ terminal event -> app::App -> agent::AgentRunner -> provider::OpenAiClient
 - DeepSeek Responses 在 `native_web_search != "disabled"` 时发送 Provider 原生 `web_search`，同时排除本地同名 function tool；DeepSeek 不使用 `previous_response_id`。
 - 非密钥配置顺序：内置默认值 -> TOML（`--config` 指定路径优先）-> `AGENT_API_BASE`、`AGENT_MODEL`、`AGENT_PROVIDER` 覆盖。`AGENT_DATA_DIR` 覆盖数据目录。
 - 密钥顺序：Provider 专属环境变量/`AGENT_API_KEY` -> 系统钥匙串。完整变量与示例配置见 `config/config.example.toml`。
-- 数据库为 `<data_dir>/agent.db`，启用 WAL 与外键。`sessions` 保存 workspace/mode/provider/head，`turns` 形成分支树，`messages` 保存类型化消息；删除为软删除。
+- 数据库为 `<data_dir>/agent.db`，启用 WAL 与外键。`sessions` 保存 workspace/mode/provider/model/parent_id/head；`turns` 形成分支树；`messages` 保存类型化消息；删除为软删除。子会话通过 `parent_id` 挂在父会话下，各自保存独立 provider/model。
 - fork 不复制 Provider `response_id`；undo/redo 只移动 session head；新输入在 undo 后创建新分支。
 
 ## 6. 实施与验证

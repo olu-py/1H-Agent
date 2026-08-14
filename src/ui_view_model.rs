@@ -96,16 +96,17 @@ pub struct UiViewModel {
 }
 
 pub fn activity_view(app: &App) -> ActivityView {
-    let (state, symbol, text) = if let Some(approval) = &app.pending_approval {
+    let (state, symbol, text) = if let Some(approval) = &app.current.pending_approval {
         (
             ActivityState::Warning,
             "!",
             format!("{}需要确认", tool_display_name(&approval.call.name)),
         )
-    } else if app.agent_phase == AgentPhase::Failed {
+    } else if app.current.agent_phase == AgentPhase::Failed {
         (ActivityState::Failed, "×", "请求失败".into())
-    } else if app.agent_phase == AgentPhase::ToolRunning {
+    } else if app.current.agent_phase == AgentPhase::ToolRunning {
         let name = app
+            .current
             .entries
             .iter()
             .rev()
@@ -117,11 +118,11 @@ pub fn activity_view(app: &App) -> ActivityView {
             })
             .unwrap_or_else(|| "工具".into());
         (ActivityState::Working, "●", format!("正在执行：{name}"))
-    } else if app.agent_phase == AgentPhase::Thinking {
+    } else if app.current.agent_phase == AgentPhase::Thinking {
         (ActivityState::Waiting, "●", "正在思考".into())
-    } else if app.agent_phase == AgentPhase::StreamingText {
+    } else if app.current.agent_phase == AgentPhase::StreamingText {
         (ActivityState::Working, "●", "正在生成回复".into())
-    } else if app.agent_phase == AgentPhase::Completed {
+    } else if app.current.agent_phase == AgentPhase::Completed {
         (ActivityState::Success, "✓", "已完成".into())
     } else if app.status.contains("已取消") {
         (ActivityState::Cancelled, "■", "已取消".into())
@@ -171,13 +172,13 @@ pub fn contextual_shortcuts(app: &App) -> Vec<ShortcutHint> {
             hint("Esc", "关闭", 1),
         ];
     }
-    if app.pending_approval.is_some() {
+    if app.current.pending_approval.is_some() {
         return vec![hint("Y", "批准", 1), hint("N", "拒绝", 2)];
     }
-    if app.busy {
+    if app.current.busy {
         return vec![hint("Esc", "取消", 1)];
     }
-    if !app.follow_output {
+    if !app.current.follow_output {
         return vec![hint("Ctrl+L", "回到底部", 1), hint("Enter", "发送", 3)];
     }
     if app.input.is_empty() {
@@ -223,10 +224,11 @@ impl UiViewModel {
         let activity = activity_view(app);
         let context = ContextView {
             enabled: app.context_meter_enabled,
-            used: app.context_used_tokens,
-            limit: app.context_limit_tokens,
-            percent: app.context_limit_tokens.map(|limit| {
-                app.context_used_tokens
+            used: app.current.context_used_tokens,
+            limit: app.current.context_limit_tokens,
+            percent: app.current.context_limit_tokens.map(|limit| {
+                app.current
+                    .context_used_tokens
                     .min(limit.max(1))
                     .saturating_mul(100)
                     / limit.max(1)
@@ -235,8 +237,8 @@ impl UiViewModel {
         let profile = app.thinking_profile();
         let thinking = ThinkingControlView {
             label: format!("思考 {} ▾", app.thinking_level().label()),
-            enabled: !app.busy
-                && app.pending_approval.is_none()
+            enabled: !app.current.busy
+                && app.current.pending_approval.is_none()
                 && app.settings.is_none()
                 && app.palette.is_none(),
             options: profile
@@ -269,7 +271,7 @@ impl UiViewModel {
             right: shortcut_segments(&shortcuts),
         };
         let secondary = (height == HeightClass::Normal).then(|| {
-            if let Some(approval) = &app.pending_approval {
+            if let Some(approval) = &app.current.pending_approval {
                 let path = approval
                     .call
                     .arguments
@@ -290,7 +292,7 @@ impl UiViewModel {
             } else {
                 FooterLine {
                     left: metadata_segments(
-                        app.mode,
+                        app.current.mode,
                         app.provider_label(),
                         app.model_name(),
                         density,
@@ -303,9 +305,9 @@ impl UiViewModel {
             activity,
             footer: FooterView { primary, secondary },
             input: InputView {
-                title: format!(" 输入 · {} ", mode_label(app.mode)),
-                enabled: !app.busy && app.pending_approval.is_none(),
-                warning: app.pending_approval.is_some(),
+                title: format!(" 输入 · {} ", mode_label(app.current.mode)),
+                enabled: !app.current.busy && app.current.pending_approval.is_none(),
+                warning: app.current.pending_approval.is_some(),
             },
             context,
             thinking,
@@ -434,6 +436,7 @@ pub fn mode_label(mode: AgentMode) -> &'static str {
         AgentMode::Build => "构建",
         AgentMode::Plan => "计划",
         AgentMode::Explore => "探索",
+        AgentMode::Cluster => "集群",
     }
 }
 

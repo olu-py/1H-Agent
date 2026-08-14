@@ -1,4 +1,9 @@
-use std::{fs, io::Read, path::Path, time::UNIX_EPOCH};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    time::UNIX_EPOCH,
+};
 
 use ignore::WalkBuilder;
 use serde::Deserialize;
@@ -18,6 +23,7 @@ struct PathArgs {
 struct ReadArgs {
     path: String,
     max_bytes: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +97,10 @@ pub fn read(workspace: &Workspace, value: &Value, limit: usize) -> Result<String
         .map_err(security_error)?;
     let limit = args.max_bytes.unwrap_or(limit).min(limit);
     let mut file = fs::File::open(path).map_err(execution_error)?;
+    if let Some(offset) = args.offset {
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(execution_error)?;
+    }
     let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
     file.by_ref()
         .take(limit as u64 + 1)
@@ -257,5 +267,26 @@ mod tests {
         );
         let result = search(&workspace, &json!({"path":".","query":"two"}), 4096).unwrap();
         assert!(result.contains("a.txt"));
+    }
+
+    #[test]
+    fn read_supports_byte_offset() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let content = "0123456789";
+        write(&workspace, &json!({"path":"b.txt","content": content})).unwrap();
+        assert_eq!(
+            read(&workspace, &json!({"path":"b.txt","offset":4}), 100).unwrap(),
+            "456789"
+        );
+        assert_eq!(
+            read(
+                &workspace,
+                &json!({"path":"b.txt","offset":4,"max_bytes":2}),
+                100
+            )
+            .unwrap(),
+            "45\n[output truncated]"
+        );
     }
 }

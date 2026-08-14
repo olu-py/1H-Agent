@@ -23,10 +23,9 @@ use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use serde_json::Value;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
@@ -34,10 +33,11 @@ use crate::{
     commands::{self, AgentMode, Command},
     config::{Config, ProviderPreset, ThinkingLevel, ThinkingProfile, thinking_profile},
     input::InputBuffer,
-    output::{EdgeScroll, InteractionTarget, MessageLayout, OutputSelection},
+    output::{EdgeScroll, InteractionTarget, OutputSelection},
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
     secrets,
     security::Workspace,
+    session::SessionRuntime,
     settings::SettingsForm,
     storage::{SessionSummary, Storage},
     tools::ToolRegistry,
@@ -46,110 +46,11 @@ use crate::{
 
 const MOUSE_WHEEL_SCROLL_LINES: isize = 1;
 
-#[derive(Clone, Debug)]
-pub enum DisplayKind {
-    User,
-    Assistant,
-    Thinking,
-    Tool,
-    Error,
-    System,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AgentPhase {
-    #[default]
-    Idle,
-    Thinking,
-    StreamingText,
-    WaitingApproval,
-    ToolRunning,
-    Completed,
-    Failed,
-}
-
-impl AgentPhase {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "IDLE",
-            Self::Thinking => "THINKING",
-            Self::StreamingText => "STREAMING_TEXT",
-            Self::WaitingApproval => "WAITING_APPROVAL",
-            Self::ToolRunning => "TOOL_RUNNING",
-            Self::Completed => "COMPLETED",
-            Self::Failed => "FAILED",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ModelPhase {
-    #[default]
-    Idle,
-    Streaming,
-    Completed,
-    Failed,
-}
-
-impl ModelPhase {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "IDLE",
-            Self::Streaming => "STREAMING",
-            Self::Completed => "COMPLETED",
-            Self::Failed => "FAILED",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DisplayEntry {
-    pub kind: DisplayKind,
-    pub content: DisplayContent,
-}
-
-#[derive(Clone, Debug)]
-pub enum DisplayContent {
-    Markdown(String),
-    Diff(String),
-    Tool(ToolDisplay),
-    Thinking(ThinkingDisplay),
-}
-
-#[derive(Clone, Debug)]
-pub struct ThinkingDisplay {
-    pub id: String,
-    pub content: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolDisplayStatus {
-    Running,
-    Completed,
-    Failed,
-    Rejected,
-}
-
-#[derive(Clone, Debug)]
-pub struct ToolDisplay {
-    pub call_id: String,
-    pub name: String,
-    pub arguments: Value,
-    pub status: ToolDisplayStatus,
-    pub result: Option<String>,
-}
-
-pub struct PendingApproval {
-    pub call: ToolCall,
-    pub reason: String,
-    pub action: ApprovalAction,
-    pub created_at: Instant,
-}
-
-pub enum ApprovalAction {
-    Agent(oneshot::Sender<bool>),
-    Shell(String),
-}
+pub(crate) use crate::model::ThinkingResult;
+pub use crate::model::{
+    AgentPhase, ApprovalAction, DisplayContent, DisplayEntry, DisplayKind, ModelPhase,
+    PendingApproval, ThinkingDisplay, ToolDisplay, ToolDisplayStatus,
+};
 
 #[derive(Clone, Debug)]
 pub struct CommandPaletteState {
@@ -160,31 +61,11 @@ pub struct CommandPaletteState {
 pub struct App {
     pub workspace: PathBuf,
     pub input: InputBuffer,
-    pub entries: Vec<DisplayEntry>,
     pub status: String,
-    pub busy: bool,
-    pub agent_phase: AgentPhase,
-    pub model_phase: ModelPhase,
-    pub thinking_last_line: String,
-    pub thinking_active: bool,
-    pub thinking_buffer: String,
-    pub thinking_buffer_truncated: bool,
-    pub thinking_animation_frame: usize,
-    pub thinking_anchor: Option<usize>,
-    pub(crate) thinking_result: ThinkingResult,
-    pub usage: Usage,
-    pub context_used_tokens: u64,
-    pub context_limit_tokens: Option<u64>,
     pub context_meter_enabled: bool,
-    pub pending_approval: Option<PendingApproval>,
     pub settings: Option<SettingsForm>,
     pub palette: Option<CommandPaletteState>,
-    pub mode: AgentMode,
-    pub cluster_mode: bool,
     pub leader_pending: bool,
-    pub expanded_tools: HashSet<String>,
-    pub expanded_thinking: HashSet<String>,
-    pub thinking_expanded: bool,
     pub thinking_menu_open: bool,
     pub thinking_control_rect: Option<Rect>,
     pub thinking_menu_rect: Option<Rect>,
@@ -198,32 +79,25 @@ pub struct App {
     pub layout_restore_anchor: Option<(InteractionTarget, usize)>,
     pub file_suggestions: Vec<String>,
     pub file_selected: usize,
-    pub message_scroll: usize,
-    pub follow_output: bool,
-    pub output_scroll_top: Option<usize>,
-    pub output_selection: Option<OutputSelection>,
-    pub message_layout: Option<MessageLayout>,
-    pub output_layout_dirty: bool,
-    #[cfg(test)]
-    pub output_layout_rebuild_count: usize,
-    #[cfg(test)]
-    pub markdown_parse_count: usize,
-    #[cfg(test)]
-    pub footer_rebuild_count: usize,
-    pub edge_scroll: EdgeScroll,
-    pub session_id: String,
     pub sessions: Vec<SessionSummary>,
-    pub collapsed_sessions: HashSet<String>,
-    conversation: Vec<ConversationItem>,
+    pub expanded_sessions: HashSet<String>,
     storage: Storage,
     config: Config,
     registry: Arc<ToolRegistry>,
-    runner: Option<AgentRunner>,
     active_secret: Option<(ProviderPreset, String)>,
-    agent_tx: mpsc::Sender<AgentEvent>,
-    agent_rx: mpsc::Receiver<AgentEvent>,
-    active_task: Option<JoinHandle<()>>,
+    active_session: String,
+    pub current: SessionRuntime,
+    background: HashMap<String, SessionRuntime>,
+    router_tx: mpsc::Sender<RoutedEvent>,
+    router_rx: mpsc::Receiver<RoutedEvent>,
     should_quit: bool,
+}
+
+/// An agent event tagged with the session it belongs to, so a single channel
+/// can route events to any background session in O(1).
+struct RoutedEvent {
+    session_id: String,
+    event: AgentEvent,
 }
 
 pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
@@ -235,8 +109,6 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         None => storage.create_session(&workspace_path)?,
     };
     let sessions = storage.list_sessions(&workspace_path)?;
-    let mut conversation = storage.load_messages(&session_id)?;
-    trim_conversation(&mut conversation);
     let workspace = Workspace::new(&workspace_path)?;
     let registry = Arc::new(ToolRegistry::new(
         workspace,
@@ -246,29 +118,18 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
     registry.set_permission_rules(config.permissions.tools.clone());
     registry.set_external_config(config.browser.clone(), config.mcp_servers.clone());
     let _ = registry.initialize_mcp().await;
-    let (agent_tx, agent_rx) = mpsc::channel(128);
-    let (runner, active_secret, initial_status) = match secrets::api_key(config.provider.preset) {
-        Ok(api_key) => {
-            let provider = OpenAiClient::new(config.provider.base_url.clone(), api_key.clone())?;
-            (
-                Some(AgentRunner::new(
-                    provider,
-                    config.provider.clone(),
-                    registry.clone(),
-                    storage.clone(),
-                    session_id.clone(),
-                )),
-                Some((config.provider.preset, api_key)),
-                format!(
-                    "Ready | {} | {}",
-                    config.provider.preset.label(),
-                    config.provider.model
-                ),
-            )
-        }
-        Err(secrets::SecretError::Missing(_)) => (None, None, "需要配置提供商".into()),
+    let (router_tx, router_rx) = mpsc::channel(256);
+    let (active_secret, initial_status) = match secrets::api_key(config.provider.preset) {
+        Ok(api_key) => (
+            Some((config.provider.preset, api_key)),
+            format!(
+                "Ready | {} | {}",
+                config.provider.preset.label(),
+                config.provider.model
+            ),
+        ),
+        Err(secrets::SecretError::Missing(_)) => (None, "需要配置提供商".into()),
         Err(error) => (
-            None,
             None,
             format!(
                 "系统密钥环读取失败：{}",
@@ -276,41 +137,28 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
             ),
         ),
     };
-    let entries = display_entries(&conversation);
     let initial_mode = storage
         .session_mode(&session_id)
         .ok()
         .and_then(|value| AgentMode::parse(&value))
         .unwrap_or_default();
     registry.set_mode(initial_mode);
+    let runtime = build_runtime(
+        &storage,
+        &config,
+        &registry,
+        &router_tx,
+        active_secret.as_ref(),
+        &session_id,
+    );
     let mut app = App {
         workspace: workspace_path,
         input: InputBuffer::new(),
-        entries,
         status: initial_status,
-        busy: false,
-        agent_phase: AgentPhase::Idle,
-        model_phase: ModelPhase::Idle,
-        thinking_last_line: String::new(),
-        thinking_active: false,
-        thinking_buffer: String::new(),
-        thinking_buffer_truncated: false,
-        thinking_animation_frame: 0,
-        thinking_anchor: None,
-        thinking_result: ThinkingResult::Completed,
-        usage: Usage::default(),
-        context_used_tokens: estimate_context_tokens(&conversation),
-        context_limit_tokens: config.provider.resolved_context_window_tokens(),
         context_meter_enabled: config.ui.context_meter,
-        pending_approval: None,
         settings: None,
         palette: None,
-        mode: initial_mode,
-        cluster_mode: false,
         leader_pending: false,
-        expanded_tools: HashSet::new(),
-        expanded_thinking: HashSet::new(),
-        thinking_expanded: false,
         thinking_menu_open: false,
         thinking_control_rect: None,
         thinking_menu_rect: None,
@@ -324,31 +172,17 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         layout_restore_anchor: None,
         file_suggestions: Vec::new(),
         file_selected: 0,
-        message_scroll: 0,
-        follow_output: true,
-        output_scroll_top: None,
-        output_selection: None,
-        message_layout: None,
-        output_layout_dirty: true,
-        #[cfg(test)]
-        output_layout_rebuild_count: 0,
-        #[cfg(test)]
-        markdown_parse_count: 0,
-        #[cfg(test)]
-        footer_rebuild_count: 0,
-        edge_scroll: EdgeScroll::default(),
-        session_id,
         sessions,
-        collapsed_sessions: HashSet::new(),
-        conversation,
+        expanded_sessions: HashSet::new(),
         storage,
         config,
         registry,
-        runner,
         active_secret,
-        agent_tx,
-        agent_rx,
-        active_task: None,
+        active_session: session_id,
+        current: runtime,
+        background: HashMap::new(),
+        router_tx,
+        router_rx,
         should_quit: false,
     };
 
@@ -417,9 +251,10 @@ async fn event_loop(
 
     while !app.should_quit {
         if app
+            .current
             .output_selection
             .is_some_and(|selection| selection.dragging)
-            && app.edge_scroll.direction != 0
+            && app.current.edge_scroll.direction != 0
             && edge_scroll_timer.is_none()
         {
             edge_scroll_timer = Some(Box::pin(tokio::time::sleep(
@@ -427,18 +262,19 @@ async fn event_loop(
             )));
         }
         if !app
+            .current
             .output_selection
             .is_some_and(|selection| selection.dragging)
-            || app.edge_scroll.direction == 0
+            || app.current.edge_scroll.direction == 0
         {
             edge_scroll_timer = None;
         }
-        if app.thinking_active && thinking_timer.is_none() {
+        if app.current.thinking_active && thinking_timer.is_none() {
             thinking_timer = Some(Box::pin(tokio::time::sleep(
                 std::time::Duration::from_millis(100),
             )));
         }
-        if !app.thinking_active {
+        if !app.current.thinking_active {
             thinking_timer = None;
         }
         let edge_scroll_tick = async {
@@ -464,7 +300,7 @@ async fn event_loop(
             }
             _ = thinking_tick => {
                 thinking_timer = None;
-                app.thinking_animation_frame = app.thinking_animation_frame.wrapping_add(1);
+                app.current.thinking_animation_frame = app.current.thinking_animation_frame.wrapping_add(1);
                 redraw = true;
             }
             terminal_event = terminal_events.next() => {
@@ -480,10 +316,9 @@ async fn event_loop(
                     None => break,
                 }
             }
-            agent_event = app.agent_rx.recv() => {
-                if let Some(event) = agent_event {
-                    handle_agent_event(app, event);
-                    redraw = true;
+            agent_event = app.router_rx.recv() => {
+                if let Some(routed) = agent_event {
+                    redraw = handle_routed_event(app, routed);
                 }
             }
         }
@@ -495,8 +330,13 @@ async fn event_loop(
             terminal.draw(|frame| ui::draw(frame, app))?;
         }
     }
-    if let Some(task) = app.active_task.take() {
+    if let Some(task) = app.current.active_task.take() {
         task.abort();
+    }
+    for runtime in app.background.values_mut() {
+        if let Some(task) = runtime.active_task.take() {
+            task.abort();
+        }
     }
     if let Some(approval) = take_pending_approval(app) {
         if let ApprovalAction::Agent(reply) = approval.action {
@@ -523,7 +363,7 @@ impl EventOutcome {
 
 async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutcome> {
     if let Event::Paste(text) = &event {
-        if !app.busy && app.settings.is_none() && app.palette.is_none() {
+        if !app.current.busy && app.settings.is_none() && app.palette.is_none() {
             app.input.insert_str(text);
             update_file_suggestions(app);
             return Ok(EventOutcome::redraw());
@@ -544,14 +384,14 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             mouse.kind,
             app.settings.is_some(),
             app.palette.is_some(),
-            app.pending_approval.is_some(),
+            app.current.pending_approval.is_some(),
         ) {
             return Ok(handle_output_mouse(app, mouse));
         }
         return Ok(EventOutcome::default());
     }
     if matches!(event, Event::Resize(_, _)) {
-        if app.pending_approval.is_some()
+        if app.current.pending_approval.is_some()
             || app.settings.is_some()
             || app.palette.is_some()
             || app.thinking_menu_open
@@ -586,7 +426,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             osc52: None,
         });
     }
-    if app.pending_approval.is_some() {
+    if app.current.pending_approval.is_some() {
         let redraw = matches!(
             key.code,
             KeyCode::Char('y')
@@ -607,7 +447,9 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         });
     }
     let redraw = match key.code {
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
+        KeyCode::Char('p')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
+        {
             app.palette = Some(CommandPaletteState {
                 query: String::new(),
                 selected: 0,
@@ -615,19 +457,19 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             app.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
             true
         }
-        KeyCode::PageUp if !app.busy => {
+        KeyCode::PageUp if !app.current.busy => {
             scroll_messages(app, 5);
             true
         }
-        KeyCode::PageDown if !app.busy => {
+        KeyCode::PageDown if !app.current.busy => {
             scroll_messages(app, -5);
             true
         }
-        KeyCode::Up if !app.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Up if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
             scroll_messages(app, 3);
             true
         }
-        KeyCode::Down if !app.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Down if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
             scroll_messages(app, -3);
             true
         }
@@ -635,15 +477,17 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             scroll_to_bottom(app);
             true
         }
-        KeyCode::PageUp if !app.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::PageUp if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
             scroll_messages(app, 5);
             true
         }
-        KeyCode::PageDown if !app.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::PageDown if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
             scroll_messages(app, -5);
             true
         }
-        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
+        KeyCode::Char('x')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
+        {
             app.leader_pending = true;
             app.status = "快捷键待命 | 按下对应键执行 | Esc 取消".into();
             true
@@ -659,30 +503,32 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             }
             true
         }
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
+        KeyCode::Char('s')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
+        {
             open_settings(app);
             true
         }
-        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             create_session(app)?;
             true
         }
-        KeyCode::Up if !app.busy && session_switch_direction(&key) == Some(-1) => {
+        KeyCode::Up if session_switch_direction(&key) == Some(-1) => {
             switch_session(app, -1)?;
             true
         }
-        KeyCode::Down if !app.busy && session_switch_direction(&key) == Some(1) => {
+        KeyCode::Down if session_switch_direction(&key) == Some(1) => {
             switch_session(app, 1)?;
             true
         }
         KeyCode::Esc => {
             app.leader_pending = false;
-            if let Some(task) = app.active_task.take() {
+            if let Some(task) = app.current.active_task.take() {
                 task.abort();
                 finish_thinking(app, "思考已取消");
-                app.busy = false;
-                app.agent_phase = AgentPhase::Idle;
-                app.model_phase = ModelPhase::Idle;
+                app.current.busy = false;
+                app.current.agent_phase = AgentPhase::Idle;
+                app.current.model_phase = ModelPhase::Idle;
                 app.status = "已取消".into();
                 app.push_entry(DisplayEntry {
                     kind: DisplayKind::System,
@@ -691,76 +537,84 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             }
             true
         }
-        KeyCode::Tab if !app.busy && !app.file_suggestions.is_empty() => {
+        KeyCode::Tab if !app.current.busy && !app.file_suggestions.is_empty() => {
             apply_file_completion(app);
             true
         }
-        KeyCode::Enter if !app.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Enter if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.input.insert('\n');
             app.file_suggestions.clear();
             true
         }
-        KeyCode::Char('j') if !app.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('j')
+            if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.input.insert('\n');
             app.file_suggestions.clear();
             true
         }
-        KeyCode::Enter if !app.busy => {
+        KeyCode::Enter if !app.current.busy => {
             submit_input(app)?;
             true
         }
-        KeyCode::Backspace if !app.busy => {
+        KeyCode::Backspace if !app.current.busy => {
             app.input.backspace();
             update_file_suggestions(app);
             true
         }
-        KeyCode::Delete if !app.busy => {
+        KeyCode::Delete if !app.current.busy => {
             app.input.delete();
             update_file_suggestions(app);
             true
         }
-        KeyCode::Left if !app.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Left if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.input.select_left();
             true
         }
-        KeyCode::Right if !app.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Right if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.input.select_right();
             true
         }
-        KeyCode::Char('a') if !app.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('a')
+            if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.input.select_all();
             true
         }
-        KeyCode::Left if !app.busy => {
+        KeyCode::Left if !app.current.busy => {
             app.input.move_left();
             true
         }
-        KeyCode::Right if !app.busy => {
+        KeyCode::Right if !app.current.busy => {
             app.input.move_right();
             true
         }
-        KeyCode::Home if !app.busy => {
+        KeyCode::Home if !app.current.busy => {
             app.input.move_home();
             true
         }
-        KeyCode::End if !app.busy => {
+        KeyCode::End if !app.current.busy => {
             app.input.move_end();
             true
         }
         KeyCode::Up
-            if !app.busy && key.modifiers.is_empty() && !app.file_suggestions.is_empty() =>
+            if !app.current.busy
+                && key.modifiers.is_empty()
+                && !app.file_suggestions.is_empty() =>
         {
             app.file_selected = app.file_selected.saturating_sub(1);
             true
         }
         KeyCode::Down
-            if !app.busy && key.modifiers.is_empty() && !app.file_suggestions.is_empty() =>
+            if !app.current.busy
+                && key.modifiers.is_empty()
+                && !app.file_suggestions.is_empty() =>
         {
             app.file_selected =
                 (app.file_selected + 1).min(app.file_suggestions.len().saturating_sub(1));
             true
         }
-        KeyCode::Up if !app.busy && key.modifiers.is_empty() => {
+        KeyCode::Up if !app.current.busy && key.modifiers.is_empty() => {
             if app.input.is_empty() {
                 app.input.history_previous();
             } else {
@@ -768,7 +622,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             }
             true
         }
-        KeyCode::Down if !app.busy && key.modifiers.is_empty() => {
+        KeyCode::Down if !app.current.busy && key.modifiers.is_empty() => {
             if app.input.is_empty() {
                 app.input.history_next();
             } else {
@@ -776,16 +630,20 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             }
             true
         }
-        KeyCode::Char('w') if !app.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('w')
+            if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.input.delete_word_left();
             true
         }
-        KeyCode::Char('u') if !app.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('u')
+            if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.input.clear();
             true
         }
         KeyCode::Char(character)
-            if !app.busy
+            if !app.current.busy
                 && !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -842,8 +700,8 @@ fn handle_thinking_mouse(
         }
         return Ok(Some(EventOutcome::redraw()));
     }
-    if !app.busy
-        && app.pending_approval.is_none()
+    if !app.current.busy
+        && app.current.pending_approval.is_none()
         && app
             .thinking_control_rect
             .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
@@ -923,32 +781,28 @@ fn handle_navigation_mouse(
     if mouse.kind != MouseEventKind::Down(MouseButton::Left)
         || app.settings.is_some()
         || app.palette.is_some()
-        || app.pending_approval.is_some()
+        || app.current.pending_approval.is_some()
         || app.leader_pending
     {
         return Ok(None);
     }
     if let Some(area) = app.session_panel_rect {
-        let rows = ui::flatten_session_tree(&app.sessions, &app.collapsed_sessions);
+        let rows = ui::flatten_session_tree(&app.sessions, &app.expanded_sessions);
         let current = rows
             .iter()
-            .position(|row| row.id == app.session_id)
+            .position(|row| row.id == app.current.session_id)
             .unwrap_or(0);
         if let Some(index) =
             ui::session_index_at(area, mouse.column, mouse.row, rows.len(), current)
         {
             let row = &rows[index];
             if row.has_children {
-                if !app.collapsed_sessions.insert(row.id.clone()) {
-                    app.collapsed_sessions.remove(&row.id);
+                if !app.expanded_sessions.insert(row.id.clone()) {
+                    app.expanded_sessions.remove(&row.id);
                 }
                 return Ok(Some(EventOutcome::redraw()));
             }
-            if row.id == app.session_id {
-                return Ok(Some(EventOutcome::redraw()));
-            }
-            if app.busy {
-                app.status = "请求运行中，无法切换会话".into();
+            if row.id == app.current.session_id {
                 return Ok(Some(EventOutcome::redraw()));
             }
             activate_session(app, row.id.clone())?;
@@ -958,11 +812,11 @@ fn handle_navigation_mouse(
     if let Some(rect) = app.input_mode_rect
         && point_in_rect(mouse.column, mouse.row, rect)
     {
-        if app.busy {
+        if app.current.busy {
             app.status = "请求运行中，无法切换模式".into();
             return Ok(Some(EventOutcome::redraw()));
         }
-        switch_mode(app, next_mode(app.mode))?;
+        switch_mode(app, next_mode(app.current.mode))?;
         return Ok(Some(EventOutcome::redraw()));
     }
     Ok(None)
@@ -982,15 +836,17 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
             app.mouse_dragged = false;
             app.mouse_press_position = Some((mouse.column, mouse.row));
             app.mouse_press_target = app
+                .current
                 .message_layout
                 .as_ref()
                 .and_then(|layout| layout.interaction_at(mouse.column, mouse.row));
             if app.mouse_press_target.is_some() {
                 app.clear_output_selection();
-                app.edge_scroll = EdgeScroll::default();
+                app.current.edge_scroll = EdgeScroll::default();
                 return EventOutcome::redraw();
             }
             let Some(offset) = app
+                .current
                 .message_layout
                 .as_ref()
                 .and_then(|layout| layout.hit_test(mouse.column, mouse.row))
@@ -998,14 +854,18 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                 app.clear_output_selection();
                 return EventOutcome::redraw();
             };
-            if app.follow_output {
-                app.output_scroll_top = app.message_layout.as_ref().map(|layout| layout.scroll);
-                if let Some(layout) = &app.message_layout {
-                    app.message_scroll = layout.max_scroll().saturating_sub(layout.scroll);
+            if app.current.follow_output {
+                app.current.output_scroll_top = app
+                    .current
+                    .message_layout
+                    .as_ref()
+                    .map(|layout| layout.scroll);
+                if let Some(layout) = &app.current.message_layout {
+                    app.current.message_scroll = layout.max_scroll().saturating_sub(layout.scroll);
                 }
             }
-            app.follow_output = false;
-            app.output_selection = Some(OutputSelection::new(offset));
+            app.current.follow_output = false;
+            app.current.output_selection = Some(OutputSelection::new(offset));
             update_edge_scroll(app, mouse.column, mouse.row);
             EventOutcome::redraw()
         }
@@ -1020,11 +880,12 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                     app.mouse_press_target = None;
                     if let Some((column, row)) = app.mouse_press_position
                         && let Some(offset) = app
+                            .current
                             .message_layout
                             .as_ref()
                             .and_then(|layout| layout.hit_test(column, row))
                     {
-                        app.output_selection = Some(OutputSelection::new(offset));
+                        app.current.output_selection = Some(OutputSelection::new(offset));
                     }
                     update_drag_position(app, mouse.column, mouse.row);
                     return EventOutcome::redraw();
@@ -1032,6 +893,7 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                 return EventOutcome::default();
             }
             if app
+                .current
                 .output_selection
                 .is_some_and(|selection| selection.dragging)
             {
@@ -1042,18 +904,19 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            app.edge_scroll = EdgeScroll::default();
+            app.current.edge_scroll = EdgeScroll::default();
             let pressed_target = app.mouse_press_target.take();
             app.mouse_press_position = None;
             if let Some(target) = pressed_target {
                 let released_target = app
+                    .current
                     .message_layout
                     .as_ref()
                     .and_then(|layout| layout.interaction_at(mouse.column, mouse.row));
                 if !app.mouse_dragged && released_target.as_ref() == Some(&target) {
-                    if !app.follow_output {
+                    if !app.current.follow_output {
                         app.layout_restore_anchor =
-                            app.message_layout.as_ref().and_then(|layout| {
+                            app.current.message_layout.as_ref().and_then(|layout| {
                                 layout
                                     .visual_lines
                                     .iter()
@@ -1065,16 +928,16 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                     }
                     match target {
                         InteractionTarget::Tool(call_id) => {
-                            if !app.expanded_tools.insert(call_id.clone()) {
-                                app.expanded_tools.remove(&call_id);
+                            if !app.current.expanded_tools.insert(call_id.clone()) {
+                                app.current.expanded_tools.remove(&call_id);
                             }
                         }
                         InteractionTarget::Thinking => {
-                            app.thinking_expanded = !app.thinking_expanded;
+                            app.current.thinking_expanded = !app.current.thinking_expanded;
                         }
                         InteractionTarget::ThinkingSummary(id) => {
-                            if !app.expanded_thinking.insert(id.clone()) {
-                                app.expanded_thinking.remove(&id);
+                            if !app.current.expanded_thinking.insert(id.clone()) {
+                                app.current.expanded_thinking.remove(&id);
                             }
                         }
                     }
@@ -1084,16 +947,17 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                 return EventOutcome::redraw();
             }
             app.mouse_dragged = false;
-            let Some(mut selection) = app.output_selection else {
+            let Some(mut selection) = app.current.output_selection else {
                 return EventOutcome::default();
             };
             selection.dragging = false;
             let Some((start, end)) = selection.range() else {
-                app.output_selection = None;
+                app.current.output_selection = None;
                 return EventOutcome::redraw();
             };
-            app.output_selection = Some(selection);
+            app.current.output_selection = Some(selection);
             let Some(text) = app
+                .current
                 .message_layout
                 .as_ref()
                 .and_then(|layout| layout.text.get(start..end))
@@ -1148,7 +1012,7 @@ fn settings_key_handled(code: KeyCode, modifiers: KeyModifiers) -> bool {
 
 fn update_drag_position(app: &mut App, column: u16, row: u16) {
     update_edge_scroll(app, column, row);
-    let Some(offset) = app.message_layout.as_ref().and_then(|layout| {
+    let Some(offset) = app.current.message_layout.as_ref().and_then(|layout| {
         let clamped_row = row
             .max(layout.viewport.y)
             .min(layout.viewport.bottom().saturating_sub(1));
@@ -1156,41 +1020,42 @@ fn update_drag_position(app: &mut App, column: u16, row: u16) {
     }) else {
         return;
     };
-    if let Some(selection) = &mut app.output_selection {
+    if let Some(selection) = &mut app.current.output_selection {
         selection.active = offset;
     }
 }
 
 fn update_edge_scroll(app: &mut App, column: u16, row: u16) {
-    let Some(layout) = &app.message_layout else {
+    let Some(layout) = &app.current.message_layout else {
         return;
     };
     let direction = edge_scroll_direction(row, layout.viewport);
-    app.edge_scroll = EdgeScroll { direction, column };
+    app.current.edge_scroll = EdgeScroll { direction, column };
 }
 
 fn auto_scroll_selection(app: &mut App) {
-    let direction = app.edge_scroll.direction;
+    let direction = app.current.edge_scroll.direction;
     if direction == 0
         || !app
+            .current
             .output_selection
             .is_some_and(|selection| selection.dragging)
     {
         return;
     }
     scroll_messages(app, if direction < 0 { 1 } else { -1 });
-    let Some(layout) = &app.message_layout else {
+    let Some(layout) = &app.current.message_layout else {
         return;
     };
-    let scroll = app.output_scroll_top.unwrap_or(layout.scroll);
+    let scroll = app.current.output_scroll_top.unwrap_or(layout.scroll);
     let row = if direction < 0 {
         scroll
     } else {
         scroll.saturating_add(layout.viewport.height.saturating_sub(1) as usize)
     };
-    let column = relative_output_column(app.edge_scroll.column, layout.viewport);
+    let column = relative_output_column(app.current.edge_scroll.column, layout.viewport);
     if let Some(offset) = layout.position_at_visual_row(row, column)
-        && let Some(selection) = &mut app.output_selection
+        && let Some(selection) = &mut app.current.output_selection
     {
         selection.active = offset;
     }
@@ -1240,14 +1105,14 @@ fn edge_scroll_direction(row: u16, viewport: ratatui::layout::Rect) -> i8 {
 }
 
 fn clear_output_selection(app: &mut App) {
-    app.output_selection = None;
-    app.edge_scroll = EdgeScroll::default();
+    app.current.output_selection = None;
+    app.current.edge_scroll = EdgeScroll::default();
 }
 
 fn push_entry(app: &mut App, entry: DisplayEntry) {
     clear_output_selection(app);
     app.invalidate_output_layout();
-    app.entries.push(entry);
+    app.current.entries.push(entry);
 }
 
 impl App {
@@ -1280,8 +1145,8 @@ impl App {
     }
 
     pub fn invalidate_output_layout(&mut self) {
-        self.message_layout.take();
-        self.output_layout_dirty = true;
+        self.current.message_layout.take();
+        self.current.output_layout_dirty = true;
     }
 }
 
@@ -1291,13 +1156,13 @@ fn cancel_active_request(app: &mut App) {
     {
         let _ = reply.send(false);
     }
-    if let Some(task) = app.active_task.take() {
+    if let Some(task) = app.current.active_task.take() {
         task.abort();
     }
     finish_thinking(app, "思考已取消");
-    app.busy = false;
-    app.agent_phase = AgentPhase::Idle;
-    app.model_phase = ModelPhase::Idle;
+    app.current.busy = false;
+    app.current.agent_phase = AgentPhase::Idle;
+    app.current.model_phase = ModelPhase::Idle;
     app.status = "已取消当前请求".into();
     app.push_entry(DisplayEntry {
         kind: DisplayKind::System,
@@ -1306,7 +1171,7 @@ fn cancel_active_request(app: &mut App) {
 }
 
 fn take_pending_approval(app: &mut App) -> Option<PendingApproval> {
-    let approval = app.pending_approval.take();
+    let approval = app.current.pending_approval.take();
     if approval.is_some() {
         app.force_full_redraw = true;
     }
@@ -1314,32 +1179,36 @@ fn take_pending_approval(app: &mut App) -> Option<PendingApproval> {
 }
 
 fn scroll_messages(app: &mut App, delta: isize) {
-    let Some(layout) = &app.message_layout else {
+    let Some(layout) = &app.current.message_layout else {
         if delta > 0 {
-            app.message_scroll = app.message_scroll.saturating_add(delta as usize);
-            app.follow_output = false;
+            app.current.message_scroll = app.current.message_scroll.saturating_add(delta as usize);
+            app.current.follow_output = false;
         } else {
-            app.message_scroll = app.message_scroll.saturating_sub(delta.unsigned_abs());
-            if app.message_scroll == 0 {
-                app.follow_output = true;
+            app.current.message_scroll = app
+                .current
+                .message_scroll
+                .saturating_sub(delta.unsigned_abs());
+            if app.current.message_scroll == 0 {
+                app.current.follow_output = true;
             }
         }
         return;
     };
     let max_scroll = layout.max_scroll();
     let current = app
+        .current
         .output_scroll_top
         .unwrap_or(layout.scroll)
         .min(max_scroll);
     let next = next_output_scroll_top(current, max_scroll, delta);
     if delta < 0 && next == max_scroll {
-        app.output_scroll_top = None;
-        app.follow_output = true;
-        app.message_scroll = 0;
+        app.current.output_scroll_top = None;
+        app.current.follow_output = true;
+        app.current.message_scroll = 0;
     } else {
-        app.output_scroll_top = Some(next);
-        app.follow_output = false;
-        app.message_scroll = max_scroll.saturating_sub(next);
+        app.current.output_scroll_top = Some(next);
+        app.current.follow_output = false;
+        app.current.message_scroll = max_scroll.saturating_sub(next);
     }
 }
 
@@ -1353,9 +1222,9 @@ fn next_output_scroll_top(current: usize, max_scroll: usize, delta: isize) -> us
 }
 
 fn scroll_to_bottom(app: &mut App) {
-    app.message_scroll = 0;
-    app.follow_output = true;
-    app.output_scroll_top = None;
+    app.current.message_scroll = 0;
+    app.current.follow_output = true;
+    app.current.output_scroll_top = None;
 }
 
 fn submit_input(app: &mut App) -> Result<()> {
@@ -1388,50 +1257,49 @@ fn submit_input(app: &mut App) -> Result<()> {
         });
         return Ok(());
     }
-    let Some(runner) = app.runner.clone() else {
+    let Some(runner) = app.current.runner.clone() else {
         app.status = "请打开提供商设置配置 API Key".into();
         return Ok(());
     };
     app.input.clear();
     app.file_suggestions.clear();
     app.clear_output_selection();
-    app.message_scroll = 0;
-    app.follow_output = true;
-    app.output_scroll_top = None;
+    app.current.message_scroll = 0;
+    app.current.follow_output = true;
+    app.current.output_scroll_top = None;
     app.push_entry(DisplayEntry {
         kind: DisplayKind::User,
         content: DisplayContent::Markdown(input.clone()),
     });
-    app.conversation.push(ConversationItem::Message {
+    app.current.conversation.push(ConversationItem::Message {
         role: Role::User,
         content: input.clone(),
     });
     app.storage
-        .append_message(&app.session_id, Role::User, &input)?;
+        .append_message(&app.current.session_id, Role::User, &input)?;
     for (label, content) in collect_file_context(app, &input) {
-        app.conversation.push(ConversationItem::Context {
+        app.current.conversation.push(ConversationItem::Context {
             label: label.clone(),
             content: content.clone(),
         });
         app.storage
-            .append_context(&app.session_id, &label, &content)?;
+            .append_context(&app.current.session_id, &label, &content)?;
         app.push_entry(DisplayEntry {
             kind: DisplayKind::System,
             content: DisplayContent::Markdown(format!("已附加文件 @{label}")),
         });
     }
     refresh_sessions(app)?;
-    trim_conversation(&mut app.conversation);
-    app.context_used_tokens = estimate_context_tokens(&app.conversation);
-    app.busy = true;
-    app.agent_phase = AgentPhase::Thinking;
-    app.model_phase = ModelPhase::Idle;
+    trim_conversation(&mut app.current.conversation);
+    app.current.context_used_tokens = estimate_context_tokens(&app.current.conversation);
+    app.current.busy = true;
+    app.current.agent_phase = AgentPhase::Thinking;
+    app.current.model_phase = ModelPhase::Idle;
     app.status = "准备请求中…… | Esc 取消".into();
-    let items = app.conversation.clone();
-    let events = app.agent_tx.clone();
-    let cluster_mode = app.cluster_mode;
-    app.active_task = Some(tokio::spawn(async move {
-        runner.run(items, events, cluster_mode).await;
+    let items = app.current.conversation.clone();
+    let events = app.current.agent_tx.clone();
+    app.current.active_task = Some(tokio::spawn(async move {
+        runner.run(items, events).await;
     }));
     trim_app_entries(app);
     Ok(())
@@ -1622,7 +1490,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 .iter()
                 .enumerate()
                 .map(|(index, session)| {
-                    let marker = if session.id == app.session_id {
+                    let marker = if session.id == app.current.session_id {
                         "*"
                     } else {
                         " "
@@ -1648,7 +1516,8 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 } else {
                     app.config.provider.model = model.trim().to_owned();
                     app.config.provider.normalize_thinking();
-                    app.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
+                    app.current.context_limit_tokens =
+                        app.config.provider.resolved_context_window_tokens();
                     rebuild_runner(app)?;
                     app.status = format!("模型已设置为 {}", app.config.provider.model);
                     let _ = app.config.save();
@@ -1660,27 +1529,27 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         Command::Agent(agent) => {
             if let Some(name) = agent {
                 if let Some(configured) = app.config.agents.iter().find(|item| item.name == name) {
-                    app.mode = configured.mode;
-                    app.registry.set_mode(app.mode);
+                    app.current.mode = configured.mode;
+                    app.registry.set_mode(app.current.mode);
                     app.storage
-                        .set_session_mode(&app.session_id, app.mode.as_str())?;
+                        .set_session_mode(&app.current.session_id, app.current.mode.as_str())?;
                     // Force a fresh provider context so the new mode contract is
                     // sent as the stable system prefix on the next request.
-                    app.storage.clear_response_id(&app.session_id)?;
-                    app.status = format!("Agent：{} | 模式：{}", name, app.mode);
+                    app.storage.clear_response_id(&app.current.session_id)?;
+                    app.status = format!("Agent：{} | 模式：{}", name, app.current.mode);
                     app.push_entry(DisplayEntry {
                         kind: DisplayKind::System,
                         content: DisplayContent::Markdown(format!(
                             "Agent 模式已切换为 **{}**。下一次模型请求将使用 {} 执行约束。",
-                            app.mode.as_str().to_ascii_uppercase(),
-                            app.mode.as_str()
+                            app.current.mode.as_str().to_ascii_uppercase(),
+                            app.current.mode.as_str()
                         )),
                     });
                 } else {
                     app.status = format!("未知 Agent：{name}");
                 }
             } else {
-                app.status = format!("当前 Agent 模式：{}", app.mode);
+                app.status = format!("当前 Agent 模式：{}", app.current.mode);
             }
         }
         Command::Mode(mode) => {
@@ -1696,23 +1565,16 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         }
         Command::Clear => {
             app.invalidate_output_layout();
-            app.entries.clear();
+            app.current.entries.clear();
             reset_thinking_state(app);
             app.clear_output_selection();
             app.status = "显示已清空，会话历史仍保留".into();
         }
-        Command::Cluster => {
-            app.cluster_mode = !app.cluster_mode;
-            app.status = if app.cluster_mode {
-                "集群模式已开启 | 可在对话中指派角色与模型".into()
-            } else {
-                "集群模式已关闭".into()
-            };
-        }
         Command::Quit => app.should_quit = true,
         Command::Rename(title) => {
             let title = title.unwrap_or_else(|| "Untitled session".into());
-            app.storage.rename_session(&app.session_id, &title)?;
+            app.storage
+                .rename_session(&app.current.session_id, &title)?;
             refresh_sessions(app)?;
             app.status = format!("会话已重命名为 {}", title.trim());
         }
@@ -1720,7 +1582,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             if app.sessions.len() <= 1 {
                 app.status = "不能删除最后一个会话，请先执行 /new".into();
             } else {
-                let deleted = app.session_id.clone();
+                let deleted = app.current.session_id.clone();
                 app.storage.delete_session(&deleted)?;
                 let next = app
                     .storage
@@ -1732,15 +1594,15 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             }
         }
         Command::Fork => {
-            let fork = app.storage.fork_session(&app.session_id)?;
+            let fork = app.storage.fork_session(&app.current.session_id)?;
             activate_session(app, fork)?;
             refresh_sessions(app)?;
             app.status = "会话已创建分支".into();
         }
         Command::Undo => {
-            if app.storage.undo(&app.session_id)? {
-                app.storage.clear_response_id(&app.session_id)?;
-                let session_id = app.session_id.clone();
+            if app.storage.undo(&app.current.session_id)? {
+                app.storage.clear_response_id(&app.current.session_id)?;
+                let session_id = app.current.session_id.clone();
                 activate_session(app, session_id)?;
                 app.status = "已撤销上一轮".into();
             } else {
@@ -1748,9 +1610,9 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             }
         }
         Command::Redo => {
-            if app.storage.redo(&app.session_id)? {
-                app.storage.clear_response_id(&app.session_id)?;
-                let session_id = app.session_id.clone();
+            if app.storage.redo(&app.current.session_id)? {
+                app.storage.clear_response_id(&app.current.session_id)?;
+                let session_id = app.current.session_id.clone();
                 activate_session(app, session_id)?;
                 app.status = "已重做上一轮".into();
             } else {
@@ -1758,15 +1620,15 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             }
         }
         Command::Compact => {
-            let hidden = app.storage.compact_session(&app.session_id, 8)?;
+            let hidden = app.storage.compact_session(&app.current.session_id, 8)?;
             if hidden > 0 {
                 app.storage.append_message(
-                    &app.session_id,
+                    &app.current.session_id,
                     Role::System,
                     &format!("Local compaction hid {hidden} older messages."),
                 )?;
             }
-            let session_id = app.session_id.clone();
+            let session_id = app.current.session_id.clone();
             activate_session(app, session_id)?;
             app.status = format!("已压缩 {hidden} 条旧消息");
         }
@@ -1838,7 +1700,7 @@ impl LeaderAction {
 fn execute_leader_action(app: &mut App, action: LeaderAction) -> Result<()> {
     match action {
         LeaderAction::New => create_session(app),
-        LeaderAction::Mode => switch_mode(app, next_mode(app.mode)),
+        LeaderAction::Mode => switch_mode(app, next_mode(app.current.mode)),
         LeaderAction::Settings => {
             open_settings(app);
             Ok(())
@@ -1852,7 +1714,7 @@ fn execute_leader_action(app: &mut App, action: LeaderAction) -> Result<()> {
             app.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
             Ok(())
         }
-        LeaderAction::Cluster => execute_command(app, Command::Cluster),
+        LeaderAction::Cluster => switch_mode(app, AgentMode::Cluster),
         LeaderAction::Quit => {
             app.should_quit = true;
             Ok(())
@@ -1861,14 +1723,14 @@ fn execute_leader_action(app: &mut App, action: LeaderAction) -> Result<()> {
 }
 
 fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
-    let filename = requested.unwrap_or_else(|| format!(".1h-agent-{}.md", app.session_id));
+    let filename = requested.unwrap_or_else(|| format!(".1h-agent-{}.md", app.current.session_id));
     let target = app
         .registry
         .workspace()
         .resolve_new(&filename)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let mut output = String::new();
-    for item in &app.conversation {
+    for item in &app.current.conversation {
         if let ConversationItem::Message { role, content } = item {
             let label = match role {
                 Role::System => "System",
@@ -1890,29 +1752,29 @@ fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
 
 fn rebuild_runner(app: &mut App) -> Result<()> {
     let Some((_, api_key)) = &app.active_secret else {
-        app.runner = None;
+        app.current.runner = None;
         return Ok(());
     };
     let provider = OpenAiClient::new(app.config.provider.base_url.clone(), api_key.clone())?;
-    app.runner = Some(AgentRunner::new(
+    app.current.runner = Some(AgentRunner::new(
         provider,
         app.config.provider.clone(),
         app.registry.clone(),
         app.storage.clone(),
-        app.session_id.clone(),
+        app.current.session_id.clone(),
     ));
     Ok(())
 }
 
 fn start_diff(app: &mut App) -> Result<()> {
-    if app.busy {
+    if app.current.busy {
         return Ok(());
     }
     let registry = app.registry.clone();
-    let events = app.agent_tx.clone();
-    app.busy = true;
+    let events = app.current.agent_tx.clone();
+    app.current.busy = true;
     app.status = "正在收集 Git diff…… | Esc 取消".into();
-    app.active_task = Some(tokio::spawn(async move {
+    app.current.active_task = Some(tokio::spawn(async move {
         let call = ToolCall {
             id: format!("diff_{}", uuid::Uuid::new_v4()),
             name: "git".into(),
@@ -1983,16 +1845,16 @@ fn apply_settings(app: &mut App) -> Result<()> {
     let entered_key = form.api_key.trim();
 
     let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())?;
-    app.runner = Some(AgentRunner::new(
+    app.current.runner = Some(AgentRunner::new(
         provider,
         provider_config.clone(),
         app.registry.clone(),
         app.storage.clone(),
-        app.session_id.clone(),
+        app.current.session_id.clone(),
     ));
     app.active_secret = Some((provider_config.preset, api_key));
     app.config.provider = provider_config.clone();
-    app.context_limit_tokens = provider_config.resolved_context_window_tokens();
+    app.current.context_limit_tokens = provider_config.resolved_context_window_tokens();
 
     let key_warning = if !entered_key.is_empty() {
         secrets::store_api_key(provider_config.preset, entered_key)
@@ -2031,24 +1893,57 @@ fn apply_settings(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Routes an agent event to its owning session. Events for the active session
+/// are applied directly and trigger a redraw; events for a background session
+/// are applied by temporarily swapping the runtime in, without redrawing or
+/// disturbing the active session's status.
+fn handle_routed_event(app: &mut App, routed: RoutedEvent) -> bool {
+    let RoutedEvent { session_id, event } = routed;
+    if session_id == app.active_session {
+        handle_agent_event(app, event);
+        return true;
+    }
+    if !app.background.contains_key(&session_id) {
+        return false;
+    }
+    let saved_status = app.status.clone();
+    // Swap the background runtime into `current`, apply the event, then swap
+    // back, preserving both runtimes' in-flight state.
+    let target = app.background.remove(&session_id).unwrap();
+    let parked = std::mem::replace(&mut app.current, target);
+    app.background.insert(app.active_session.clone(), parked);
+    let previous_active = std::mem::replace(&mut app.active_session, session_id.clone());
+
+    handle_agent_event(app, event);
+
+    let updated = std::mem::replace(
+        &mut app.current,
+        app.background.remove(&previous_active).unwrap(),
+    );
+    app.background.insert(session_id, updated);
+    app.active_session = previous_active;
+    app.status = saved_status;
+    false
+}
+
 fn handle_agent_event(app: &mut App, event: AgentEvent) {
     match event {
         AgentEvent::ReasoningDelta(delta) => {
-            app.agent_phase = AgentPhase::Thinking;
-            app.model_phase = ModelPhase::Streaming;
+            app.current.agent_phase = AgentPhase::Thinking;
+            app.current.model_phase = ModelPhase::Streaming;
             update_thinking_line(app, &delta);
         }
         AgentEvent::ModelStreaming => {
             begin_thinking(app);
-            app.agent_phase = AgentPhase::Thinking;
-            app.model_phase = ModelPhase::Streaming;
+            app.current.agent_phase = AgentPhase::Thinking;
+            app.current.model_phase = ModelPhase::Streaming;
             app.status = "等待模型流式响应".into();
         }
         AgentEvent::WebSearchStarted { query } => {
             finish_thinking(app, "思考完成");
-            app.agent_phase = AgentPhase::ToolRunning;
-            app.model_phase = ModelPhase::Streaming;
-            let already_open = app.entries.last().is_some_and(|entry| {
+            app.current.agent_phase = AgentPhase::ToolRunning;
+            app.current.model_phase = ModelPhase::Streaming;
+            let already_open = app.current.entries.last().is_some_and(|entry| {
                 matches!(&entry.content, DisplayContent::Tool(tool) if tool.name == "web_search" && tool.status == ToolDisplayStatus::Running)
             });
             if !already_open {
@@ -2073,7 +1968,8 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         } => {
             let context = format!("{title}\n{url}\n{snippet}");
             if let Some(tool) =
-                app.entries
+                app.current
+                    .entries
                     .iter_mut()
                     .rev()
                     .find_map(|entry| match &mut entry.content {
@@ -2095,7 +1991,8 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::WebSearchCompleted { count } => {
             if let Some(tool) =
-                app.entries
+                app.current
+                    .entries
                     .iter_mut()
                     .rev()
                     .find_map(|entry| match &mut entry.content {
@@ -2111,7 +2008,7 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
                 tool.status = ToolDisplayStatus::Completed;
                 app.invalidate_output_layout();
             }
-            app.agent_phase = AgentPhase::Thinking;
+            app.current.agent_phase = AgentPhase::Thinking;
             app.status = if count == 0 {
                 "联网搜索完成".into()
             } else {
@@ -2120,15 +2017,15 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::Cancelled(reason) => {
             finish_thinking(app, "思考已取消");
-            app.busy = false;
-            app.active_task = None;
+            app.current.busy = false;
+            app.current.active_task = None;
             if let Some(approval) = take_pending_approval(app)
                 && let ApprovalAction::Agent(reply) = approval.action
             {
                 let _ = reply.send(false);
             }
-            app.agent_phase = AgentPhase::Idle;
-            app.model_phase = ModelPhase::Idle;
+            app.current.agent_phase = AgentPhase::Idle;
+            app.current.model_phase = ModelPhase::Idle;
             app.status = if reason.contains("approval") {
                 "审批等待已取消".into()
             } else {
@@ -2137,10 +2034,10 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::TextDelta(delta) => {
             finish_thinking(app, "思考完成");
-            app.agent_phase = AgentPhase::StreamingText;
-            app.model_phase = ModelPhase::Streaming;
+            app.current.agent_phase = AgentPhase::StreamingText;
+            app.current.model_phase = ModelPhase::Streaming;
             app.invalidate_output_layout();
-            if let Some(entry) = app.entries.last_mut()
+            if let Some(entry) = app.current.entries.last_mut()
                 && matches!(entry.kind, DisplayKind::Assistant)
                 && let DisplayContent::Markdown(text) = &mut entry.content
             {
@@ -2159,10 +2056,10 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             reply,
         } => {
             finish_thinking(app, "思考完成");
-            app.agent_phase = AgentPhase::WaitingApproval;
-            app.model_phase = ModelPhase::Idle;
+            app.current.agent_phase = AgentPhase::WaitingApproval;
+            app.current.model_phase = ModelPhase::Idle;
             app.status = "需要确认工具权限".into();
-            app.pending_approval = Some(PendingApproval {
+            app.current.pending_approval = Some(PendingApproval {
                 call,
                 reason,
                 action: ApprovalAction::Agent(reply),
@@ -2171,8 +2068,8 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
         }
         AgentEvent::ToolStarted(call) => {
             finish_thinking(app, "思考完成");
-            app.agent_phase = AgentPhase::ToolRunning;
-            app.model_phase = ModelPhase::Idle;
+            app.current.agent_phase = AgentPhase::ToolRunning;
+            app.current.model_phase = ModelPhase::Idle;
             app.status = format!("正在执行 {}……", ui::tool_display_name(&call.name));
             app.push_entry(DisplayEntry {
                 kind: DisplayKind::Tool,
@@ -2186,10 +2083,11 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             });
         }
         AgentEvent::ToolFinished { call, result } => {
-            app.agent_phase = AgentPhase::Thinking;
+            app.current.agent_phase = AgentPhase::Thinking;
             let status = tool_result_status(&result);
             if let Some(tool) =
-                app.entries
+                app.current
+                    .entries
                     .iter_mut()
                     .rev()
                     .find_map(|entry| match &mut entry.content {
@@ -2215,24 +2113,29 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             app.status = "正在将工具结果交给模型……".into();
         }
         AgentEvent::Usage(usage) => {
-            app.context_used_tokens = usage
+            app.current.context_used_tokens = usage
                 .input_tokens
-                .max(estimate_context_tokens(&app.conversation));
-            app.usage = usage;
+                .max(estimate_context_tokens(&app.current.conversation));
+            app.current.usage = usage;
         }
         AgentEvent::Completed { items } => {
             finish_thinking(app, "思考完成");
-            app.conversation = items;
-            trim_conversation(&mut app.conversation);
-            app.busy = false;
-            app.active_task = None;
-            app.agent_phase = AgentPhase::Idle;
-            app.model_phase = ModelPhase::Completed;
+            app.current.conversation = items;
+            trim_conversation(&mut app.current.conversation);
+            app.current.busy = false;
+            app.current.active_task = None;
+            app.current.agent_phase = AgentPhase::Idle;
+            app.current.model_phase = ModelPhase::Completed;
             app.status = if refresh_sessions(app).is_ok() {
                 "就绪".into()
             } else {
                 "就绪，但刷新会话失败".into()
             };
+        }
+        AgentEvent::SessionsChanged => {
+            if refresh_sessions(app).is_ok() && !app.current.busy {
+                app.status = "会话列表已更新".into();
+            }
         }
         AgentEvent::Failed(error) => {
             finish_thinking(app, "思考失败");
@@ -2240,10 +2143,10 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
                 kind: DisplayKind::Error,
                 content: DisplayContent::Markdown(secrets::redact(&error)),
             });
-            app.busy = false;
-            app.active_task = None;
-            app.agent_phase = AgentPhase::Failed;
-            app.model_phase = ModelPhase::Failed;
+            app.current.busy = false;
+            app.current.active_task = None;
+            app.current.agent_phase = AgentPhase::Failed;
+            app.current.model_phase = ModelPhase::Failed;
             app.status = "请求失败".into();
         }
         AgentEvent::LocalCommandFinished { command, result } => {
@@ -2252,10 +2155,10 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
                     kind: DisplayKind::Tool,
                     content: DisplayContent::Diff(result),
                 });
-                app.busy = false;
-                app.active_task = None;
-                app.agent_phase = AgentPhase::Idle;
-                app.model_phase = ModelPhase::Completed;
+                app.current.busy = false;
+                app.current.active_task = None;
+                app.current.agent_phase = AgentPhase::Idle;
+                app.current.model_phase = ModelPhase::Completed;
                 app.status = "Git diff 已准备好".into();
                 trim_app_entries(app);
                 return;
@@ -2270,22 +2173,23 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
                     result: Some(result.clone()),
                 }),
             });
-            app.conversation.push(ConversationItem::Context {
+            app.current.conversation.push(ConversationItem::Context {
                 label: format!("shell: {command}"),
                 content: result.clone(),
             });
-            if let Err(error) =
-                app.storage
-                    .append_context(&app.session_id, &format!("shell: {command}"), &result)
-            {
+            if let Err(error) = app.storage.append_context(
+                &app.current.session_id,
+                &format!("shell: {command}"),
+                &result,
+            ) {
                 app.status = format!("命令已完成，但保存失败：{error}");
             } else {
                 app.status = "Shell 命令已完成".into();
             }
-            app.busy = false;
-            app.active_task = None;
-            app.agent_phase = AgentPhase::Idle;
-            app.model_phase = ModelPhase::Completed;
+            app.current.busy = false;
+            app.current.active_task = None;
+            app.current.agent_phase = AgentPhase::Idle;
+            app.current.model_phase = ModelPhase::Completed;
         }
     }
     trim_app_entries(app);
@@ -2308,14 +2212,6 @@ fn tool_result_status(result: &str) -> ToolDisplayStatus {
 
 const MAX_THINKING_LINE_BYTES: usize = 1024;
 const MAX_THINKING_BUFFER_BYTES: usize = 64 * 1024;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ThinkingResult {
-    #[default]
-    Completed,
-    Failed,
-    Cancelled,
-}
 
 // Kept as a small pure helper so terminals without Braille support can use the
 // ASCII sequence without changing the live row or layout.
@@ -2344,23 +2240,23 @@ fn begin_thinking(app: &mut App) {
     // Anchor the single live row before the next entry. TextDelta will append
     // that assistant entry at the same index, so the row never moves.
     app.invalidate_output_layout();
-    app.thinking_active = true;
-    app.thinking_last_line = "模型正在思考".into();
-    app.thinking_buffer.clear();
-    app.thinking_buffer_truncated = false;
-    app.thinking_animation_frame = 0;
-    app.thinking_anchor = Some(app.entries.len());
-    app.thinking_expanded = false;
+    app.current.thinking_active = true;
+    app.current.thinking_last_line = "模型正在思考".into();
+    app.current.thinking_buffer.clear();
+    app.current.thinking_buffer_truncated = false;
+    app.current.thinking_animation_frame = 0;
+    app.current.thinking_anchor = Some(app.current.entries.len());
+    app.current.thinking_expanded = false;
 }
 
 fn finish_thinking(app: &mut App, line: &str) {
-    app.thinking_active = false;
-    app.thinking_animation_frame = 0;
+    app.current.thinking_active = false;
+    app.current.thinking_animation_frame = 0;
     persist_thinking_summary(app);
     match line {
-        "思考失败" => app.thinking_result = ThinkingResult::Failed,
-        "思考已取消" => app.thinking_result = ThinkingResult::Cancelled,
-        _ => app.thinking_result = ThinkingResult::Completed,
+        "思考失败" => app.current.thinking_result = ThinkingResult::Failed,
+        "思考已取消" => app.current.thinking_result = ThinkingResult::Cancelled,
+        _ => app.current.thinking_result = ThinkingResult::Completed,
     }
 }
 
@@ -2368,12 +2264,12 @@ fn finish_thinking(app: &mut App, line: &str) {
 /// thinking round is kept in the task stream instead of being overwritten by
 /// the next round. The live row is then retired (anchor cleared).
 fn persist_thinking_summary(app: &mut App) {
-    let truncated = app.thinking_buffer_truncated;
-    let reasoning = app.thinking_buffer.trim().to_owned();
-    app.thinking_buffer.clear();
-    app.thinking_last_line.clear();
-    app.thinking_anchor = None;
-    app.thinking_buffer_truncated = false;
+    let truncated = app.current.thinking_buffer_truncated;
+    let reasoning = app.current.thinking_buffer.trim().to_owned();
+    app.current.thinking_buffer.clear();
+    app.current.thinking_last_line.clear();
+    app.current.thinking_anchor = None;
+    app.current.thinking_buffer_truncated = false;
     if reasoning.is_empty() {
         return;
     }
@@ -2395,39 +2291,42 @@ fn persist_thinking_summary(app: &mut App) {
 }
 
 fn reset_thinking_state(app: &mut App) {
-    app.thinking_active = false;
-    app.thinking_last_line.clear();
-    app.thinking_buffer.clear();
-    app.thinking_buffer_truncated = false;
-    app.thinking_animation_frame = 0;
-    app.thinking_anchor = None;
-    app.thinking_result = ThinkingResult::Completed;
+    app.current.thinking_active = false;
+    app.current.thinking_last_line.clear();
+    app.current.thinking_buffer.clear();
+    app.current.thinking_buffer_truncated = false;
+    app.current.thinking_animation_frame = 0;
+    app.current.thinking_anchor = None;
+    app.current.thinking_result = ThinkingResult::Completed;
 }
 
 fn update_thinking_line(app: &mut App, delta: &str) {
-    app.thinking_active = true;
-    app.thinking_buffer.push_str(delta);
-    if app.thinking_buffer.len() > MAX_THINKING_BUFFER_BYTES {
+    app.current.thinking_active = true;
+    app.current.thinking_buffer.push_str(delta);
+    if app.current.thinking_buffer.len() > MAX_THINKING_BUFFER_BYTES {
         let minimum = app
+            .current
             .thinking_buffer
             .len()
             .saturating_sub(MAX_THINKING_BUFFER_BYTES);
         let start = app
+            .current
             .thinking_buffer
             .grapheme_indices(true)
             .map(|(offset, _)| offset)
             .find(|offset| *offset >= minimum)
-            .unwrap_or(app.thinking_buffer.len());
-        app.thinking_buffer.drain(..start);
-        app.thinking_buffer_truncated = true;
+            .unwrap_or(app.current.thinking_buffer.len());
+        app.current.thinking_buffer.drain(..start);
+        app.current.thinking_buffer_truncated = true;
     }
     let latest = app
+        .current
         .thinking_buffer
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("思考中");
-    app.thinking_last_line = utf8_tail(latest, MAX_THINKING_LINE_BYTES).to_owned();
+    app.current.thinking_last_line = utf8_tail(latest, MAX_THINKING_LINE_BYTES).to_owned();
 }
 
 fn utf8_tail(value: &str, max_bytes: usize) -> &str {
@@ -2448,8 +2347,8 @@ fn resolve_approval(app: &mut App, approved: bool) {
         match approval.action {
             ApprovalAction::Agent(reply) => {
                 let _ = reply.send(approved);
-                app.agent_phase = AgentPhase::Thinking;
-                app.model_phase = ModelPhase::Idle;
+                app.current.agent_phase = AgentPhase::Thinking;
+                app.current.model_phase = ModelPhase::Idle;
                 app.status = if approved {
                     "已批准，开始执行工具……".into()
                 } else {
@@ -2459,13 +2358,13 @@ fn resolve_approval(app: &mut App, approved: bool) {
             ApprovalAction::Shell(command) => {
                 if approved {
                     let registry = app.registry.clone();
-                    let events = app.agent_tx.clone();
+                    let events = app.current.agent_tx.clone();
                     let command_for_event = command.clone();
-                    app.busy = true;
-                    app.agent_phase = AgentPhase::ToolRunning;
-                    app.model_phase = ModelPhase::Idle;
+                    app.current.busy = true;
+                    app.current.agent_phase = AgentPhase::ToolRunning;
+                    app.current.model_phase = ModelPhase::Idle;
                     app.status = "正在执行 Shell 命令…… | Esc 取消".into();
-                    app.active_task = Some(tokio::spawn(async move {
+                    app.current.active_task = Some(tokio::spawn(async move {
                         let result = registry
                             .execute_shell(&command)
                             .await
@@ -2483,7 +2382,7 @@ fn resolve_approval(app: &mut App, approved: bool) {
                         content: DisplayContent::Markdown("Shell 命令已拒绝。".into()),
                     });
                     app.status = "Shell 命令已拒绝".into();
-                    app.agent_phase = AgentPhase::Idle;
+                    app.current.agent_phase = AgentPhase::Idle;
                 }
             }
         }
@@ -2496,14 +2395,14 @@ fn request_shell_approval(app: &mut App, command: String) -> Result<()> {
         name: "terminal_shell".into(),
         arguments: serde_json::json!({ "command": command }),
     };
-    app.pending_approval = Some(PendingApproval {
+    app.current.pending_approval = Some(PendingApproval {
         call,
         reason: "! 命令将通过 workspace Shell 执行".into(),
         action: ApprovalAction::Shell(command),
         created_at: Instant::now(),
     });
-    app.agent_phase = AgentPhase::WaitingApproval;
-    app.model_phase = ModelPhase::Idle;
+    app.current.agent_phase = AgentPhase::WaitingApproval;
+    app.current.model_phase = ModelPhase::Idle;
     app.status = "Shell 命令需要确认".into();
     Ok(())
 }
@@ -2520,7 +2419,8 @@ fn next_mode(mode: AgentMode) -> AgentMode {
     match mode {
         AgentMode::Build => AgentMode::Plan,
         AgentMode::Plan => AgentMode::Explore,
-        AgentMode::Explore => AgentMode::Build,
+        AgentMode::Explore => AgentMode::Cluster,
+        AgentMode::Cluster => AgentMode::Build,
     }
 }
 
@@ -2529,10 +2429,12 @@ fn next_mode(mode: AgentMode) -> AgentMode {
 /// tool permissions, persistence, and clears the provider response id so the
 /// next request uses the new mode contract.
 fn switch_mode(app: &mut App, mode: AgentMode) -> Result<()> {
-    app.mode = mode;
+    app.current.mode = mode;
     app.registry.set_mode(mode);
-    let _ = app.storage.set_session_mode(&app.session_id, mode.as_str());
-    app.storage.clear_response_id(&app.session_id)?;
+    let _ = app
+        .storage
+        .set_session_mode(&app.current.session_id, mode.as_str());
+    app.storage.clear_response_id(&app.current.session_id)?;
     app.status = format!("模式已切换为 {}", mode.as_str().to_ascii_uppercase());
     Ok(())
 }
@@ -2557,83 +2459,158 @@ fn session_switch_direction(key: &crossterm::event::KeyEvent) -> Option<i32> {
 
 fn switch_session(app: &mut App, direction: i32) -> Result<()> {
     refresh_sessions(app)?;
-    let rows = ui::flatten_session_tree(&app.sessions, &app.collapsed_sessions);
+    let rows = ui::flatten_session_tree(&app.sessions, &app.expanded_sessions);
     if rows.len() < 2 {
         app.status = "当前只有一个会话 | Ctrl+N 新建会话".into();
         return Ok(());
     }
     let current = rows
         .iter()
-        .position(|row| row.id == app.session_id)
+        .position(|row| row.id == app.current.session_id)
         .unwrap_or(0) as i32;
     let next = (current + direction).rem_euclid(rows.len() as i32) as usize;
     let session_id = rows[next].id.clone();
     activate_session(app, session_id)
 }
 
-fn activate_session(app: &mut App, session_id: String) -> Result<()> {
-    let mut conversation = app.storage.load_messages(&session_id)?;
+/// Builds a fresh `SessionRuntime` for the given session: loads its messages,
+/// resolves provider/model (child sessions override the global default), and
+/// spawns an event forwarder that routes its agent events to the router.
+fn build_runtime(
+    storage: &Storage,
+    config: &Config,
+    registry: &Arc<ToolRegistry>,
+    router_tx: &mpsc::Sender<RoutedEvent>,
+    active_secret: Option<&(ProviderPreset, String)>,
+    session_id: &str,
+) -> SessionRuntime {
+    let mut conversation = storage.load_messages(session_id).unwrap_or_default();
     trim_conversation(&mut conversation);
-    app.invalidate_output_layout();
     let entries = display_entries(&conversation);
-    app.mode = app
-        .storage
-        .session_mode(&session_id)
+    let mode = storage
+        .session_mode(session_id)
         .ok()
         .and_then(|value| AgentMode::parse(&value))
         .unwrap_or_default();
-    app.registry.set_mode(app.mode);
-    let provider_config = app
-        .storage
-        .session_provider_model(&session_id)
+    let provider_config = storage
+        .session_provider_model(session_id)
         .ok()
         .and_then(|(provider_id, model)| {
+            let model = model.trim();
+            if model.is_empty() {
+                return None;
+            }
             ProviderPreset::parse(&provider_id).map(|preset| {
-                let mut config = app.config.provider.clone();
+                let mut config = config.provider.clone();
                 config.preset = preset;
-                config.model = model;
+                config.model = model.to_owned();
                 config.normalize_thinking();
                 config
             })
         })
-        .unwrap_or_else(|| app.config.provider.clone());
-    let runner = if let Some((_, api_key)) = &app.active_secret {
-        let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())?;
-        Some(AgentRunner::new(
-            provider,
-            provider_config.clone(),
-            app.registry.clone(),
-            app.storage.clone(),
-            session_id.clone(),
-        ))
-    } else {
-        None
-    };
+        .unwrap_or_else(|| config.provider.clone());
+    let runner = active_secret
+        .filter(|(preset, _)| *preset == provider_config.preset)
+        .and_then(|(_, api_key)| {
+            OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())
+                .ok()
+                .map(|provider| {
+                    AgentRunner::new(
+                        provider,
+                        provider_config.clone(),
+                        registry.clone(),
+                        storage.clone(),
+                        session_id.to_owned(),
+                    )
+                })
+        });
+    let (agent_tx, agent_rx) = mpsc::channel(128);
+    let router = router_tx.clone();
+    let sid = session_id.to_owned();
+    tokio::spawn(async move {
+        let mut receiver = agent_rx;
+        while let Some(event) = receiver.recv().await {
+            if router
+                .send(RoutedEvent {
+                    session_id: sid.clone(),
+                    event,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    SessionRuntime {
+        session_id: session_id.to_owned(),
+        entries,
+        busy: false,
+        agent_phase: AgentPhase::Idle,
+        model_phase: ModelPhase::Idle,
+        thinking_last_line: String::new(),
+        thinking_active: false,
+        thinking_buffer: String::new(),
+        thinking_buffer_truncated: false,
+        thinking_animation_frame: 0,
+        thinking_anchor: None,
+        thinking_result: ThinkingResult::Completed,
+        usage: Usage::default(),
+        context_used_tokens: estimate_context_tokens(&conversation),
+        context_limit_tokens: provider_config.resolved_context_window_tokens(),
+        pending_approval: None,
+        mode,
+        expanded_tools: HashSet::new(),
+        expanded_thinking: HashSet::new(),
+        thinking_expanded: false,
+        message_scroll: 0,
+        follow_output: true,
+        output_scroll_top: None,
+        output_selection: None,
+        message_layout: None,
+        output_layout_dirty: true,
+        #[cfg(test)]
+        output_layout_rebuild_count: 0,
+        #[cfg(test)]
+        markdown_parse_count: 0,
+        #[cfg(test)]
+        footer_rebuild_count: 0,
+        edge_scroll: EdgeScroll::default(),
+        conversation,
+        runner,
+        agent_tx,
+        active_task: None,
+    }
+}
 
-    app.session_id = session_id;
-    app.conversation = conversation;
-    app.entries = entries;
+fn activate_session(app: &mut App, session_id: String) -> Result<()> {
+    if session_id == app.active_session {
+        return Ok(());
+    }
+    // Pull the target runtime from the background (preserving any in-flight
+    // agent state) or build it fresh; the current runtime is parked so its
+    // agent keeps running in the background.
+    let active_secret = app.active_secret.clone();
+    let target = app.background.remove(&session_id).unwrap_or_else(|| {
+        build_runtime(
+            &app.storage,
+            &app.config,
+            &app.registry,
+            &app.router_tx,
+            active_secret.as_ref(),
+            &session_id,
+        )
+    });
+    let old_id = app.active_session.clone();
+    let old = std::mem::replace(&mut app.current, target);
+    app.background.insert(old_id, old);
+    app.active_session = session_id;
+    app.registry.set_mode(app.current.mode);
     app.input.clear();
     app.file_suggestions.clear();
-    app.expanded_tools.clear();
-    app.expanded_thinking.clear();
-    app.clear_output_selection();
-    app.message_scroll = 0;
-    app.follow_output = true;
-    app.output_scroll_top = None;
-    app.usage = Usage::default();
-    app.context_used_tokens = estimate_context_tokens(&app.conversation);
-    app.context_limit_tokens = provider_config.resolved_context_window_tokens();
-    app.agent_phase = AgentPhase::Idle;
-    app.model_phase = ModelPhase::Idle;
-    reset_thinking_state(app);
-    app.runner = runner;
-    app.status = if app.runner.is_some() {
-        format!(
-            "就绪 | {} | {}",
-            provider_config.preset.label(),
-            provider_config.model
-        )
+    app.invalidate_output_layout();
+    app.status = if app.current.runner.is_some() {
+        "就绪".into()
     } else {
         "需要配置提供商".into()
     };
@@ -2762,12 +2739,15 @@ fn trim_entries(entries: &mut Vec<DisplayEntry>) -> usize {
 fn trim_app_entries(app: &mut App) {
     const MAX_ENTRIES: usize = 1000;
     const MAX_BYTES: usize = 2 * 1024 * 1024;
-    if app.entries.len() <= MAX_ENTRIES && display_entry_bytes(&app.entries) <= MAX_BYTES {
+    if app.current.entries.len() <= MAX_ENTRIES
+        && display_entry_bytes(&app.current.entries) <= MAX_BYTES
+    {
         return;
     }
     app.invalidate_output_layout();
-    let removed = trim_entries(&mut app.entries);
-    app.thinking_anchor = app
+    let removed = trim_entries(&mut app.current.entries);
+    app.current.thinking_anchor = app
+        .current
         .thinking_anchor
         .map(|anchor| anchor.saturating_sub(removed));
     app.clear_output_selection();
@@ -2846,10 +2826,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn next_mode_cycles_in_build_plan_explore_order() {
+    fn next_mode_cycles_in_build_plan_explore_cluster_order() {
         assert_eq!(next_mode(AgentMode::Build), AgentMode::Plan);
         assert_eq!(next_mode(AgentMode::Plan), AgentMode::Explore);
-        assert_eq!(next_mode(AgentMode::Explore), AgentMode::Build);
+        assert_eq!(next_mode(AgentMode::Explore), AgentMode::Cluster);
+        assert_eq!(next_mode(AgentMode::Cluster), AgentMode::Build);
     }
 
     #[test]
@@ -2857,16 +2838,21 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         app.storage
-            .save_response_id(&app.session_id, "stale-response")
+            .save_response_id(&app.current.session_id, "stale-response")
             .unwrap();
         switch_mode(&mut app, AgentMode::Explore).unwrap();
-        assert_eq!(app.mode, AgentMode::Explore);
+        assert_eq!(app.current.mode, AgentMode::Explore);
         assert!(app.status.contains("EXPLORE"));
         assert_eq!(
-            app.storage.session_mode(&app.session_id).unwrap(),
+            app.storage.session_mode(&app.current.session_id).unwrap(),
             AgentMode::Explore.as_str()
         );
-        assert!(app.storage.response_id(&app.session_id).unwrap().is_none());
+        assert!(
+            app.storage
+                .response_id(&app.current.session_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2982,24 +2968,51 @@ mod tests {
     fn execute_leader_action_mode_uses_next_mode() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        assert_eq!(app.mode, AgentMode::Build);
+        assert_eq!(app.current.mode, AgentMode::Build);
         execute_leader_action(&mut app, LeaderAction::Mode).unwrap();
-        assert_eq!(app.mode, AgentMode::Plan);
+        assert_eq!(app.current.mode, AgentMode::Plan);
     }
 
     #[test]
-    fn cluster_command_toggles_mode() {
+    fn cluster_command_switches_to_cluster_mode() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        assert!(!app.cluster_mode);
-        execute_command(&mut app, Command::Cluster).unwrap();
-        assert!(app.cluster_mode);
-        execute_command(&mut app, Command::Cluster).unwrap();
-        assert!(!app.cluster_mode);
+        assert_eq!(app.current.mode, AgentMode::Build);
+        execute_command(&mut app, Command::Mode(AgentMode::Cluster)).unwrap();
+        assert_eq!(app.current.mode, AgentMode::Cluster);
     }
 
-    #[test]
-    fn leader_mouse_click_executes_action_and_outside_cancels() {
+    #[tokio::test]
+    async fn activate_session_keeps_global_model_when_session_model_is_empty() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.config.provider.preset = ProviderPreset::DeepSeek;
+        app.config.provider.model = "deepseek-v4-flash".into();
+        let new_session = app.storage.create_session(&app.workspace).unwrap();
+        activate_session(&mut app, new_session).unwrap();
+        // A regular session stores an empty model; it must fall back to the
+        // global DeepSeek model (deepseek-v4-flash window) rather than "".
+        assert_eq!(app.current.context_limit_tokens, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn switching_session_parks_runtime_and_switches_back() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let old_session = app.active_session.clone();
+        let new_session = app.storage.create_session(&app.workspace).unwrap();
+
+        activate_session(&mut app, new_session.clone()).unwrap();
+        assert_eq!(app.active_session, new_session);
+        assert!(app.background.contains_key(&old_session));
+
+        activate_session(&mut app, old_session.clone()).unwrap();
+        assert_eq!(app.active_session, old_session);
+        assert!(app.background.contains_key(&new_session));
+    }
+
+    #[tokio::test]
+    async fn leader_mouse_click_executes_action_and_outside_cancels() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         app.leader_pending = true;
@@ -3033,14 +3046,16 @@ mod tests {
     }
 
     fn thinking_summary_count(app: &App) -> usize {
-        app.entries
+        app.current
+            .entries
             .iter()
             .filter(|entry| matches!(entry.kind, DisplayKind::Thinking))
             .count()
     }
 
     fn last_thinking_summary(app: &App) -> Option<&str> {
-        app.entries
+        app.current
+            .entries
             .iter()
             .rev()
             .find(|entry| matches!(entry.kind, DisplayKind::Thinking))
@@ -3061,15 +3076,14 @@ mod tests {
             config.runtime.clone(),
             config.security.allow_private_networks,
         ));
-        let (agent_tx, agent_rx) = mpsc::channel(8);
-        App {
-            workspace,
-            input: InputBuffer::new(),
+        let (agent_tx, _agent_rx) = mpsc::channel(8);
+        let (router_tx, router_rx) = mpsc::channel(16);
+        let runtime = SessionRuntime {
+            session_id: session_id.clone(),
             entries: vec![DisplayEntry {
                 kind: DisplayKind::Assistant,
                 content: DisplayContent::Markdown("first line\n\n中文 🙂 long output".into()),
             }],
-            status: String::new(),
             busy: false,
             agent_phase: AgentPhase::Idle,
             model_phase: ModelPhase::Idle,
@@ -3083,16 +3097,34 @@ mod tests {
             usage: Usage::default(),
             context_used_tokens: 1,
             context_limit_tokens: None,
-            context_meter_enabled: false,
             pending_approval: None,
-            settings: None,
-            palette: None,
             mode: AgentMode::default(),
-            cluster_mode: false,
-            leader_pending: false,
             expanded_tools: HashSet::new(),
             expanded_thinking: HashSet::new(),
             thinking_expanded: false,
+            message_scroll: 0,
+            follow_output: true,
+            output_scroll_top: None,
+            output_selection: None,
+            message_layout: None,
+            output_layout_dirty: true,
+            output_layout_rebuild_count: 0,
+            markdown_parse_count: 0,
+            footer_rebuild_count: 0,
+            edge_scroll: EdgeScroll::default(),
+            conversation: Vec::new(),
+            runner: None,
+            agent_tx,
+            active_task: None,
+        };
+        App {
+            workspace,
+            input: InputBuffer::new(),
+            status: String::new(),
+            context_meter_enabled: false,
+            settings: None,
+            palette: None,
+            leader_pending: false,
             thinking_menu_open: false,
             thinking_control_rect: None,
             thinking_menu_rect: None,
@@ -3106,28 +3138,17 @@ mod tests {
             layout_restore_anchor: None,
             file_suggestions: Vec::new(),
             file_selected: 0,
-            message_scroll: 0,
-            follow_output: true,
-            output_scroll_top: None,
-            output_selection: None,
-            message_layout: None,
-            output_layout_dirty: true,
-            output_layout_rebuild_count: 0,
-            markdown_parse_count: 0,
-            footer_rebuild_count: 0,
-            edge_scroll: EdgeScroll::default(),
-            session_id,
             sessions,
-            collapsed_sessions: HashSet::new(),
-            conversation: Vec::new(),
+            expanded_sessions: HashSet::new(),
             storage,
             config,
             registry,
-            runner: None,
             active_secret: None,
-            agent_tx,
-            agent_rx,
-            active_task: None,
+            active_session: session_id,
+            current: runtime,
+            background: HashMap::new(),
+            router_tx,
+            router_rx,
             should_quit: false,
         }
     }
@@ -3157,17 +3178,17 @@ mod tests {
         let mut app = test_app(&temp);
         assert_eq!(activity_view(&app).state, ActivityState::Idle);
 
-        app.agent_phase = AgentPhase::StreamingText;
+        app.current.agent_phase = AgentPhase::StreamingText;
         assert_eq!(activity_view(&app).text, "正在生成回复");
-        app.agent_phase = AgentPhase::Thinking;
+        app.current.agent_phase = AgentPhase::Thinking;
         assert_eq!(activity_view(&app).text, "正在思考");
-        app.agent_phase = AgentPhase::ToolRunning;
+        app.current.agent_phase = AgentPhase::ToolRunning;
         assert!(activity_view(&app).text.starts_with("正在执行："));
-        app.agent_phase = AgentPhase::Failed;
+        app.current.agent_phase = AgentPhase::Failed;
         assert_eq!(activity_view(&app).state, ActivityState::Failed);
 
         let (reply, _receiver) = oneshot::channel();
-        app.pending_approval = Some(PendingApproval {
+        app.current.pending_approval = Some(PendingApproval {
             call: ToolCall {
                 id: "approval".into(),
                 name: "file_write".into(),
@@ -3196,8 +3217,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         app.context_meter_enabled = true;
-        app.context_used_tokens = 87_000;
-        app.context_limit_tokens = Some(258_000);
+        app.current.context_used_tokens = 87_000;
+        app.current.context_limit_tokens = Some(258_000);
 
         let wide = render_screen(&mut app, 120, 30);
         assert!(wide[28].contains('○'));
@@ -3208,8 +3229,8 @@ mod tests {
         assert!(wide[29].contains("87k/258k"));
         assert!(wide.iter().any(|line| line.contains("Alt+Up/Down")));
 
-        app.busy = true;
-        app.agent_phase = AgentPhase::Thinking;
+        app.current.busy = true;
+        app.current.agent_phase = AgentPhase::Thinking;
         let narrow = render_screen(&mut app, 60, 20);
         assert!(narrow[18].contains('●'));
         assert!(narrow[18].contains("Esc"));
@@ -3231,8 +3252,8 @@ mod tests {
         app.config.provider = ProviderPreset::DeepSeek.defaults();
         app.config.provider.model = "tenant-deepseek-v4-flash-long-deployment-name".into();
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 60, 12));
-        let rebuilds = app.output_layout_rebuild_count;
-        let parses = app.markdown_parse_count;
+        let rebuilds = app.current.output_layout_rebuild_count;
+        let parses = app.current.markdown_parse_count;
         let screen = render_screen(&mut app, 60, 20);
         assert!(screen[19].contains("high ▾"));
         let control = app.thinking_control_rect.unwrap();
@@ -3271,10 +3292,10 @@ mod tests {
         assert_eq!(app.thinking_level(), ThinkingLevel::Max);
         assert!(!app.thinking_menu_open);
         assert!(app.status.contains("配置保存失败"));
-        assert_eq!(app.output_layout_rebuild_count, rebuilds);
-        assert_eq!(app.markdown_parse_count, parses);
+        assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
+        assert_eq!(app.current.markdown_parse_count, parses);
 
-        app.busy = true;
+        app.current.busy = true;
         render_screen(&mut app, 60, 20);
         let control = app.thinking_control_rect.unwrap();
         handle_terminal_event(&mut app, click(control.x, control.y))
@@ -3314,7 +3335,7 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let mut app = test_app(&temp);
             let (reply, _receiver) = oneshot::channel();
-            app.pending_approval = Some(PendingApproval {
+            app.current.pending_approval = Some(PendingApproval {
                 call: ToolCall {
                     id: "approval".into(),
                     name: "file_write".into(),
@@ -3325,7 +3346,7 @@ mod tests {
                 created_at: Instant::now(),
             });
             resolve_approval(&mut app, approved);
-            assert!(app.pending_approval.is_none());
+            assert!(app.current.pending_approval.is_none());
             assert!(app.force_full_redraw);
         }
 
@@ -3338,7 +3359,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         let (reply, _receiver) = oneshot::channel();
-        app.pending_approval = Some(PendingApproval {
+        app.current.pending_approval = Some(PendingApproval {
             call: ToolCall {
                 id: "cancel".into(),
                 name: "file_write".into(),
@@ -3352,7 +3373,7 @@ mod tests {
         assert!(app.force_full_redraw);
 
         let (reply, _receiver) = oneshot::channel();
-        app.pending_approval = Some(PendingApproval {
+        app.current.pending_approval = Some(PendingApproval {
             call: ToolCall {
                 id: "event-cancel".into(),
                 name: "file_write".into(),
@@ -3372,7 +3393,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         let (reply, _receiver) = oneshot::channel();
-        app.pending_approval = Some(PendingApproval {
+        app.current.pending_approval = Some(PendingApproval {
             call: ToolCall {
                 id: "approval".into(),
                 name: "file_write".into(),
@@ -3423,15 +3444,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         render_screen(&mut app, 80, 20);
-        let layout_rebuilds = app.output_layout_rebuild_count;
-        let markdown_parses = app.markdown_parse_count;
-        let footer_rebuilds = app.footer_rebuild_count;
+        let layout_rebuilds = app.current.output_layout_rebuild_count;
+        let markdown_parses = app.current.markdown_parse_count;
+        let footer_rebuilds = app.current.footer_rebuild_count;
 
         app.status = "仅 Footer 变化".into();
         render_screen(&mut app, 80, 20);
-        assert_eq!(app.output_layout_rebuild_count, layout_rebuilds);
-        assert_eq!(app.markdown_parse_count, markdown_parses);
-        assert_eq!(app.footer_rebuild_count, footer_rebuilds + 1);
+        assert_eq!(app.current.output_layout_rebuild_count, layout_rebuilds);
+        assert_eq!(app.current.markdown_parse_count, markdown_parses);
+        assert_eq!(app.current.footer_rebuild_count, footer_rebuilds + 1);
     }
 
     #[test]
@@ -3439,8 +3460,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         app.context_meter_enabled = true;
-        app.context_used_tokens = 87_000;
-        app.context_limit_tokens = Some(258_000);
+        app.current.context_used_tokens = 87_000;
+        app.current.context_limit_tokens = Some(258_000);
         app.config.provider.model = "a-very-long-model-name-that-must-not-cover-context".into();
         let screen = render_screen(&mut app, 70, 20);
         assert!(screen[19].contains("33%"));
@@ -3458,7 +3479,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         let (reply, _receiver) = oneshot::channel();
-        app.pending_approval = Some(PendingApproval {
+        app.current.pending_approval = Some(PendingApproval {
             call: ToolCall {
                 id: "approval-screen".into(),
                 name: "file_write".into(),
@@ -3473,10 +3494,10 @@ mod tests {
         assert!(approval[22].contains('Y'));
         assert!(approval[22].contains('N'));
         assert!(approval[23].contains("src/ui.rs"));
-        app.pending_approval = None;
+        app.current.pending_approval = None;
 
-        app.agent_phase = AgentPhase::ToolRunning;
-        app.entries.push(DisplayEntry {
+        app.current.agent_phase = AgentPhase::ToolRunning;
+        app.current.entries.push(DisplayEntry {
             kind: DisplayKind::Tool,
             content: DisplayContent::Tool(ToolDisplay {
                 call_id: "running-screen".into(),
@@ -3491,18 +3512,18 @@ mod tests {
         assert!(tool[22].contains('●'));
         assert!(tool.iter().any(|line| line.contains("src/app.rs")));
 
-        app.agent_phase = AgentPhase::Failed;
+        app.current.agent_phase = AgentPhase::Failed;
         let failed = render_screen(&mut app, 100, 24);
         assert!(failed[22].contains('×'));
 
         app.context_meter_enabled = true;
-        app.context_limit_tokens = Some(100);
+        app.current.context_limit_tokens = Some(100);
         for (used, role) in [
             (70, VisualRole::Secondary),
             (85, VisualRole::Warning),
             (95, VisualRole::Danger),
         ] {
-            app.context_used_tokens = used;
+            app.current.context_used_tokens = used;
             let view = UiViewModel::from_app(&app, Density::Wide, HeightClass::Normal, 100);
             assert_eq!(view.footer.secondary.as_ref().unwrap().right[0].role, role);
             let screen = render_screen(&mut app, 100, 24);
@@ -3639,10 +3660,10 @@ mod tests {
         let mut app = test_app(&temp);
         let viewport = Rect::new(0, 0, 8, 3);
         crate::ui::update_message_layout(&mut app, viewport);
-        assert_eq!(app.output_layout_rebuild_count, 1);
-        let markdown_parses = app.markdown_parse_count;
+        assert_eq!(app.current.output_layout_rebuild_count, 1);
+        let markdown_parses = app.current.markdown_parse_count;
 
-        let layout = app.message_layout.as_ref().unwrap();
+        let layout = app.current.message_layout.as_ref().unwrap();
         let text_ptr = layout.text.as_ptr();
         let lines_ptr = layout.lines.as_ptr();
         let visual_lines_ptr = layout.visual_lines.as_ptr();
@@ -3653,9 +3674,9 @@ mod tests {
         scroll_messages(&mut app, -1);
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 8, 5));
 
-        let layout = app.message_layout.as_ref().unwrap();
-        assert_eq!(app.output_layout_rebuild_count, 1);
-        assert_eq!(app.markdown_parse_count, markdown_parses);
+        let layout = app.current.message_layout.as_ref().unwrap();
+        assert_eq!(app.current.output_layout_rebuild_count, 1);
+        assert_eq!(app.current.markdown_parse_count, markdown_parses);
         assert_eq!(layout.text.as_ptr(), text_ptr);
         assert_eq!(layout.lines.as_ptr(), lines_ptr);
         assert_eq!(layout.visual_lines.as_ptr(), visual_lines_ptr);
@@ -3668,15 +3689,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 8, 3));
-        let text_ptr = app.message_layout.as_ref().unwrap().text.as_ptr();
-        let lines_ptr = app.message_layout.as_ref().unwrap().lines.as_ptr();
-        let markdown_parses = app.markdown_parse_count;
+        let text_ptr = app.current.message_layout.as_ref().unwrap().text.as_ptr();
+        let lines_ptr = app.current.message_layout.as_ref().unwrap().lines.as_ptr();
+        let markdown_parses = app.current.markdown_parse_count;
 
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 16, 3));
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 16, 3));
-        let layout = app.message_layout.as_ref().unwrap();
-        assert_eq!(app.output_layout_rebuild_count, 2);
-        assert_eq!(app.markdown_parse_count, markdown_parses);
+        let layout = app.current.message_layout.as_ref().unwrap();
+        assert_eq!(app.current.output_layout_rebuild_count, 2);
+        assert_eq!(app.current.markdown_parse_count, markdown_parses);
         assert_eq!(layout.text.as_ptr(), text_ptr);
         assert_eq!(layout.lines.as_ptr(), lines_ptr);
     }
@@ -3688,12 +3709,19 @@ mod tests {
         let viewport = Rect::new(0, 0, 20, 4);
         crate::ui::update_message_layout(&mut app, viewport);
         handle_agent_event(&mut app, AgentEvent::TextDelta(" NEW".into()));
-        assert!(app.output_layout_dirty);
-        assert!(app.message_layout.is_none());
+        assert!(app.current.output_layout_dirty);
+        assert!(app.current.message_layout.is_none());
 
         crate::ui::update_message_layout(&mut app, viewport);
-        assert_eq!(app.output_layout_rebuild_count, 2);
-        assert!(app.message_layout.as_ref().unwrap().text.contains("NEW"));
+        assert_eq!(app.current.output_layout_rebuild_count, 2);
+        assert!(
+            app.current
+                .message_layout
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("NEW")
+        );
     }
 
     #[test]
@@ -3702,15 +3730,15 @@ mod tests {
         let mut app = test_app(&temp);
         let viewport = Rect::new(0, 0, 20, 4);
         crate::ui::update_message_layout(&mut app, viewport);
-        let entries = app.entries.len();
-        let stored = app.storage.load_messages(&app.session_id).unwrap();
-        let layout_text = app.message_layout.as_ref().unwrap().text.clone();
+        let entries = app.current.entries.len();
+        let stored = app.storage.load_messages(&app.current.session_id).unwrap();
+        let layout_text = app.current.message_layout.as_ref().unwrap().text.clone();
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        assert!(app.thinking_active);
-        assert_eq!(app.thinking_last_line, "模型正在思考");
+        assert!(app.current.thinking_active);
+        assert_eq!(app.current.thinking_last_line, "模型正在思考");
         crate::ui::update_message_layout(&mut app, viewport);
-        let rebuilds = app.output_layout_rebuild_count;
-        let markdown_parses = app.markdown_parse_count;
+        let rebuilds = app.current.output_layout_rebuild_count;
+        let markdown_parses = app.current.markdown_parse_count;
         handle_agent_event(
             &mut app,
             AgentEvent::ReasoningDelta("第一行\n\n最新".into()),
@@ -3722,23 +3750,30 @@ mod tests {
         crate::ui::update_message_layout(&mut app, viewport);
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta("一行".into()));
 
-        assert_eq!(app.thinking_last_line, "最新一行");
+        assert_eq!(app.current.thinking_last_line, "最新一行");
         assert_eq!(
             crate::ui::live_thinking_line_with_braille(&app, true),
             "⠋ 思考中  最新一行"
         );
         crate::ui::update_message_layout(&mut app, viewport);
-        assert_eq!(app.entries.len(), entries);
-        assert_eq!(app.storage.load_messages(&app.session_id).unwrap(), stored);
-        assert_eq!(app.message_layout.as_ref().unwrap().text, layout_text);
+        assert_eq!(app.current.entries.len(), entries);
+        assert_eq!(
+            app.storage.load_messages(&app.current.session_id).unwrap(),
+            stored
+        );
+        assert_eq!(
+            app.current.message_layout.as_ref().unwrap().text,
+            layout_text
+        );
         assert!(
-            !app.message_layout
+            !app.current
+                .message_layout
                 .as_ref()
                 .unwrap()
                 .text
                 .contains("最新一行")
         );
-        let layout = app.message_layout.as_ref().unwrap();
+        let layout = app.current.message_layout.as_ref().unwrap();
         let copied = layout
             .selected_text(OutputSelection {
                 anchor: 0,
@@ -3747,8 +3782,8 @@ mod tests {
             })
             .unwrap();
         assert!(!copied.contains("最新一行"));
-        assert_eq!(app.output_layout_rebuild_count, rebuilds);
-        assert_eq!(app.markdown_parse_count, markdown_parses);
+        assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
+        assert_eq!(app.current.markdown_parse_count, markdown_parses);
     }
 
     #[test]
@@ -3764,7 +3799,7 @@ mod tests {
                 arguments: serde_json::json!({"path":"Cargo.toml"}),
             }),
         );
-        assert!(app.thinking_anchor.is_none());
+        assert!(app.current.thinking_anchor.is_none());
         assert_eq!(thinking_summary_count(&app), 0);
     }
 
@@ -3776,9 +3811,9 @@ mod tests {
         let delta = format!("{}👩‍💻e\u{301}尾", "中文🙂".repeat(400));
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta(delta));
 
-        assert!(app.thinking_last_line.len() <= MAX_THINKING_LINE_BYTES);
-        assert!(app.thinking_last_line.ends_with("👩‍💻e\u{301}尾"));
-        assert!(!app.thinking_last_line.contains('\u{fffd}'));
+        assert!(app.current.thinking_last_line.len() <= MAX_THINKING_LINE_BYTES);
+        assert!(app.current.thinking_last_line.ends_with("👩‍💻e\u{301}尾"));
+        assert!(!app.current.thinking_last_line.contains('\u{fffd}'));
     }
 
     #[test]
@@ -3792,27 +3827,27 @@ mod tests {
             AgentEvent::ReasoningDelta("正在分析工具结果".into()),
         );
         handle_agent_event(&mut app, AgentEvent::TextDelta("answer".into()));
-        assert!(!app.thinking_active);
-        assert!(app.thinking_anchor.is_none());
-        assert_eq!(app.thinking_result, ThinkingResult::Completed);
+        assert!(!app.current.thinking_active);
+        assert!(app.current.thinking_anchor.is_none());
+        assert_eq!(app.current.thinking_result, ThinkingResult::Completed);
         assert_eq!(thinking_summary_count(&app), 1);
         assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("正在分析工具结果")));
 
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta("最后失败位置".into()));
         handle_agent_event(&mut app, AgentEvent::Failed("failed".into()));
-        assert!(!app.thinking_active);
-        assert!(app.thinking_anchor.is_none());
-        assert_eq!(app.thinking_result, ThinkingResult::Failed);
+        assert!(!app.current.thinking_active);
+        assert!(app.current.thinking_anchor.is_none());
+        assert_eq!(app.current.thinking_result, ThinkingResult::Failed);
         assert_eq!(thinking_summary_count(&app), 2);
         assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("最后失败位置")));
 
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta("取消前内容".into()));
         handle_agent_event(&mut app, AgentEvent::Cancelled("cancelled".into()));
-        assert!(!app.thinking_active);
-        assert!(app.thinking_anchor.is_none());
-        assert_eq!(app.thinking_result, ThinkingResult::Cancelled);
+        assert!(!app.current.thinking_active);
+        assert!(app.current.thinking_anchor.is_none());
+        assert_eq!(app.current.thinking_result, ThinkingResult::Cancelled);
         assert_eq!(thinking_summary_count(&app), 3);
         assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("取消前内容")));
     }
@@ -3841,13 +3876,14 @@ mod tests {
         crate::ui::update_message_layout(&mut app, viewport);
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
         crate::ui::update_message_layout(&mut app, viewport);
-        let rebuilds = app.output_layout_rebuild_count;
+        let rebuilds = app.current.output_layout_rebuild_count;
 
         for _ in 0..10 {
-            app.thinking_animation_frame = app.thinking_animation_frame.wrapping_add(1);
+            app.current.thinking_animation_frame =
+                app.current.thinking_animation_frame.wrapping_add(1);
             crate::ui::update_message_layout(&mut app, viewport);
         }
-        assert_eq!(app.output_layout_rebuild_count, rebuilds);
+        assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
     }
 
     #[test]
@@ -3863,7 +3899,7 @@ mod tests {
                 AgentEvent::ReasoningDelta(format!("第 {round} 轮")),
             );
             crate::ui::update_message_layout(&mut app, viewport);
-            let layout = app.message_layout.as_ref().unwrap();
+            let layout = app.current.message_layout.as_ref().unwrap();
             assert_eq!(layout.live_thinking_rows, 1);
             assert_eq!(
                 layout
@@ -3891,7 +3927,8 @@ mod tests {
         let viewport = Rect::new(0, 0, 20, 4);
         crate::ui::update_message_layout(&mut app, viewport);
         assert_eq!(
-            app.message_layout
+            app.current
+                .message_layout
                 .as_ref()
                 .unwrap()
                 .visual_lines
@@ -3907,11 +3944,11 @@ mod tests {
         });
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
         crate::ui::update_message_layout(&mut app, viewport);
-        let initial_rebuilds = app.output_layout_rebuild_count;
+        let initial_rebuilds = app.current.output_layout_rebuild_count;
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta("真实摘要".into()));
         crate::ui::update_message_layout(&mut app, viewport);
-        assert_eq!(app.output_layout_rebuild_count, initial_rebuilds);
-        let layout = app.message_layout.as_ref().unwrap();
+        assert_eq!(app.current.output_layout_rebuild_count, initial_rebuilds);
+        let layout = app.current.message_layout.as_ref().unwrap();
         let live_row = layout
             .visual_lines
             .iter()
@@ -3921,13 +3958,21 @@ mod tests {
 
         handle_agent_event(&mut app, AgentEvent::TextDelta("answer".into()));
         crate::ui::update_message_layout(&mut app, viewport);
-        assert_eq!(app.output_layout_rebuild_count, initial_rebuilds + 1);
         assert_eq!(
-            app.message_layout.as_ref().unwrap().live_thinking_before,
+            app.current.output_layout_rebuild_count,
+            initial_rebuilds + 1
+        );
+        assert_eq!(
+            app.current
+                .message_layout
+                .as_ref()
+                .unwrap()
+                .live_thinking_before,
             None
         );
         assert_eq!(
-            app.message_layout
+            app.current
+                .message_layout
                 .as_ref()
                 .unwrap()
                 .visual_lines
@@ -3936,7 +3981,7 @@ mod tests {
                 .count(),
             0
         );
-        assert!(app.thinking_anchor.is_none());
+        assert!(app.current.thinking_anchor.is_none());
         assert_eq!(thinking_summary_count(&app), 1);
         assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("真实摘要")));
     }
@@ -3959,7 +4004,7 @@ mod tests {
         crate::ui::update_message_layout(&mut app, viewport);
 
         for expected_count in [2, 3] {
-            let layout = app.message_layout.as_ref().unwrap();
+            let layout = app.current.message_layout.as_ref().unwrap();
             let target_row = layout
                 .visual_lines
                 .iter()
@@ -3983,9 +4028,9 @@ mod tests {
             };
             assert!(handle_output_mouse(&mut app, down).redraw);
             assert!(handle_output_mouse(&mut app, up).redraw);
-            assert!(app.output_layout_dirty);
+            assert!(app.current.output_layout_dirty);
             crate::ui::update_message_layout(&mut app, viewport);
-            assert_eq!(app.output_layout_rebuild_count, expected_count);
+            assert_eq!(app.current.output_layout_rebuild_count, expected_count);
         }
     }
 
@@ -4002,10 +4047,10 @@ mod tests {
         });
         let viewport = Rect::new(0, 0, 30, 30);
         crate::ui::update_message_layout(&mut app, viewport);
-        assert!(app.expanded_thinking.is_empty());
+        assert!(app.current.expanded_thinking.is_empty());
 
         for expected in [true, false] {
-            let layout = app.message_layout.as_ref().unwrap();
+            let layout = app.current.message_layout.as_ref().unwrap();
             let target_row = layout
                 .visual_lines
                 .iter()
@@ -4030,7 +4075,10 @@ mod tests {
             };
             handle_output_mouse(&mut app, down);
             handle_output_mouse(&mut app, up);
-            assert_eq!(app.expanded_thinking.contains("thinking-0"), expected);
+            assert_eq!(
+                app.current.expanded_thinking.contains("thinking-0"),
+                expected
+            );
             crate::ui::update_message_layout(&mut app, viewport);
         }
     }
@@ -4039,7 +4087,7 @@ mod tests {
     fn three_tools_render_as_one_group_and_keep_stable_expansion_ids() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        app.entries = ["file_read", "file_search", "file_write"]
+        app.current.entries = ["file_read", "file_search", "file_write"]
             .into_iter()
             .enumerate()
             .map(|(index, name)| DisplayEntry {
@@ -4055,7 +4103,7 @@ mod tests {
             .collect();
         app.invalidate_output_layout();
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 80, 20));
-        let layout = app.message_layout.as_ref().unwrap();
+        let layout = app.current.message_layout.as_ref().unwrap();
         assert_eq!(
             layout.text.lines().filter(|line| *line == "工具").count(),
             1
@@ -4068,16 +4116,16 @@ mod tests {
                 .count(),
             3
         );
-        app.expanded_tools.insert("call-1".into());
-        app.entries.insert(
+        app.current.expanded_tools.insert("call-1".into());
+        app.current.entries.insert(
             0,
             DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown("trim me".into()),
             },
         );
-        trim_entries(&mut app.entries);
-        assert!(app.expanded_tools.contains("call-1"));
+        trim_entries(&mut app.current.entries);
+        assert!(app.current.expanded_tools.contains("call-1"));
     }
 
     #[test]
@@ -4089,7 +4137,7 @@ mod tests {
             name: "file_read".into(),
             arguments: serde_json::json!({"path":"src/app.rs"}),
         };
-        let initial_len = app.entries.len();
+        let initial_len = app.current.entries.len();
         handle_agent_event(&mut app, AgentEvent::ToolStarted(call.clone()));
         handle_agent_event(
             &mut app,
@@ -4098,11 +4146,13 @@ mod tests {
                 result: "contents".into(),
             },
         );
-        assert_eq!(app.entries.len(), initial_len + 1);
-        assert!(matches!(app.entries.last().map(|entry| &entry.content),
+        assert_eq!(app.current.entries.len(), initial_len + 1);
+        assert!(
+            matches!(app.current.entries.last().map(|entry| &entry.content),
             Some(DisplayContent::Tool(tool))
                 if tool.status == ToolDisplayStatus::Completed
-                    && tool.result.as_deref() == Some("contents")));
+                    && tool.result.as_deref() == Some("contents"))
+        );
     }
 
     #[test]
@@ -4117,6 +4167,7 @@ mod tests {
         let viewport = Rect::new(0, 0, 80, 30);
         crate::ui::update_message_layout(&mut app, viewport);
         let thinking_row = app
+            .current
             .message_layout
             .as_ref()
             .unwrap()
@@ -4132,15 +4183,29 @@ mod tests {
         };
         handle_output_mouse(&mut app, click(MouseEventKind::Down(MouseButton::Left)));
         handle_output_mouse(&mut app, click(MouseEventKind::Up(MouseButton::Left)));
-        assert!(app.thinking_expanded);
+        assert!(app.current.thinking_expanded);
         crate::ui::update_message_layout(&mut app, viewport);
-        assert!(app.message_layout.as_ref().unwrap().live_thinking_rows >= 3);
+        assert!(
+            app.current
+                .message_layout
+                .as_ref()
+                .unwrap()
+                .live_thinking_rows
+                >= 3
+        );
 
         handle_output_mouse(&mut app, click(MouseEventKind::Down(MouseButton::Left)));
         handle_output_mouse(&mut app, click(MouseEventKind::Up(MouseButton::Left)));
-        assert!(!app.thinking_expanded);
+        assert!(!app.current.thinking_expanded);
         crate::ui::update_message_layout(&mut app, viewport);
-        assert_eq!(app.message_layout.as_ref().unwrap().live_thinking_rows, 1);
+        assert_eq!(
+            app.current
+                .message_layout
+                .as_ref()
+                .unwrap()
+                .live_thinking_rows,
+            1
+        );
     }
 
     #[test]
@@ -4158,7 +4223,7 @@ mod tests {
             }),
         });
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 80, 30));
-        let layout = app.message_layout.as_ref().unwrap();
+        let layout = app.current.message_layout.as_ref().unwrap();
         let row = layout
             .visual_lines
             .iter()
@@ -4191,7 +4256,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
         );
-        assert!(!app.expanded_tools.contains("drag-tool"));
+        assert!(!app.current.expanded_tools.contains("drag-tool"));
     }
 
     #[tokio::test]
@@ -4210,7 +4275,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!outcome.redraw);
-        assert!(app.expanded_tools.is_empty());
+        assert!(app.current.expanded_tools.is_empty());
     }
 
     #[test]
@@ -4222,31 +4287,31 @@ mod tests {
             &mut app,
             AgentEvent::ReasoningDelta(format!("第一行\n{}尾🙂", "中文👩‍💻".repeat(20_000))),
         );
-        assert!(app.thinking_buffer.len() <= MAX_THINKING_BUFFER_BYTES);
-        assert!(app.thinking_buffer_truncated);
-        assert!(app.thinking_buffer.ends_with("尾🙂"));
-        assert!(app.thinking_buffer.is_char_boundary(0));
-        app.thinking_expanded = true;
+        assert!(app.current.thinking_buffer.len() <= MAX_THINKING_BUFFER_BYTES);
+        assert!(app.current.thinking_buffer_truncated);
+        assert!(app.current.thinking_buffer.ends_with("尾🙂"));
+        assert!(app.current.thinking_buffer.is_char_boundary(0));
+        app.current.thinking_expanded = true;
         let lines = crate::ui::live_thinking_line_with_braille(&app, true);
         assert!(lines.contains("[较早思考内容已截断]"));
         assert!(lines.contains("尾🙂"));
     }
 
-    #[test]
-    fn clear_and_session_activation_invalidate_layout() {
+    #[tokio::test]
+    async fn clear_and_session_activation_invalidate_layout() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         let viewport = Rect::new(0, 0, 20, 4);
         crate::ui::update_message_layout(&mut app, viewport);
         execute_command(&mut app, Command::Clear).unwrap();
-        assert!(app.output_layout_dirty);
-        assert!(app.message_layout.is_none());
+        assert!(app.current.output_layout_dirty);
+        assert!(app.current.message_layout.is_none());
 
         crate::ui::update_message_layout(&mut app, viewport);
         let session_id = app.storage.create_session(&app.workspace).unwrap();
         activate_session(&mut app, session_id).unwrap();
-        assert!(app.output_layout_dirty);
-        assert!(app.message_layout.is_none());
+        assert!(app.current.output_layout_dirty);
+        assert!(app.current.message_layout.is_none());
     }
 
     #[test]
@@ -4254,15 +4319,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 20, 4));
-        app.entries.extend((0..1000).map(|_| DisplayEntry {
+        app.current.entries.extend((0..1000).map(|_| DisplayEntry {
             kind: DisplayKind::System,
             content: DisplayContent::Markdown("x".into()),
         }));
 
         trim_app_entries(&mut app);
-        assert_eq!(app.entries.len(), 1000);
-        assert!(app.output_layout_dirty);
-        assert!(app.message_layout.is_none());
+        assert_eq!(app.current.entries.len(), 1000);
+        assert!(app.current.output_layout_dirty);
+        assert!(app.current.message_layout.is_none());
     }
 
     #[tokio::test]
@@ -4306,20 +4371,20 @@ mod tests {
         let mut app = test_app(&temp);
         let viewport = Rect::new(0, 0, 20, 1);
         crate::ui::update_message_layout(&mut app, viewport);
-        let max_scroll = app.message_layout.as_ref().unwrap().max_scroll();
+        let max_scroll = app.current.message_layout.as_ref().unwrap().max_scroll();
         assert!(max_scroll >= 3);
-        assert_eq!(app.output_layout_rebuild_count, 1);
+        assert_eq!(app.current.output_layout_rebuild_count, 1);
 
         handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
-        assert_eq!(app.output_scroll_top, Some(max_scroll - 1));
-        assert_eq!(app.message_scroll, 1);
-        assert_eq!(app.output_layout_rebuild_count, 1);
+        assert_eq!(app.current.output_scroll_top, Some(max_scroll - 1));
+        assert_eq!(app.current.message_scroll, 1);
+        assert_eq!(app.current.output_layout_rebuild_count, 1);
 
         handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
         handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
-        assert_eq!(app.output_scroll_top, Some(max_scroll - 3));
-        assert_eq!(app.message_scroll, 3);
-        assert_eq!(app.output_layout_rebuild_count, 1);
+        assert_eq!(app.current.output_scroll_top, Some(max_scroll - 3));
+        assert_eq!(app.current.message_scroll, 3);
+        assert_eq!(app.current.output_layout_rebuild_count, 1);
     }
 
     #[test]
@@ -4328,26 +4393,26 @@ mod tests {
         let mut app = test_app(&temp);
         let viewport = Rect::new(0, 0, 20, 1);
         crate::ui::update_message_layout(&mut app, viewport);
-        let max_scroll = app.message_layout.as_ref().unwrap().max_scroll();
+        let max_scroll = app.current.message_layout.as_ref().unwrap().max_scroll();
 
-        app.output_scroll_top = Some(0);
-        app.follow_output = false;
-        app.message_scroll = max_scroll;
+        app.current.output_scroll_top = Some(0);
+        app.current.follow_output = false;
+        app.current.message_scroll = max_scroll;
         handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
-        assert_eq!(app.output_scroll_top, Some(0));
-        assert_eq!(app.message_scroll, max_scroll);
+        assert_eq!(app.current.output_scroll_top, Some(0));
+        assert_eq!(app.current.message_scroll, max_scroll);
 
         handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown));
-        assert_eq!(app.output_scroll_top, Some(1));
-        assert_eq!(app.message_scroll, max_scroll - 1);
+        assert_eq!(app.current.output_scroll_top, Some(1));
+        assert_eq!(app.current.message_scroll, max_scroll - 1);
 
-        app.output_scroll_top = Some(max_scroll);
-        app.follow_output = false;
-        app.message_scroll = 0;
+        app.current.output_scroll_top = Some(max_scroll);
+        app.current.follow_output = false;
+        app.current.message_scroll = 0;
         handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown));
-        assert_eq!(app.output_scroll_top, None);
-        assert!(app.follow_output);
-        assert_eq!(app.message_scroll, 0);
-        assert_eq!(app.output_layout_rebuild_count, 1);
+        assert_eq!(app.current.output_scroll_top, None);
+        assert!(app.current.follow_output);
+        assert_eq!(app.current.message_scroll, 0);
+        assert_eq!(app.current.output_layout_rebuild_count, 1);
     }
 }
