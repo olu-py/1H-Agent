@@ -19,6 +19,7 @@ pub struct Storage {
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -162,6 +163,56 @@ impl Storage {
         Ok(id)
     }
 
+    /// Creates a child session nested under `parent_id`. The child owns its own
+    /// provider/model so a cluster can run different roles on different models.
+    pub fn create_child_session(
+        &self,
+        workspace: &Path,
+        parent_id: &str,
+        provider: &str,
+        model: &str,
+        title: &str,
+    ) -> Result<String, StorageError> {
+        let id = Uuid::new_v4().to_string();
+        let turn_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id) VALUES (?1, ?2, ?3, ?4, ?4, 'explore', ?5, ?6, ?7, ?8)",
+            params![id, workspace.display().to_string(), title, now, provider, model, parent_id, turn_id],
+        )?;
+        connection.execute(
+            "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
+            params![turn_id, id, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Returns the stored provider preset id and model for a session.
+    pub fn session_provider_model(
+        &self,
+        session_id: &str,
+    ) -> Result<(String, String), StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT provider, model FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(StorageError::from)
+    }
+
+    /// Returns the workspace path this session belongs to.
+    pub fn session_workspace(&self, session_id: &str) -> Result<String, StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT workspace FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+    }
+
     pub fn latest_session(&self, workspace: &Path) -> Result<Option<String>, StorageError> {
         self.lock()?
             .query_row(
@@ -176,12 +227,13 @@ impl Storage {
     pub fn list_sessions(&self, workspace: &Path) -> Result<Vec<SessionSummary>, StorageError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT id, title FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC",
+            "SELECT id, title, parent_id FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC",
         )?;
         let rows = statement.query_map([workspace.display().to_string()], |row| {
             Ok(SessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
+                parent_id: row.get(2)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -697,6 +749,26 @@ fn backfill_turns(connection: &Connection) -> Result<(), StorageError> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn child_session_nests_under_parent_and_keeps_provider_model() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let parent = storage.create_session(root.path()).unwrap();
+        let child = storage
+            .create_child_session(root.path(), &parent, "deepseek", "deepseek-v4-pro", "计划")
+            .unwrap();
+
+        let sessions = storage.list_sessions(root.path()).unwrap();
+        let child_summary = sessions.iter().find(|session| session.id == child).unwrap();
+        assert_eq!(child_summary.parent_id.as_deref(), Some(parent.as_str()));
+        assert_eq!(child_summary.title, "计划");
+
+        let (provider, model) = storage.session_provider_model(&child).unwrap();
+        assert_eq!(provider, "deepseek");
+        assert_eq!(model, "deepseek-v4-pro");
+        assert_eq!(storage.session_mode(&child).unwrap(), "explore");
+    }
 
     #[test]
     fn stores_and_loads_messages_and_provider_state() {

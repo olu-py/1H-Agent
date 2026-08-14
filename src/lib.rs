@@ -9,6 +9,7 @@ pub mod prompt;
 pub mod provider;
 pub mod secrets;
 pub mod security;
+pub mod settings;
 pub mod storage;
 pub mod tools;
 pub mod ui;

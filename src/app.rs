@@ -32,15 +32,13 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     agent::{AgentEvent, AgentRunner},
     commands::{self, AgentMode, Command},
-    config::{
-        Config, ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability, ThinkingLevel,
-        ThinkingProfile, thinking_profile,
-    },
+    config::{Config, ProviderPreset, ThinkingLevel, ThinkingProfile, thinking_profile},
     input::InputBuffer,
     output::{EdgeScroll, InteractionTarget, MessageLayout, OutputSelection},
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
     secrets,
     security::Workspace,
+    settings::SettingsForm,
     storage::{SessionSummary, Storage},
     tools::ToolRegistry,
     ui,
@@ -115,6 +113,13 @@ pub enum DisplayContent {
     Markdown(String),
     Diff(String),
     Tool(ToolDisplay),
+    Thinking(ThinkingDisplay),
+}
+
+#[derive(Clone, Debug)]
+pub struct ThinkingDisplay {
+    pub id: String,
+    pub content: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,44 +151,6 @@ pub enum ApprovalAction {
     Shell(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SettingsField {
-    Preset,
-    Protocol,
-    BaseUrl,
-    Model,
-    Thinking,
-    ApiKey,
-}
-
-impl SettingsField {
-    const ALL: [Self; 6] = [
-        Self::Preset,
-        Self::Protocol,
-        Self::BaseUrl,
-        Self::Model,
-        Self::Thinking,
-        Self::ApiKey,
-    ];
-
-    fn cycle(self, direction: i32) -> Self {
-        let current = Self::ALL
-            .iter()
-            .position(|field| *field == self)
-            .unwrap_or(0) as i32;
-        let next = (current + direction).rem_euclid(Self::ALL.len() as i32) as usize;
-        Self::ALL[next]
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SettingsState {
-    pub provider: ProviderConfig,
-    pub api_key: String,
-    pub has_existing_key: bool,
-    pub field: SettingsField,
-}
-
 #[derive(Clone, Debug)]
 pub struct CommandPaletteState {
     pub query: String,
@@ -210,17 +177,20 @@ pub struct App {
     pub context_limit_tokens: Option<u64>,
     pub context_meter_enabled: bool,
     pub pending_approval: Option<PendingApproval>,
-    pub settings: Option<SettingsState>,
+    pub settings: Option<SettingsForm>,
     pub palette: Option<CommandPaletteState>,
     pub mode: AgentMode,
+    pub cluster_mode: bool,
     pub leader_pending: bool,
     pub expanded_tools: HashSet<String>,
+    pub expanded_thinking: HashSet<String>,
     pub thinking_expanded: bool,
     pub thinking_menu_open: bool,
     pub thinking_control_rect: Option<Rect>,
     pub thinking_menu_rect: Option<Rect>,
     pub session_panel_rect: Option<Rect>,
     pub input_mode_rect: Option<Rect>,
+    pub leader_hint_rect: Option<Rect>,
     pub force_full_redraw: bool,
     pub mouse_press_target: Option<InteractionTarget>,
     pub mouse_press_position: Option<(u16, u16)>,
@@ -243,6 +213,7 @@ pub struct App {
     pub edge_scroll: EdgeScroll,
     pub session_id: String,
     pub sessions: Vec<SessionSummary>,
+    pub collapsed_sessions: HashSet<String>,
     conversation: Vec<ConversationItem>,
     storage: Storage,
     config: Config,
@@ -335,14 +306,17 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         settings: None,
         palette: None,
         mode: initial_mode,
+        cluster_mode: false,
         leader_pending: false,
         expanded_tools: HashSet::new(),
+        expanded_thinking: HashSet::new(),
         thinking_expanded: false,
         thinking_menu_open: false,
         thinking_control_rect: None,
         thinking_menu_rect: None,
         session_panel_rect: None,
         input_mode_rect: None,
+        leader_hint_rect: None,
         force_full_redraw: false,
         mouse_press_target: None,
         mouse_press_position: None,
@@ -365,6 +339,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         edge_scroll: EdgeScroll::default(),
         session_id,
         sessions,
+        collapsed_sessions: HashSet::new(),
         conversation,
         storage,
         config,
@@ -556,6 +531,9 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         return Ok(EventOutcome::default());
     }
     if let Event::Mouse(mouse) = event {
+        if let Some(outcome) = handle_leader_mouse(app, mouse)? {
+            return Ok(outcome);
+        }
         if let Some(outcome) = handle_thinking_mouse(app, mouse)? {
             return Ok(outcome);
         }
@@ -667,24 +645,17 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         }
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.busy => {
             app.leader_pending = true;
-            app.status = "快捷键：n 新建 | m 模式 | s 设置 | f 分支 | p 面板 | q 退出".into();
+            app.status = "快捷键待命 | 按下对应键执行 | Esc 取消".into();
             true
         }
         _ if app.leader_pending => {
             app.leader_pending = false;
             match key.code {
-                KeyCode::Char('n') => create_session(app)?,
-                KeyCode::Char('m') => switch_mode(app, next_mode(app.mode))?,
-                KeyCode::Char('s') => open_settings(app),
-                KeyCode::Char('f') => execute_command(app, Command::Fork)?,
-                KeyCode::Char('p') => {
-                    app.palette = Some(CommandPaletteState {
-                        query: String::new(),
-                        selected: 0,
-                    });
-                }
-                KeyCode::Char('q') => app.should_quit = true,
-                _ => app.status = "未知快捷键".into(),
+                KeyCode::Esc => app.status = "已取消".into(),
+                _ => match LeaderAction::from_key(key.code) {
+                    Some(action) => execute_leader_action(app, action)?,
+                    None => app.status = "未知快捷键".into(),
+                },
             }
             true
         }
@@ -831,6 +802,27 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
     })
 }
 
+/// Handles left clicks while the `Ctrl+X` leader hint is pending. A click on a
+/// listed action executes it; a click anywhere else cancels the pending state,
+/// mirroring `Esc`.
+fn handle_leader_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    if !app.leader_pending || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return Ok(None);
+    }
+    app.leader_pending = false;
+    let action = app
+        .leader_hint_rect
+        .and_then(|rect| ui::leader_action_at(rect, mouse.column, mouse.row));
+    match action {
+        Some(action) => execute_leader_action(app, action)?,
+        None => app.status = "已取消".into(),
+    }
+    Ok(Some(EventOutcome::redraw()))
+}
+
 fn handle_thinking_mouse(
     app: &mut App,
     mouse: crossterm::event::MouseEvent,
@@ -932,27 +924,34 @@ fn handle_navigation_mouse(
         || app.settings.is_some()
         || app.palette.is_some()
         || app.pending_approval.is_some()
+        || app.leader_pending
     {
         return Ok(None);
     }
     if let Some(area) = app.session_panel_rect {
-        let current = app
-            .sessions
+        let rows = ui::flatten_session_tree(&app.sessions, &app.collapsed_sessions);
+        let current = rows
             .iter()
-            .position(|session| session.id == app.session_id)
+            .position(|row| row.id == app.session_id)
             .unwrap_or(0);
         if let Some(index) =
-            ui::session_index_at(area, mouse.column, mouse.row, app.sessions.len(), current)
+            ui::session_index_at(area, mouse.column, mouse.row, rows.len(), current)
         {
-            let session_id = app.sessions[index].id.clone();
-            if session_id == app.session_id {
+            let row = &rows[index];
+            if row.has_children {
+                if !app.collapsed_sessions.insert(row.id.clone()) {
+                    app.collapsed_sessions.remove(&row.id);
+                }
+                return Ok(Some(EventOutcome::redraw()));
+            }
+            if row.id == app.session_id {
                 return Ok(Some(EventOutcome::redraw()));
             }
             if app.busy {
                 app.status = "请求运行中，无法切换会话".into();
                 return Ok(Some(EventOutcome::redraw()));
             }
-            activate_session(app, session_id)?;
+            activate_session(app, row.id.clone())?;
             return Ok(Some(EventOutcome::redraw()));
         }
     }
@@ -1072,6 +1071,11 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                         }
                         InteractionTarget::Thinking => {
                             app.thinking_expanded = !app.thinking_expanded;
+                        }
+                        InteractionTarget::ThinkingSummary(id) => {
+                            if !app.expanded_thinking.insert(id.clone()) {
+                                app.expanded_thinking.remove(&id);
+                            }
                         }
                     }
                     app.invalidate_output_layout();
@@ -1425,8 +1429,9 @@ fn submit_input(app: &mut App) -> Result<()> {
     app.status = "准备请求中…… | Esc 取消".into();
     let items = app.conversation.clone();
     let events = app.agent_tx.clone();
+    let cluster_mode = app.cluster_mode;
     app.active_task = Some(tokio::spawn(async move {
-        runner.run(items, events).await;
+        runner.run(items, events, cluster_mode).await;
     }));
     trim_app_entries(app);
     Ok(())
@@ -1551,15 +1556,11 @@ fn apply_file_completion(app: &mut App) {
 }
 
 fn open_settings(app: &mut App) {
-    app.settings = Some(SettingsState {
-        provider: app.config.provider.clone(),
-        api_key: String::new(),
-        has_existing_key: app
-            .active_secret
-            .as_ref()
-            .is_some_and(|(preset, _)| *preset == app.config.provider.preset),
-        field: SettingsField::Preset,
-    });
+    let existing_key_preset = app.active_secret.as_ref().map(|(preset, _)| *preset);
+    app.settings = Some(SettingsForm::new(
+        app.config.provider.clone(),
+        existing_key_preset,
+    ));
     app.status = "提供商设置".into();
 }
 
@@ -1700,6 +1701,14 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             app.clear_output_selection();
             app.status = "显示已清空，会话历史仍保留".into();
         }
+        Command::Cluster => {
+            app.cluster_mode = !app.cluster_mode;
+            app.status = if app.cluster_mode {
+                "集群模式已开启 | 可在对话中指派角色与模型".into()
+            } else {
+                "集群模式已关闭".into()
+            };
+        }
         Command::Quit => app.should_quit = true,
         Command::Rename(title) => {
             let title = title.unwrap_or_else(|| "Untitled session".into());
@@ -1765,6 +1774,90 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         Command::Diff => start_diff(app)?,
     }
     Ok(())
+}
+
+/// Actions reachable from the `Ctrl+X` leader prefix. The key, label, and
+/// dispatch are all driven by this single source of truth so the on-screen
+/// hint, the keyboard handler, and the mouse hit-test cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaderAction {
+    New,
+    Mode,
+    Settings,
+    Fork,
+    Palette,
+    Cluster,
+    Quit,
+}
+
+impl LeaderAction {
+    pub const ALL: [Self; 7] = [
+        Self::New,
+        Self::Mode,
+        Self::Settings,
+        Self::Fork,
+        Self::Palette,
+        Self::Cluster,
+        Self::Quit,
+    ];
+
+    pub fn key(self) -> char {
+        match self {
+            Self::New => 'n',
+            Self::Mode => 'm',
+            Self::Settings => 's',
+            Self::Fork => 'f',
+            Self::Palette => 'p',
+            Self::Cluster => 'c',
+            Self::Quit => 'q',
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::New => "新建会话",
+            Self::Mode => "切换模式",
+            Self::Settings => "Provider 设置",
+            Self::Fork => "分支当前会话",
+            Self::Palette => "命令面板",
+            Self::Cluster => "集群模式",
+            Self::Quit => "退出",
+        }
+    }
+
+    fn from_key(code: KeyCode) -> Option<Self> {
+        let KeyCode::Char(character) = code else {
+            return None;
+        };
+        Self::ALL
+            .into_iter()
+            .find(|action| action.key() == character)
+    }
+}
+
+fn execute_leader_action(app: &mut App, action: LeaderAction) -> Result<()> {
+    match action {
+        LeaderAction::New => create_session(app),
+        LeaderAction::Mode => switch_mode(app, next_mode(app.mode)),
+        LeaderAction::Settings => {
+            open_settings(app);
+            Ok(())
+        }
+        LeaderAction::Fork => execute_command(app, Command::Fork),
+        LeaderAction::Palette => {
+            app.palette = Some(CommandPaletteState {
+                query: String::new(),
+                selected: 0,
+            });
+            app.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
+            Ok(())
+        }
+        LeaderAction::Cluster => execute_command(app, Command::Cluster),
+        LeaderAction::Quit => {
+            app.should_quit = true;
+            Ok(())
+        }
+    }
 }
 
 fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
@@ -1845,31 +1938,34 @@ fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.settings = None;
             app.status = "设置已取消".into();
         }
-        KeyCode::Tab => {
-            if let Some(settings) = &mut app.settings {
-                settings.field = settings.field.cycle(1);
+        KeyCode::Tab | KeyCode::Down => {
+            if let Some(form) = &mut app.settings {
+                form.move_selection(1);
             }
         }
-        KeyCode::BackTab => {
-            if let Some(settings) = &mut app.settings {
-                settings.field = settings.field.cycle(-1);
+        KeyCode::BackTab | KeyCode::Up => {
+            if let Some(form) = &mut app.settings {
+                form.move_selection(-1);
             }
         }
-        KeyCode::Up => {
-            if let Some(settings) = &mut app.settings {
-                settings.field = settings.field.cycle(-1);
+        KeyCode::Left | KeyCode::Right => {
+            let direction = if code == KeyCode::Right { 1 } else { -1 };
+            if let Some(form) = &mut app.settings {
+                let field = form.field();
+                form.cycle(field, direction);
             }
         }
-        KeyCode::Down => {
-            if let Some(settings) = &mut app.settings {
-                settings.field = settings.field.cycle(1);
+        KeyCode::Backspace => {
+            if let Some(form) = &mut app.settings {
+                let field = form.field();
+                form.edit(field, None);
             }
         }
-        KeyCode::Left => cycle_setting_value(app, -1),
-        KeyCode::Right => cycle_setting_value(app, 1),
-        KeyCode::Backspace => edit_setting(app, None),
         KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
-            edit_setting(app, Some(character));
+            if let Some(form) = &mut app.settings {
+                let field = form.field();
+                form.edit(field, Some(character));
+            }
         }
         KeyCode::Enter => {
             if let Err(error) = apply_settings(app) {
@@ -1880,78 +1976,11 @@ fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     }
 }
 
-fn cycle_setting_value(app: &mut App, direction: i32) {
-    let Some(settings) = &mut app.settings else {
-        return;
-    };
-    match settings.field {
-        SettingsField::Preset => {
-            let current = ProviderPreset::ALL
-                .iter()
-                .position(|preset| *preset == settings.provider.preset)
-                .unwrap_or(0) as i32;
-            let next = (current + direction).rem_euclid(ProviderPreset::ALL.len() as i32) as usize;
-            settings.provider = ProviderPreset::ALL[next].defaults();
-            settings.api_key.clear();
-            settings.has_existing_key = app
-                .active_secret
-                .as_ref()
-                .is_some_and(|(preset, _)| *preset == settings.provider.preset);
-        }
-        SettingsField::Protocol if settings.provider.preset.supports_responses() => {
-            settings.provider.kind = match settings.provider.kind {
-                ProviderKind::ChatCompletions => ProviderKind::Responses,
-                ProviderKind::Responses => ProviderKind::ChatCompletions,
-            };
-        }
-        SettingsField::Thinking => {
-            let current = ThinkingCapability::ALL
-                .iter()
-                .position(|value| *value == settings.provider.thinking)
-                .unwrap_or(0) as i32;
-            let next =
-                (current + direction).rem_euclid(ThinkingCapability::ALL.len() as i32) as usize;
-            settings.provider.thinking = ThinkingCapability::ALL[next];
-        }
-        _ => {}
-    }
-}
-
-fn edit_setting(app: &mut App, character: Option<char>) {
-    let Some(settings) = &mut app.settings else {
-        return;
-    };
-    let value = match settings.field {
-        SettingsField::BaseUrl => &mut settings.provider.base_url,
-        SettingsField::Model => &mut settings.provider.model,
-        SettingsField::ApiKey => &mut settings.api_key,
-        _ => return,
-    };
-    match character {
-        Some(character) => value.push(character),
-        None => {
-            value.pop();
-        }
-    }
-}
-
 fn apply_settings(app: &mut App) -> Result<()> {
-    let settings = app.settings.as_ref().context("settings are not open")?;
-    let mut provider_config = settings.provider.clone();
-    provider_config.validate()?;
-    provider_config.normalize_thinking();
-    let entered_key = settings.api_key.trim();
-    let api_key = if !entered_key.is_empty() {
-        entered_key.to_owned()
-    } else if let Some((preset, key)) = &app.active_secret {
-        if *preset == provider_config.preset {
-            key.clone()
-        } else {
-            secrets::api_key(provider_config.preset)?
-        }
-    } else {
-        secrets::api_key(provider_config.preset)?
-    };
+    let form = app.settings.as_ref().context("settings are not open")?;
+    let provider_config = form.prepare()?;
+    let api_key = form.resolve_api_key(app.active_secret.as_ref())?;
+    let entered_key = form.api_key.trim();
 
     let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())?;
     app.runner = Some(AgentRunner::new(
@@ -2327,11 +2356,42 @@ fn begin_thinking(app: &mut App) {
 fn finish_thinking(app: &mut App, line: &str) {
     app.thinking_active = false;
     app.thinking_animation_frame = 0;
+    persist_thinking_summary(app);
     match line {
         "思考失败" => app.thinking_result = ThinkingResult::Failed,
         "思考已取消" => app.thinking_result = ThinkingResult::Cancelled,
         _ => app.thinking_result = ThinkingResult::Completed,
     }
+}
+
+/// Turns the buffered reasoning into a persistent "思考摘要" entry so every
+/// thinking round is kept in the task stream instead of being overwritten by
+/// the next round. The live row is then retired (anchor cleared).
+fn persist_thinking_summary(app: &mut App) {
+    let truncated = app.thinking_buffer_truncated;
+    let reasoning = app.thinking_buffer.trim().to_owned();
+    app.thinking_buffer.clear();
+    app.thinking_last_line.clear();
+    app.thinking_anchor = None;
+    app.thinking_buffer_truncated = false;
+    if reasoning.is_empty() {
+        return;
+    }
+    let content = if truncated {
+        format!("[较早思考内容已截断]\n\n{reasoning}")
+    } else {
+        reasoning
+    };
+    push_entry(
+        app,
+        DisplayEntry {
+            kind: DisplayKind::Thinking,
+            content: DisplayContent::Thinking(ThinkingDisplay {
+                id: format!("thinking-{}", uuid::Uuid::new_v4()),
+                content,
+            }),
+        },
+    );
 }
 
 fn reset_thinking_state(app: &mut App) {
@@ -2497,17 +2557,17 @@ fn session_switch_direction(key: &crossterm::event::KeyEvent) -> Option<i32> {
 
 fn switch_session(app: &mut App, direction: i32) -> Result<()> {
     refresh_sessions(app)?;
-    if app.sessions.len() < 2 {
+    let rows = ui::flatten_session_tree(&app.sessions, &app.collapsed_sessions);
+    if rows.len() < 2 {
         app.status = "当前只有一个会话 | Ctrl+N 新建会话".into();
         return Ok(());
     }
-    let current = app
-        .sessions
+    let current = rows
         .iter()
-        .position(|session| session.id == app.session_id)
+        .position(|row| row.id == app.session_id)
         .unwrap_or(0) as i32;
-    let next = (current + direction).rem_euclid(app.sessions.len() as i32) as usize;
-    let session_id = app.sessions[next].id.clone();
+    let next = (current + direction).rem_euclid(rows.len() as i32) as usize;
+    let session_id = rows[next].id.clone();
     activate_session(app, session_id)
 }
 
@@ -2523,11 +2583,25 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
         .and_then(|value| AgentMode::parse(&value))
         .unwrap_or_default();
     app.registry.set_mode(app.mode);
+    let provider_config = app
+        .storage
+        .session_provider_model(&session_id)
+        .ok()
+        .and_then(|(provider_id, model)| {
+            ProviderPreset::parse(&provider_id).map(|preset| {
+                let mut config = app.config.provider.clone();
+                config.preset = preset;
+                config.model = model;
+                config.normalize_thinking();
+                config
+            })
+        })
+        .unwrap_or_else(|| app.config.provider.clone());
     let runner = if let Some((_, api_key)) = &app.active_secret {
-        let provider = OpenAiClient::new(app.config.provider.base_url.clone(), api_key.clone())?;
+        let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())?;
         Some(AgentRunner::new(
             provider,
-            app.config.provider.clone(),
+            provider_config.clone(),
             app.registry.clone(),
             app.storage.clone(),
             session_id.clone(),
@@ -2542,13 +2616,14 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     app.input.clear();
     app.file_suggestions.clear();
     app.expanded_tools.clear();
+    app.expanded_thinking.clear();
     app.clear_output_selection();
     app.message_scroll = 0;
     app.follow_output = true;
     app.output_scroll_top = None;
     app.usage = Usage::default();
     app.context_used_tokens = estimate_context_tokens(&app.conversation);
-    app.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
+    app.context_limit_tokens = provider_config.resolved_context_window_tokens();
     app.agent_phase = AgentPhase::Idle;
     app.model_phase = ModelPhase::Idle;
     reset_thinking_state(app);
@@ -2556,8 +2631,8 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     app.status = if app.runner.is_some() {
         format!(
             "就绪 | {} | {}",
-            app.config.provider.preset.label(),
-            app.config.provider.model
+            provider_config.preset.label(),
+            provider_config.model
         )
     } else {
         "需要配置提供商".into()
@@ -2573,6 +2648,7 @@ fn refresh_sessions(app: &mut App) -> Result<()> {
 fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {
     let mut entries = Vec::new();
     let mut tool_entries = HashMap::<String, usize>::new();
+    let mut thinking_index = 0usize;
     for item in conversation {
         match item {
             ConversationItem::Message { role, content } => entries.push(DisplayEntry {
@@ -2583,10 +2659,17 @@ fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {
                 },
                 content: DisplayContent::Markdown(content.clone()),
             }),
-            ConversationItem::ThinkingSummary { content } => entries.push(DisplayEntry {
-                kind: DisplayKind::Thinking,
-                content: DisplayContent::Markdown(content.clone()),
-            }),
+            ConversationItem::ThinkingSummary { content } => {
+                let id = format!("thinking-{thinking_index}");
+                thinking_index += 1;
+                entries.push(DisplayEntry {
+                    kind: DisplayKind::Thinking,
+                    content: DisplayContent::Thinking(ThinkingDisplay {
+                        id,
+                        content: content.clone(),
+                    }),
+                });
+            }
             ConversationItem::Context { label, content } => entries.push(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(format!("### @{label}\n\n{content}")),
@@ -2749,6 +2832,7 @@ fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
                     + tool.arguments.to_string().len()
                     + tool.result.as_ref().map_or(0, String::len)
             }
+            DisplayContent::Thinking(thinking) => thinking.id.len() + thinking.content.len(),
         })
         .sum()
 }
@@ -2822,6 +2906,150 @@ mod tests {
         );
     }
 
+    #[test]
+    fn leader_action_from_key_maps_shortcuts_and_rejects_others() {
+        assert_eq!(
+            LeaderAction::from_key(KeyCode::Char('n')),
+            Some(LeaderAction::New)
+        );
+        assert_eq!(
+            LeaderAction::from_key(KeyCode::Char('m')),
+            Some(LeaderAction::Mode)
+        );
+        assert_eq!(
+            LeaderAction::from_key(KeyCode::Char('s')),
+            Some(LeaderAction::Settings)
+        );
+        assert_eq!(
+            LeaderAction::from_key(KeyCode::Char('f')),
+            Some(LeaderAction::Fork)
+        );
+        assert_eq!(
+            LeaderAction::from_key(KeyCode::Char('p')),
+            Some(LeaderAction::Palette)
+        );
+        assert_eq!(
+            LeaderAction::from_key(KeyCode::Char('c')),
+            Some(LeaderAction::Cluster)
+        );
+        assert_eq!(
+            LeaderAction::from_key(KeyCode::Char('q')),
+            Some(LeaderAction::Quit)
+        );
+        assert_eq!(LeaderAction::from_key(KeyCode::Esc), None);
+        assert_eq!(LeaderAction::from_key(KeyCode::Char('z')), None);
+        assert_eq!(LeaderAction::from_key(KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn leader_action_keys_and_labels_are_stable() {
+        let keys: Vec<char> = LeaderAction::ALL
+            .iter()
+            .map(|action| action.key())
+            .collect();
+        assert_eq!(keys, vec!['n', 'm', 's', 'f', 'p', 'c', 'q']);
+        let labels: Vec<&str> = LeaderAction::ALL
+            .iter()
+            .map(|action| action.label())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "新建会话",
+                "切换模式",
+                "Provider 设置",
+                "分支当前会话",
+                "命令面板",
+                "集群模式",
+                "退出"
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_leader_action_dispatches_settings_palette_and_quit() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        execute_leader_action(&mut app, LeaderAction::Settings).unwrap();
+        assert!(app.settings.is_some());
+        execute_leader_action(&mut app, LeaderAction::Palette).unwrap();
+        assert!(app.palette.is_some());
+        execute_leader_action(&mut app, LeaderAction::Quit).unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn execute_leader_action_mode_uses_next_mode() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        assert_eq!(app.mode, AgentMode::Build);
+        execute_leader_action(&mut app, LeaderAction::Mode).unwrap();
+        assert_eq!(app.mode, AgentMode::Plan);
+    }
+
+    #[test]
+    fn cluster_command_toggles_mode() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        assert!(!app.cluster_mode);
+        execute_command(&mut app, Command::Cluster).unwrap();
+        assert!(app.cluster_mode);
+        execute_command(&mut app, Command::Cluster).unwrap();
+        assert!(!app.cluster_mode);
+    }
+
+    #[test]
+    fn leader_mouse_click_executes_action_and_outside_cancels() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.leader_pending = true;
+        app.leader_hint_rect = Some(Rect::new(10, 4, 40, 11));
+        // First action (New) renders at inner.y + LEADER_ACTION_FIRST_ROW = 6.
+        let click_new = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 11,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(handle_leader_mouse(&mut app, click_new).unwrap().is_some());
+        assert!(!app.leader_pending);
+        assert!(app.status.contains("新会话"));
+
+        app.leader_pending = true;
+        app.leader_hint_rect = Some(Rect::new(10, 4, 40, 11));
+        let click_outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(
+            handle_leader_mouse(&mut app, click_outside)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!app.leader_pending);
+        assert_eq!(app.status, "已取消");
+    }
+
+    fn thinking_summary_count(app: &App) -> usize {
+        app.entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, DisplayKind::Thinking))
+            .count()
+    }
+
+    fn last_thinking_summary(app: &App) -> Option<&str> {
+        app.entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.kind, DisplayKind::Thinking))
+            .and_then(|entry| match &entry.content {
+                DisplayContent::Thinking(thinking) => Some(thinking.content.as_str()),
+                _ => None,
+            })
+    }
+
     fn test_app(temp: &TempDir) -> App {
         let workspace = temp.path().to_path_buf();
         let config = Config::default();
@@ -2860,14 +3088,17 @@ mod tests {
             settings: None,
             palette: None,
             mode: AgentMode::default(),
+            cluster_mode: false,
             leader_pending: false,
             expanded_tools: HashSet::new(),
+            expanded_thinking: HashSet::new(),
             thinking_expanded: false,
             thinking_menu_open: false,
             thinking_control_rect: None,
             thinking_menu_rect: None,
             session_panel_rect: None,
             input_mode_rect: None,
+            leader_hint_rect: None,
             force_full_redraw: false,
             mouse_press_target: None,
             mouse_press_position: None,
@@ -2887,6 +3118,7 @@ mod tests {
             edge_scroll: EdgeScroll::default(),
             session_id,
             sessions,
+            collapsed_sessions: HashSet::new(),
             conversation: Vec::new(),
             storage,
             config,
@@ -3520,6 +3752,23 @@ mod tests {
     }
 
     #[test]
+    fn finish_thinking_skips_empty_buffer() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
+        handle_agent_event(
+            &mut app,
+            AgentEvent::ToolStarted(ToolCall {
+                id: "call-empty".into(),
+                name: "file_read".into(),
+                arguments: serde_json::json!({"path":"Cargo.toml"}),
+            }),
+        );
+        assert!(app.thinking_anchor.is_none());
+        assert_eq!(thinking_summary_count(&app), 0);
+    }
+
+    #[test]
     fn reasoning_without_newlines_keeps_utf8_safe_tail() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
@@ -3533,7 +3782,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_terminal_events_set_fixed_statuses() {
+    fn reasoning_terminal_events_set_fixed_statuses_and_persist() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
 
@@ -3544,34 +3793,28 @@ mod tests {
         );
         handle_agent_event(&mut app, AgentEvent::TextDelta("answer".into()));
         assert!(!app.thinking_active);
-        assert_eq!(app.thinking_last_line, "正在分析工具结果");
+        assert!(app.thinking_anchor.is_none());
         assert_eq!(app.thinking_result, ThinkingResult::Completed);
-        assert_eq!(
-            crate::ui::live_thinking_line(&app),
-            "✓ 思考完成  正在分析工具结果"
-        );
+        assert_eq!(thinking_summary_count(&app), 1);
+        assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("正在分析工具结果")));
 
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta("最后失败位置".into()));
         handle_agent_event(&mut app, AgentEvent::Failed("failed".into()));
         assert!(!app.thinking_active);
-        assert_eq!(app.thinking_last_line, "最后失败位置");
+        assert!(app.thinking_anchor.is_none());
         assert_eq!(app.thinking_result, ThinkingResult::Failed);
-        assert_eq!(
-            crate::ui::live_thinking_line(&app),
-            "✗ 思考失败  最后失败位置"
-        );
+        assert_eq!(thinking_summary_count(&app), 2);
+        assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("最后失败位置")));
 
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta("取消前内容".into()));
         handle_agent_event(&mut app, AgentEvent::Cancelled("cancelled".into()));
         assert!(!app.thinking_active);
-        assert_eq!(app.thinking_last_line, "取消前内容");
+        assert!(app.thinking_anchor.is_none());
         assert_eq!(app.thinking_result, ThinkingResult::Cancelled);
-        assert_eq!(
-            crate::ui::live_thinking_line(&app),
-            "■ 思考已取消  取消前内容"
-        );
+        assert_eq!(thinking_summary_count(&app), 3);
+        assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("取消前内容")));
     }
 
     #[test]
@@ -3665,7 +3908,6 @@ mod tests {
         handle_agent_event(&mut app, AgentEvent::ModelStreaming);
         crate::ui::update_message_layout(&mut app, viewport);
         let initial_rebuilds = app.output_layout_rebuild_count;
-        let insertion = app.message_layout.as_ref().unwrap().live_thinking_before;
         handle_agent_event(&mut app, AgentEvent::ReasoningDelta("真实摘要".into()));
         crate::ui::update_message_layout(&mut app, viewport);
         assert_eq!(app.output_layout_rebuild_count, initial_rebuilds);
@@ -3682,7 +3924,7 @@ mod tests {
         assert_eq!(app.output_layout_rebuild_count, initial_rebuilds + 1);
         assert_eq!(
             app.message_layout.as_ref().unwrap().live_thinking_before,
-            insertion
+            None
         );
         assert_eq!(
             app.message_layout
@@ -3692,9 +3934,11 @@ mod tests {
                 .iter()
                 .filter(|line| line.synthetic)
                 .count(),
-            1
+            0
         );
-        assert_eq!(app.thinking_last_line, "真实摘要");
+        assert!(app.thinking_anchor.is_none());
+        assert_eq!(thinking_summary_count(&app), 1);
+        assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("真实摘要")));
     }
 
     #[test]
@@ -3742,6 +3986,52 @@ mod tests {
             assert!(app.output_layout_dirty);
             crate::ui::update_message_layout(&mut app, viewport);
             assert_eq!(app.output_layout_rebuild_count, expected_count);
+        }
+    }
+
+    #[test]
+    fn thinking_summary_click_toggles_expansion() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.push_entry(DisplayEntry {
+            kind: DisplayKind::Thinking,
+            content: DisplayContent::Thinking(ThinkingDisplay {
+                id: "thinking-0".into(),
+                content: "第一行\n最后一行".into(),
+            }),
+        });
+        let viewport = Rect::new(0, 0, 30, 30);
+        crate::ui::update_message_layout(&mut app, viewport);
+        assert!(app.expanded_thinking.is_empty());
+
+        for expected in [true, false] {
+            let layout = app.message_layout.as_ref().unwrap();
+            let target_row = layout
+                .visual_lines
+                .iter()
+                .position(|line| {
+                    line.interaction
+                        == Some(InteractionTarget::ThinkingSummary("thinking-0".into()))
+                })
+                .unwrap()
+                .saturating_sub(layout.scroll) as u16
+                + layout.viewport.y;
+            let down = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: target_row,
+                modifiers: KeyModifiers::NONE,
+            };
+            let up = MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 1,
+                row: target_row,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_output_mouse(&mut app, down);
+            handle_output_mouse(&mut app, up);
+            assert_eq!(app.expanded_thinking.contains("thinking-0"), expected);
+            crate::ui::update_message_layout(&mut app, viewport);
         }
     }
 

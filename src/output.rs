@@ -14,6 +14,7 @@ pub struct LayoutLine {
 pub enum InteractionTarget {
     Tool(String),
     Thinking,
+    ThinkingSummary(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,7 +297,10 @@ fn build_visual_lines(
 }
 
 fn wrap_line(logical_line: usize, line: &LayoutLine, width: usize) -> Vec<VisualLine> {
-    if matches!(line.interaction, Some(InteractionTarget::Tool(_))) {
+    if matches!(
+        line.interaction,
+        Some(InteractionTarget::Tool(_) | InteractionTarget::ThinkingSummary(_))
+    ) {
         let mut used = 0usize;
         let mut end = 0usize;
         for (offset, grapheme) in line.text.grapheme_indices(true) {

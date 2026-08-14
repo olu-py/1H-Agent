@@ -10,18 +10,20 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
-use std::ops::Range;
+use std::{collections::HashSet, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, CommandPaletteState, DisplayContent, DisplayKind, SettingsField, SettingsState,
+        App, CommandPaletteState, DisplayContent, DisplayKind, LeaderAction, ThinkingDisplay,
         ToolDisplay, ToolDisplayStatus,
     },
     commands::{self, AgentMode},
     output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
     secrets,
+    settings::{FIELDS, SettingsField, SettingsForm},
+    storage::SessionSummary,
     ui_layout::{Density, HeightClass, compute_layout, message_block},
     ui_theme::{UiTheme, VisualRole},
     ui_view_model::{
@@ -78,6 +80,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(palette) = &app.palette {
         draw_palette(frame, area, palette, &theme);
     }
+    if app.leader_pending {
+        draw_leader_hint(frame, area, app, &theme);
+    }
 }
 
 const SESSIONS_TITLE_OFFSET: u16 = 1;
@@ -91,6 +96,60 @@ fn session_visible_slots(area_height: u16) -> usize {
     area_height
         .saturating_sub(SESSIONS_TITLE_OFFSET + SESSIONS_HEADER_ROWS + SESSIONS_TRAILING_ROWS)
         as usize
+}
+
+/// A flattened, depth-annotated session for tree rendering and hit-testing.
+pub(crate) struct SessionRow {
+    pub id: String,
+    pub title: String,
+    pub depth: usize,
+    pub has_children: bool,
+    pub expanded: bool,
+}
+
+/// Flattens the session list into depth-first tree order, dropping the
+/// children of collapsed parents. Roots (`parent_id == None`) come first, each
+/// followed by its visible descendants.
+pub(crate) fn flatten_session_tree(
+    sessions: &[SessionSummary],
+    collapsed: &HashSet<String>,
+) -> Vec<SessionRow> {
+    let mut rows = Vec::new();
+    for root in sessions
+        .iter()
+        .filter(|session| session.parent_id.is_none())
+    {
+        push_session_tree(root, 0, sessions, collapsed, &mut rows);
+    }
+    rows
+}
+
+fn push_session_tree(
+    session: &SessionSummary,
+    depth: usize,
+    all: &[SessionSummary],
+    collapsed: &HashSet<String>,
+    rows: &mut Vec<SessionRow>,
+) {
+    let has_children = all
+        .iter()
+        .any(|child| child.parent_id.as_deref() == Some(session.id.as_str()));
+    let expanded = has_children && !collapsed.contains(&session.id);
+    rows.push(SessionRow {
+        id: session.id.clone(),
+        title: session.title.clone(),
+        depth,
+        has_children,
+        expanded,
+    });
+    if expanded {
+        for child in all
+            .iter()
+            .filter(|child| child.parent_id.as_deref() == Some(session.id.as_str()))
+        {
+            push_session_tree(child, depth + 1, all, collapsed, rows);
+        }
+    }
 }
 
 /// Window start such that the current session stays visible, pinned to the
@@ -162,25 +221,34 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiThe
         ))),
     ];
     let visible_sessions = session_visible_slots(area.height);
-    let current = app
-        .sessions
+    let rows = flatten_session_tree(&app.sessions, &app.collapsed_sessions);
+    let current = rows
         .iter()
-        .position(|session| session.id == app.session_id)
+        .position(|row| row.id == app.session_id)
         .unwrap_or(0);
-    let start = session_window_start(app.sessions.len(), current, visible_sessions);
-    for session in app.sessions.iter().skip(start).take(visible_sessions) {
-        let active = session.id == app.session_id;
-        let marker = if active { "> " } else { "  " };
+    let start = session_window_start(rows.len(), current, visible_sessions);
+    for row in rows.iter().skip(start).take(visible_sessions) {
+        let active = row.id == app.session_id;
+        let arrow = if row.has_children {
+            if row.expanded { "▾ " } else { "▸ " }
+        } else {
+            "  "
+        };
+        let indent = "  ".repeat(row.depth);
+        let marker = if active { ">" } else { " " };
         let style = if active {
             theme.selected
+        } else if row.has_children {
+            theme.strong(VisualRole::Accent)
         } else {
             theme.style(VisualRole::Primary)
         };
+        let title = fit_text(
+            &row.title,
+            content_width.saturating_sub(row.depth.saturating_mul(2).saturating_add(4)),
+        );
         items.push(ListItem::new(Line::from(Span::styled(
-            format!(
-                "{marker}{}",
-                fit_text(&session.title, content_width.saturating_sub(2))
-            ),
+            format!("{indent}{arrow}{marker} {title}"),
             style,
         ))));
     }
@@ -334,6 +402,17 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
             continue;
         }
         in_tool_group = false;
+        if let DisplayContent::Thinking(thinking) = &entry.content {
+            render_thinking_summary(
+                thinking,
+                app.expanded_thinking.contains(&thinking.id),
+                width,
+                &mut lines,
+                &mut interactions,
+            );
+            push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
+            continue;
+        }
         if let DisplayContent::Markdown(text) = &entry.content
             && matches!(entry.kind, DisplayKind::System | DisplayKind::Error)
         {
@@ -390,6 +469,7 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
                 }
             }
             DisplayContent::Tool(_) => unreachable!("tool entries are rendered as a group"),
+            DisplayContent::Thinking(_) => unreachable!("thinking entries are rendered inline"),
         }
         push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
     }
@@ -1136,6 +1216,70 @@ fn render_tool(
     }
 }
 
+fn render_thinking_summary(
+    thinking: &ThinkingDisplay,
+    expanded: bool,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+    interactions: &mut Vec<Option<InteractionTarget>>,
+) {
+    let theme = UiTheme::default();
+    let marker = if expanded { "▾" } else { "▸" };
+    let label = "思考摘要";
+    let interaction = Some(InteractionTarget::ThinkingSummary(thinking.id.clone()));
+    if !expanded {
+        let last_line = thinking
+            .content
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        let fixed_width = UnicodeWidthStr::width(marker)
+            .saturating_add(1)
+            .saturating_add(UnicodeWidthStr::width(label));
+        let summary = fit_text_tail(
+            last_line,
+            width.saturating_sub(fixed_width.saturating_add(2)),
+        );
+        push_rendered_line(
+            lines,
+            interactions,
+            Line::from(vec![
+                Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(label, theme.strong(VisualRole::Thinking)),
+                Span::raw(if summary.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {summary}")
+                }),
+            ]),
+            interaction,
+        );
+        return;
+    }
+    push_rendered_line(
+        lines,
+        interactions,
+        Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(Color::DarkGray)),
+            Span::styled(label, theme.strong(VisualRole::Thinking)),
+        ]),
+        interaction,
+    );
+    if thinking.content.trim().is_empty() {
+        push_rendered_line(
+            lines,
+            interactions,
+            Line::from(Span::styled("  （空）", theme.style(VisualRole::Muted))),
+            None,
+        );
+        return;
+    }
+    for line in render_markdown(&thinking.content, theme.style(VisualRole::Primary)) {
+        push_rendered_line(lines, interactions, line, None);
+    }
+}
+
 pub(crate) fn tool_display_name(name: &str) -> String {
     let translated = match name {
         "file_list" => Some("文件列表"),
@@ -1660,66 +1804,103 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState, theme: &UiTheme) {
-    let popup = centered_rect(84, 19, area);
-    let key = if settings.api_key.is_empty() {
-        if settings.has_existing_key {
-            "********".to_owned()
-        } else {
-            "（未设置）".to_owned()
+/// One row in the settings list: a section header, an editable field, or a
+/// breathing-space spacer. Derived from the `FIELDS` registry.
+enum SettingsRow {
+    Section(&'static str),
+    Field(SettingsField),
+    Spacer,
+}
+
+fn settings_rows() -> Vec<SettingsRow> {
+    let mut rows = Vec::with_capacity(FIELDS.len() * 2 + 3);
+    let mut last_section = None;
+    for spec in FIELDS {
+        if last_section != Some(spec.section) {
+            last_section = Some(spec.section);
+            rows.push(SettingsRow::Section(spec.section));
+            rows.push(SettingsRow::Spacer);
         }
-    } else {
-        "*".repeat(settings.api_key.chars().count().min(32))
-    };
-    let values = [
-        (
-            SettingsField::Preset,
-            "提供商",
-            settings.provider.preset.label().to_owned(),
-        ),
-        (
-            SettingsField::Protocol,
-            "协议",
-            settings.provider.kind.label().to_owned(),
-        ),
-        (
-            SettingsField::BaseUrl,
-            "接口地址",
-            settings.provider.base_url.clone(),
-        ),
-        (
-            SettingsField::Model,
-            "模型",
-            settings.provider.model.clone(),
-        ),
-        (
-            SettingsField::Thinking,
-            "思考能力",
-            settings.provider.thinking.label().to_owned(),
-        ),
-        (SettingsField::ApiKey, "API Key", key),
-    ];
-    let value_width = popup.width.saturating_sub(19) as usize;
-    let mut lines = vec![Line::default()];
-    for (field, label, value) in values {
-        let selected = settings.field == field;
-        let marker = if selected { ">" } else { " " };
-        let style = if selected {
-            theme.selected
-        } else {
-            theme.style(VisualRole::Primary)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker} {label:<10}"), style),
-            Span::styled(fit_text(&value, value_width), style),
-        ]));
-        lines.push(Line::default());
+        rows.push(SettingsRow::Field(spec.field));
+        rows.push(SettingsRow::Spacer);
     }
+    rows
+}
+
+const SETTINGS_LABEL_COLUMNS: usize = 12;
+
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, theme: &UiTheme) {
+    let popup = centered_rect(88, 22, area);
+    let inner = Block::bordered().inner(popup);
+    let footer_rows = 2usize;
+    let visible = (inner.height as usize).saturating_sub(footer_rows);
+
+    let rows = settings_rows();
+    let selected_field = form.field();
+    let selected_row = rows
+        .iter()
+        .position(|row| matches!(row, SettingsRow::Field(field) if *field == selected_field))
+        .unwrap_or(0);
+    let scroll = selected_row
+        .saturating_sub(visible.saturating_sub(1))
+        .min(rows.len().saturating_sub(visible));
+
+    let value_width = inner
+        .width
+        .saturating_sub(SETTINGS_LABEL_COLUMNS as u16 + 7) as usize;
+    let mut lines = Vec::with_capacity(visible + footer_rows);
+    for row in rows.iter().skip(scroll).take(visible) {
+        match row {
+            SettingsRow::Section(section) => {
+                let fill = inner
+                    .width
+                    .saturating_sub(UnicodeWidthStr::width(*section) as u16 + 6)
+                    .min(24) as usize;
+                lines.push(Line::from(Span::styled(
+                    format!("  ━━ {section} {}", "━".repeat(fill)),
+                    theme.strong(VisualRole::Accent),
+                )));
+            }
+            SettingsRow::Field(field) => {
+                let spec = FIELDS.iter().find(|spec| spec.field == *field).unwrap();
+                let selected = *field == selected_field;
+                let marker = if selected { "›" } else { " " };
+                let label_pad = " ".repeat(
+                    SETTINGS_LABEL_COLUMNS.saturating_sub(UnicodeWidthStr::width(spec.label)),
+                );
+                let value = form.value(*field);
+                let label_style = if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Primary)
+                };
+                let value_style = if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Secondary)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {marker} {}{label_pad}", spec.label), label_style),
+                    Span::styled(
+                        format!("  {}", fit_text(value.as_ref(), value_width)),
+                        value_style,
+                    ),
+                ]));
+            }
+            SettingsRow::Spacer => lines.push(Line::default()),
+        }
+    }
+    let divider = "─".repeat(inner.width.saturating_sub(2) as usize);
     lines.push(Line::from(Span::styled(
-        "Tab/↑/↓：切换字段   ←/→：修改",
-        theme.strong(VisualRole::Success),
+        format!("  {divider}"),
+        theme.style(VisualRole::Muted),
     )));
-    lines.push(Line::from("Enter：保存   Esc：取消"));
+    lines.push(Line::from(vec![
+        Span::styled("  ↑/↓ 选择  ", theme.strong(VisualRole::Success)),
+        Span::styled("←/→ 修改  ", theme.strong(VisualRole::Success)),
+        Span::styled("Enter 保存  ", theme.strong(VisualRole::Success)),
+        Span::styled("Esc 取消", theme.strong(VisualRole::Success)),
+    ]));
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1770,6 +1951,57 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
             .block(
                 Block::default()
                     .title(" 命令面板 ")
+                    .borders(Borders::ALL)
+                    .border_style(theme.focus_border),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+const LEADER_POPUP_WIDTH_PERCENT: u16 = 70;
+const LEADER_POPUP_HEIGHT: u16 = 11;
+/// Inner row (0-based, relative to the block's inner area) where the first
+/// leader action is drawn. Shared by rendering and hit-testing so a click
+/// always resolves to the same action that was displayed.
+const LEADER_ACTION_FIRST_ROW: u16 = 1;
+
+/// Maps a mouse position to the leader action drawn at that row, or `None`
+/// when the position is outside the popup or not on an action line.
+pub(crate) fn leader_action_at(rect: Rect, column: u16, row: u16) -> Option<LeaderAction> {
+    let inner = Block::bordered().inner(rect);
+    if column < inner.x || column >= inner.right() || row < inner.y || row >= inner.bottom() {
+        return None;
+    }
+    let row_in_inner = row.checked_sub(inner.y)?;
+    let index = row_in_inner.checked_sub(LEADER_ACTION_FIRST_ROW)?;
+    LeaderAction::ALL.get(index as usize).copied()
+}
+
+fn draw_leader_hint(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiTheme) {
+    let popup = centered_rect(LEADER_POPUP_WIDTH_PERCENT, LEADER_POPUP_HEIGHT, area);
+    let mut lines = vec![Line::default()];
+    for action in LeaderAction::ALL {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {}  ", action.key()),
+                theme.strong(VisualRole::Success),
+            ),
+            Span::styled(action.label(), theme.style(VisualRole::Primary)),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Esc 取消",
+        Style::default().fg(Color::DarkGray),
+    )));
+    app.leader_hint_rect = Some(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" 快捷键 ")
                     .borders(Borders::ALL)
                     .border_style(theme.focus_border),
             )
@@ -1836,12 +2068,6 @@ fn fit_text(value: &str, width: usize) -> String {
         used += character_width;
     }
     output + "..."
-}
-
-#[cfg(test)]
-pub(crate) fn live_thinking_line(app: &App) -> String {
-    live_thinking_lines_with_braille(app, usize::MAX, crate::app::braille_spinner_supported())
-        .join("\n")
 }
 
 #[cfg(test)]
@@ -1999,6 +2225,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn leader_action_at_maps_rows_and_rejects_borders_and_gaps() {
+        let rect = Rect::new(10, 4, 40, 11);
+        // Block::bordered() inner starts at (11, 5); the first action is drawn
+        // one inner row below the top, so New sits at row 6.
+        assert_eq!(leader_action_at(rect, 11, 6), Some(LeaderAction::New));
+        assert_eq!(leader_action_at(rect, 11, 7), Some(LeaderAction::Mode));
+        assert_eq!(leader_action_at(rect, 11, 8), Some(LeaderAction::Settings));
+        assert_eq!(leader_action_at(rect, 11, 9), Some(LeaderAction::Fork));
+        assert_eq!(leader_action_at(rect, 11, 10), Some(LeaderAction::Palette));
+        assert_eq!(leader_action_at(rect, 11, 11), Some(LeaderAction::Cluster));
+        assert_eq!(leader_action_at(rect, 11, 12), Some(LeaderAction::Quit));
+        // Top gap row, trailing gap / Esc hint row, and the border column are
+        // not clickable actions.
+        assert_eq!(leader_action_at(rect, 11, 5), None);
+        assert_eq!(leader_action_at(rect, 11, 13), None);
+        assert_eq!(leader_action_at(rect, 10, 6), None);
+    }
+
+    #[test]
+    fn thinking_summary_folds_to_last_line_and_expands() {
+        let thinking = ThinkingDisplay {
+            id: "thinking-0".into(),
+            content: "第一行\n\n最后一行".into(),
+        };
+        let target = Some(InteractionTarget::ThinkingSummary("thinking-0".into()));
+
+        let mut lines = Vec::new();
+        let mut interactions = Vec::new();
+        render_thinking_summary(&thinking, false, 40, &mut lines, &mut interactions);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(interactions, vec![target.clone()]);
+        let collapsed = lines[0].to_string();
+        assert!(collapsed.contains('▸'));
+        assert!(collapsed.contains("最后一行"));
+        assert!(!collapsed.contains("第一行"));
+
+        lines.clear();
+        interactions.clear();
+        render_thinking_summary(&thinking, true, 40, &mut lines, &mut interactions);
+        assert_eq!(interactions.first(), Some(&target));
+        let expanded = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded.contains('▾'));
+        assert!(expanded.contains("第一行"));
+        assert!(expanded.contains("最后一行"));
+    }
+
+    #[test]
+    fn settings_rows_group_fields_in_order() {
+        let rows = settings_rows();
+        let sections: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SettingsRow::Section(section) => Some(*section),
+                SettingsRow::Field(_) | SettingsRow::Spacer => None,
+            })
+            .collect();
+        assert_eq!(sections, vec!["基础", "连接", "高级"]);
+
+        let fields: Vec<SettingsField> = rows
+            .iter()
+            .filter_map(|row| match row {
+                SettingsRow::Section(_) | SettingsRow::Spacer => None,
+                SettingsRow::Field(field) => Some(*field),
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                SettingsField::Preset,
+                SettingsField::Protocol,
+                SettingsField::Model,
+                SettingsField::BaseUrl,
+                SettingsField::Thinking,
+                SettingsField::ApiKey,
+            ]
+        );
+    }
+
+    #[test]
     fn task_block_inner_is_the_message_layout_viewport() {
         let area = Rect::new(30, 0, 80, 20);
         let block = Block::default().title(" 任务 ").borders(Borders::BOTTOM);
@@ -2025,6 +2334,38 @@ mod tests {
         assert_eq!(session_window_start(10, 4, 4), 1);
         assert_eq!(session_window_start(10, 9, 4), 6);
         assert_eq!(session_window_start(2, 1, 4), 0);
+    }
+
+    #[test]
+    fn flatten_session_tree_orders_children_and_collapses() {
+        let sessions = vec![
+            SessionSummary {
+                id: "root".into(),
+                title: "Root".into(),
+                parent_id: None,
+            },
+            SessionSummary {
+                id: "other".into(),
+                title: "Other".into(),
+                parent_id: None,
+            },
+            SessionSummary {
+                id: "child".into(),
+                title: "Child".into(),
+                parent_id: Some("root".into()),
+            },
+        ];
+        let rows = flatten_session_tree(&sessions, &HashSet::new());
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["root", "child", "other"]);
+        assert_eq!(rows[1].depth, 1);
+        assert!(rows[0].has_children && rows[0].expanded);
+
+        let collapsed: HashSet<String> = ["root".into()].into_iter().collect();
+        let rows = flatten_session_tree(&sessions, &collapsed);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["root", "other"]);
+        assert!(rows[0].has_children && !rows[0].expanded);
     }
 
     #[test]

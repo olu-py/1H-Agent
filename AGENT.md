@@ -66,7 +66,7 @@ terminal event -> app::App -> agent::AgentRunner -> provider::OpenAiClient
 | App/模型事件 channel | 各 `128`；子 Agent 模型事件 `512` |
 | 输入与历史 | 512 KiB；仅内存，最多 50 条 |
 | 显示与对话窗口 | 1,000 条或约 2 MiB；200 项或约 1 MiB |
-| 思考摘要 / `@` 文件 | 1,024 B；单文件 64 KiB、总计 256 KiB |
+| 思考摘要 / `@` 文件 | 思考摘要每条持久化 64 KiB（实时显示行 1,024 B）；单文件 64 KiB、总计 256 KiB |
 | 输出剪贴板 / 边缘滚动 | 单次文本最多 256 KiB；约 80 ms 自动滚动计时器仅在拖拽期间存在 |
 | Agent/tool | 默认最多 8 turn；命令 60 秒；工具输出 1 MiB |
 | Web | 最多 5 次重定向；连接 10 秒、请求 30 秒；抓取默认 10 MiB |

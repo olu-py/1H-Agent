@@ -613,7 +613,61 @@ impl ProviderPreset {
     pub fn supports_previous_response_id(self) -> bool {
         !matches!(self, Self::DeepSeek)
     }
+
+    /// Candidate models offered by the settings picker. `Custom` returns an
+    /// empty list, so its model must be typed manually. Kept separate from the
+    /// context-window lookup tables: those serve token estimation, not choice.
+    pub fn selectable_models(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenAi => OPENAI_SELECTABLE_MODELS,
+            Self::DeepSeek => DEEPSEEK_SELECTABLE_MODELS,
+            Self::Qwen => QWEN_SELECTABLE_MODELS,
+            Self::Volcano => VOLCANO_SELECTABLE_MODELS,
+            Self::Custom => &[],
+        }
+    }
+
+    /// Inverse of `key_id`, used to recover a preset from its stored form.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.key_id() == value)
+    }
 }
+
+const OPENAI_SELECTABLE_MODELS: &[&str] = &[
+    "gpt-5-mini",
+    "gpt-5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "o1",
+    "o3",
+    "o4-mini",
+    "gpt-4o",
+    "gpt-4.1",
+    "o1-mini",
+    "o1-preview",
+];
+
+const DEEPSEEK_SELECTABLE_MODELS: &[&str] = &[
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-chat",
+    "deepseek-reasoner",
+];
+
+const QWEN_SELECTABLE_MODELS: &[&str] = &[
+    "qwen3.8-max",
+    "qwen3.7-max",
+    "qwen-plus",
+    "qwen-max",
+    "qwen-turbo",
+    "qwen-long",
+];
+
+const VOLCANO_SELECTABLE_MODELS: &[&str] =
+    &["doubao-seed-2-1-pro-260628", "deepseek-v4-flash", "glm-5.2"];
 
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 258_000;
 
@@ -1003,6 +1057,20 @@ fn default_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selectable_models_cover_defaults_and_custom_is_empty() {
+        for preset in [
+            ProviderPreset::OpenAi,
+            ProviderPreset::DeepSeek,
+            ProviderPreset::Qwen,
+            ProviderPreset::Volcano,
+        ] {
+            let default_model = preset.defaults().model;
+            assert!(preset.selectable_models().contains(&default_model.as_str()));
+        }
+        assert!(ProviderPreset::Custom.selectable_models().is_empty());
+    }
 
     #[test]
     fn defaults_are_bounded() {

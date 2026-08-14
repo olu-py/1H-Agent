@@ -20,6 +20,7 @@ pub enum Command {
     Agent(Option<String>),
     Mode(AgentMode),
     Clear,
+    Cluster,
     Quit,
 }
 
@@ -83,6 +84,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "build" => Command::Mode(AgentMode::Build),
         "explore" => Command::Mode(AgentMode::Explore),
         "clear" => Command::Clear,
+        "cluster" => Command::Cluster,
         "quit" | "exit" | "q" => Command::Quit,
         _ => return None,
     })

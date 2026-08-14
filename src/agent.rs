@@ -1,5 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -18,6 +22,28 @@ use crate::{
     storage::Storage,
     tools::SharedToolRegistry,
 };
+
+/// Upper bound for a single persisted thinking summary. Matches the UI's live
+/// thinking buffer limit so the stored summary and the displayed summary stay
+/// consistent even when the model streams an unusually long reasoning block.
+const MAX_REASONING_BYTES: usize = 64 * 1024;
+
+/// Appends a reasoning delta while keeping the buffer within
+/// `MAX_REASONING_BYTES`, retaining the tail (like the live UI buffer) on
+/// overflow.
+fn append_reasoning_bounded(buffer: &mut String, delta: &str) {
+    buffer.push_str(delta);
+    if buffer.len() <= MAX_REASONING_BYTES {
+        return;
+    }
+    let minimum = buffer.len() - MAX_REASONING_BYTES;
+    let start = buffer
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .find(|offset| *offset >= minimum)
+        .unwrap_or(buffer.len());
+    buffer.drain(..start);
+}
 
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -90,8 +116,16 @@ impl AgentRunner {
         }
     }
 
-    pub async fn run(&self, mut items: Vec<ConversationItem>, ui_events: mpsc::Sender<AgentEvent>) {
-        if let Err(error) = self.run_at_depth(&mut items, &ui_events, 0).await {
+    pub async fn run(
+        &self,
+        mut items: Vec<ConversationItem>,
+        ui_events: mpsc::Sender<AgentEvent>,
+        cluster_mode: bool,
+    ) {
+        if let Err(error) = self
+            .run_at_depth(&mut items, &ui_events, 0, cluster_mode)
+            .await
+        {
             if error.starts_with("cancelled:") {
                 let _ = ui_events.send(AgentEvent::Cancelled(error)).await;
             } else {
@@ -105,8 +139,9 @@ impl AgentRunner {
         items: &mut Vec<ConversationItem>,
         ui_events: &mpsc::Sender<AgentEvent>,
         depth: usize,
+        cluster_mode: bool,
     ) -> Result<(), String> {
-        self.run_inner(items, ui_events, depth).await
+        self.run_inner(items, ui_events, depth, cluster_mode).await
     }
 
     async fn run_inner(
@@ -114,6 +149,7 @@ impl AgentRunner {
         items: &mut Vec<ConversationItem>,
         ui_events: &mpsc::Sender<AgentEvent>,
         depth: usize,
+        cluster_mode: bool,
     ) -> Result<(), String> {
         let mut previous_response_id = if self.provider_config.use_previous_response_id {
             self.storage
@@ -147,6 +183,7 @@ impl AgentRunner {
                         content: prompt::system_prompt(
                             self.provider_config.preset,
                             self.tools.mode(),
+                            cluster_mode,
                         ),
                     },
                 );
@@ -177,6 +214,7 @@ impl AgentRunner {
                 tokio::spawn(async move { provider.stream(request, model_tx).await });
 
             let mut assistant_text = String::new();
+            let mut reasoning_text = String::new();
             let mut partials: HashMap<String, PartialToolCall> = HashMap::new();
             let mut completed_calls = Vec::new();
             let mut completed_ids = HashSet::new();
@@ -244,6 +282,7 @@ impl AgentRunner {
                         }
                     }
                     ModelEvent::ReasoningDelta(delta) => {
+                        append_reasoning_bounded(&mut reasoning_text, &delta);
                         ui_events
                             .send(AgentEvent::ReasoningDelta(delta))
                             .await
@@ -331,6 +370,15 @@ impl AgentRunner {
                     arguments,
                 });
             }
+            let reasoning_text = reasoning_text.trim();
+            if !reasoning_text.is_empty() {
+                items.push(ConversationItem::ThinkingSummary {
+                    content: reasoning_text.to_owned(),
+                });
+                self.storage
+                    .append_thinking_summary(&self.session_id, reasoning_text)
+                    .map_err(|error| error.to_string())?;
+            }
             if !assistant_text.is_empty() {
                 items.push(ConversationItem::Message {
                     role: Role::Assistant,
@@ -359,6 +407,7 @@ impl AgentRunner {
             // When Responses server state is enabled, the response already owns the
             // assistant text and tool calls. Only subsequent tool outputs are new.
             request_cursor = items.len();
+            let mut spawn_tasks: Vec<ToolCall> = Vec::new();
             for call in completed_calls {
                 let signature = tool_call_signature(&call);
                 if executed_tool_calls.contains(&signature) {
@@ -387,16 +436,14 @@ impl AgentRunner {
                             .begin_tool(&self.session_id, &call, "denied")
                             .map_err(|error| error.to_string())?;
                         let result = format!("denied by policy: {reason}");
-                        self.storage
-                            .finish_tool(&call.id, &result)
-                            .map_err(|error| error.to_string())?;
-                        items.push(ConversationItem::ToolOutput {
-                            call_id: call.id.clone(),
-                            output: result.clone(),
-                        });
-                        self.storage
-                            .append_tool_output(&self.session_id, &call.id, &result)
-                            .map_err(|error| error.to_string())?;
+                        self.complete_tool(
+                            &call,
+                            &result,
+                            ui_events,
+                            items,
+                            &mut executed_tool_calls,
+                        )
+                        .await?;
                         continue;
                     }
                     PolicyDecision::RequireApproval(reason) => {
@@ -418,46 +465,99 @@ impl AgentRunner {
                 self.storage
                     .begin_tool(&self.session_id, &call, decision_name)
                     .map_err(|error| error.to_string())?;
-                let result = if approved {
-                    ui_events
-                        .send(AgentEvent::ToolStarted(call.clone()))
-                        .await
-                        .map_err(|_| "UI event receiver closed".to_owned())?;
-                    if call.name == "agent_spawn" {
-                        if depth >= 1 {
-                            "child agents cannot recursively spawn another child".into()
-                        } else {
-                            self.run_child(&call).await.unwrap_or_else(|error| error)
-                        }
-                    } else {
-                        self.tools
-                            .execute(&call)
-                            .await
-                            .unwrap_or_else(|error| error.to_string())
-                    }
-                } else {
-                    "rejected by user".into()
-                };
-                self.storage
-                    .finish_tool(&call.id, &result)
-                    .map_err(|error| error.to_string())?;
+                if !approved {
+                    self.complete_tool(
+                        &call,
+                        "rejected by user",
+                        ui_events,
+                        items,
+                        &mut executed_tool_calls,
+                    )
+                    .await?;
+                    continue;
+                }
                 ui_events
-                    .send(AgentEvent::ToolFinished {
-                        call: call.clone(),
-                        result: result.clone(),
-                    })
+                    .send(AgentEvent::ToolStarted(call.clone()))
                     .await
                     .map_err(|_| "UI event receiver closed".to_owned())?;
-                items.push(ConversationItem::ToolOutput {
-                    call_id: call.id.clone(),
-                    output: result.clone(),
-                });
-                self.storage
-                    .append_tool_output(&self.session_id, &call.id, &result)
-                    .map_err(|error| error.to_string())?;
-                executed_tool_calls.insert(signature);
+                if call.name == "agent_spawn" {
+                    if depth >= 1 {
+                        self.complete_tool(
+                            &call,
+                            "child agents cannot recursively spawn another child",
+                            ui_events,
+                            items,
+                            &mut executed_tool_calls,
+                        )
+                        .await?;
+                    } else {
+                        spawn_tasks.push(call);
+                    }
+                } else {
+                    let result = self
+                        .tools
+                        .execute(&call)
+                        .await
+                        .unwrap_or_else(|error| error.to_string());
+                    self.complete_tool(&call, &result, ui_events, items, &mut executed_tool_calls)
+                        .await?;
+                }
+            }
+
+            if !spawn_tasks.is_empty() {
+                let mut futures = FuturesUnordered::new();
+                for call in &spawn_tasks {
+                    let runner = self.clone();
+                    let call = call.clone();
+                    futures.push(async move {
+                        let result = runner.run_child(&call).await.unwrap_or_else(|error| error);
+                        (call.id, result)
+                    });
+                }
+                let mut results: HashMap<String, String> = HashMap::new();
+                while let Some((call_id, result)) = futures.next().await {
+                    results.insert(call_id, result);
+                }
+                for call in spawn_tasks {
+                    let result = results
+                        .remove(&call.id)
+                        .unwrap_or_else(|| "child agent did not produce a result".into());
+                    self.complete_tool(&call, &result, ui_events, items, &mut executed_tool_calls)
+                        .await?;
+                }
             }
         }
+    }
+
+    /// Finishes an already-started tool call: persists the result, emits the
+    /// `ToolFinished` event, and appends the tool output to the conversation.
+    async fn complete_tool(
+        &self,
+        call: &ToolCall,
+        result: &str,
+        ui_events: &mpsc::Sender<AgentEvent>,
+        items: &mut Vec<ConversationItem>,
+        executed_tool_calls: &mut HashSet<String>,
+    ) -> Result<(), String> {
+        self.storage
+            .finish_tool(&call.id, result)
+            .map_err(|error| error.to_string())?;
+        ui_events
+            .send(AgentEvent::ToolFinished {
+                call: call.clone(),
+                result: result.to_owned(),
+            })
+            .await
+            .map_err(|_| "UI event receiver closed".to_owned())?;
+        items.push(ConversationItem::ToolOutput {
+            call_id: call.id.clone(),
+            output: result.to_owned(),
+        });
+        self.storage
+            .append_tool_output(&self.session_id, &call.id, result)
+            .map_err(|error| error.to_string())?;
+        executed_tool_calls.insert(tool_call_signature(call));
+        Ok(())
     }
 
     async fn run_child(&self, call: &ToolCall) -> Result<String, String> {
@@ -468,7 +568,42 @@ impl AgentRunner {
         }
         let mut provider_config = self.provider_config.clone();
         let _max_turns = arguments.max_turns.unwrap_or(3).clamp(1, 3);
+        if let Some(model) = arguments
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            provider_config.model = model.to_owned();
+        }
         provider_config.use_previous_response_id = false;
+
+        // Create a nested session so the child's work is inspectable from the
+        // session panel, using its own model when one was requested.
+        let workspace = self
+            .storage
+            .session_workspace(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let title = arguments
+            .title
+            .as_deref()
+            .or(arguments.role.as_deref())
+            .unwrap_or("子 Agent")
+            .to_owned();
+        let child_id = self
+            .storage
+            .create_child_session(
+                Path::new(&workspace),
+                &self.session_id,
+                self.provider_config.preset.key_id(),
+                &provider_config.model,
+                &title,
+            )
+            .map_err(|error| error.to_string())?;
+        self.storage
+            .append_message(&child_id, Role::User, &arguments.prompt)
+            .map_err(|error| error.to_string())?;
+
         let thinking_profile_kind =
             thinking_profile(provider_config.preset, &provider_config.model).kind;
         let request = ModelRequest {
@@ -542,6 +677,9 @@ impl AgentRunner {
         if output.is_empty() {
             output.push_str("[child agent returned no text]");
         }
+        self.storage
+            .append_message(&child_id, Role::Assistant, &output)
+            .map_err(|error| error.to_string())?;
         Ok(output)
     }
 }
@@ -647,6 +785,9 @@ fn thinking_mode_for(config: &ProviderConfig) -> ThinkingMode {
 struct ChildArgs {
     prompt: String,
     max_turns: Option<usize>,
+    role: Option<String>,
+    model: Option<String>,
+    title: Option<String>,
 }
 
 #[cfg(test)]
@@ -780,6 +921,7 @@ mod tests {
                         content: "run tools".into(),
                     }],
                     events,
+                    false,
                 )
                 .await;
         });
@@ -796,6 +938,125 @@ mod tests {
         task.await.unwrap();
         assert!(completed);
         assert!(failed.is_none(), "unexpected failure: {failed:?}");
+    }
+
+    #[tokio::test]
+    async fn reasoning_deltas_are_persisted_as_thinking_summary() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "think")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![vec![
+            ModelEvent::ReasoningDelta("第一段".into()),
+            ModelEvent::ReasoningDelta("第二段".into()),
+            ModelEvent::TextDelta("answer".into()),
+            ModelEvent::Done,
+        ]])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage.clone(),
+            session_id.clone(),
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "think".into(),
+                    }],
+                    events,
+                    false,
+                )
+                .await;
+        });
+
+        let mut completed = false;
+        let mut reasoning_seen = false;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::Completed { items } => {
+                    completed = true;
+                    assert!(items.iter().any(|item| {
+                        matches!(
+                            item,
+                            ConversationItem::ThinkingSummary { content }
+                                if content == "第一段第二段"
+                        )
+                    }));
+                }
+                AgentEvent::ReasoningDelta(_) => reasoning_seen = true,
+                AgentEvent::Failed(error) => panic!("unexpected failure: {error}"),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert!(completed);
+        assert!(reasoning_seen);
+
+        let loaded = storage.load_messages(&session_id).unwrap();
+        assert!(loaded.iter().any(|item| {
+            matches!(
+                item,
+                ConversationItem::ThinkingSummary { content } if content == "第一段第二段"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn child_agent_creates_nested_session_with_model_and_result() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "parent")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![vec![
+            ModelEvent::TextDelta("child result".into()),
+            ModelEvent::Done,
+        ]])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::OpenAi.defaults(),
+            tools,
+            storage.clone(),
+            session_id.clone(),
+        );
+
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "agent_spawn".into(),
+            arguments: serde_json::json!({"prompt":"do the plan","role":"plan","model":"gpt-5"}),
+        };
+        let result = runner.run_child(&call).await.unwrap();
+        assert_eq!(result, "child result");
+
+        let sessions = storage.list_sessions(temp.path()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let child = sessions.iter().find(|s| s.id != session_id).unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(child.title, "plan");
+        assert_eq!(
+            storage.session_provider_model(&child.id).unwrap().1,
+            "gpt-5"
+        );
+        assert_eq!(storage.load_messages(&child.id).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -845,6 +1106,7 @@ mod tests {
                         content: "read fixture".into(),
                     }],
                     events,
+                    false,
                 )
                 .await;
         });
