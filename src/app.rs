@@ -26,7 +26,6 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     agent::{AgentEvent, AgentRunner},
@@ -37,7 +36,9 @@ use crate::{
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
     secrets,
     security::Workspace,
-    session::SessionRuntime,
+    session::{
+        EventCtx, SessionRuntime, estimate_context_tokens, tool_result_status, trim_conversation,
+    },
     settings::SettingsForm,
     storage::{SessionSummary, Storage},
     tools::ToolRegistry,
@@ -61,7 +62,6 @@ pub struct CommandPaletteState {
 pub struct App {
     pub workspace: PathBuf,
     pub input: InputBuffer,
-    pub status: String,
     pub context_meter_enabled: bool,
     pub settings: Option<SettingsForm>,
     pub palette: Option<CommandPaletteState>,
@@ -143,7 +143,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         .and_then(|value| AgentMode::parse(&value))
         .unwrap_or_default();
     registry.set_mode(initial_mode);
-    let runtime = build_runtime(
+    let mut runtime = build_runtime(
         &storage,
         &config,
         &registry,
@@ -151,10 +151,10 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         active_secret.as_ref(),
         &session_id,
     );
+    runtime.status = initial_status;
     let mut app = App {
         workspace: workspace_path,
         input: InputBuffer::new(),
-        status: initial_status,
         context_meter_enabled: config.ui.context_meter,
         settings: None,
         palette: None,
@@ -338,7 +338,7 @@ async fn event_loop(
             task.abort();
         }
     }
-    if let Some(approval) = take_pending_approval(app) {
+    if let Some(approval) = app.current.take_pending_approval() {
         if let ApprovalAction::Agent(reply) = approval.action {
             let _ = reply.send(false);
         }
@@ -454,7 +454,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
                 query: String::new(),
                 selected: 0,
             });
-            app.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
+            app.current.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
             true
         }
         KeyCode::PageUp if !app.current.busy => {
@@ -489,16 +489,16 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
         {
             app.leader_pending = true;
-            app.status = "快捷键待命 | 按下对应键执行 | Esc 取消".into();
+            app.current.status = "快捷键待命 | 按下对应键执行 | Esc 取消".into();
             true
         }
         _ if app.leader_pending => {
             app.leader_pending = false;
             match key.code {
-                KeyCode::Esc => app.status = "已取消".into(),
+                KeyCode::Esc => app.current.status = "已取消".into(),
                 _ => match LeaderAction::from_key(key.code) {
                     Some(action) => execute_leader_action(app, action)?,
-                    None => app.status = "未知快捷键".into(),
+                    None => app.current.status = "未知快捷键".into(),
                 },
             }
             true
@@ -525,12 +525,12 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             app.leader_pending = false;
             if let Some(task) = app.current.active_task.take() {
                 task.abort();
-                finish_thinking(app, "思考已取消");
+                app.current.finish_thinking("思考已取消");
                 app.current.busy = false;
                 app.current.agent_phase = AgentPhase::Idle;
                 app.current.model_phase = ModelPhase::Idle;
-                app.status = "已取消".into();
-                app.push_entry(DisplayEntry {
+                app.current.status = "已取消".into();
+                app.current.push_entry(DisplayEntry {
                     kind: DisplayKind::System,
                     content: DisplayContent::Markdown("请求已取消。".into()),
                 });
@@ -676,7 +676,7 @@ fn handle_leader_mouse(
         .and_then(|rect| ui::leader_action_at(rect, mouse.column, mouse.row));
     match action {
         Some(action) => execute_leader_action(app, action)?,
-        None => app.status = "已取消".into(),
+        None => app.current.status = "已取消".into(),
     }
     Ok(Some(EventOutcome::redraw()))
 }
@@ -761,7 +761,7 @@ fn apply_thinking_selection(
     app.config.provider.thinking_budget_tokens = budget;
     app.config.provider.normalize_thinking();
     rebuild_runner(app)?;
-    app.status = match app.config.save() {
+    app.current.status = match app.config.save() {
         Ok(()) => format!(
             "思考强度已设为 {}",
             app.config.provider.thinking_level.label()
@@ -813,7 +813,7 @@ fn handle_navigation_mouse(
         && point_in_rect(mouse.column, mouse.row, rect)
     {
         if app.current.busy {
-            app.status = "请求运行中，无法切换模式".into();
+            app.current.status = "请求运行中，无法切换模式".into();
             return Ok(Some(EventOutcome::redraw()));
         }
         switch_mode(app, next_mode(app.current.mode))?;
@@ -841,7 +841,7 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                 .as_ref()
                 .and_then(|layout| layout.interaction_at(mouse.column, mouse.row));
             if app.mouse_press_target.is_some() {
-                app.clear_output_selection();
+                app.current.clear_output_selection();
                 app.current.edge_scroll = EdgeScroll::default();
                 return EventOutcome::redraw();
             }
@@ -851,7 +851,7 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                 .as_ref()
                 .and_then(|layout| layout.hit_test(mouse.column, mouse.row))
             else {
-                app.clear_output_selection();
+                app.current.clear_output_selection();
                 return EventOutcome::redraw();
             };
             if app.current.follow_output {
@@ -941,7 +941,7 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                             }
                         }
                     }
-                    app.invalidate_output_layout();
+                    app.current.invalidate_output_layout();
                 }
                 app.mouse_dragged = false;
                 return EventOutcome::redraw();
@@ -963,23 +963,23 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                 .and_then(|layout| layout.text.get(start..end))
                 .map(str::to_owned)
             else {
-                app.status = "复制失败：选区位置已失效".into();
+                app.current.status = "复制失败：选区位置已失效".into();
                 return EventOutcome::redraw();
             };
             match crate::clipboard::copy_text(&text) {
                 crate::clipboard::CopyResult::Native => {
-                    app.status = "系统剪贴板已复制".into();
+                    app.current.status = "系统剪贴板已复制".into();
                     EventOutcome::redraw()
                 }
                 crate::clipboard::CopyResult::Osc52Requested(sequence) => {
-                    app.status = "已向终端发送复制请求".into();
+                    app.current.status = "已向终端发送复制请求".into();
                     EventOutcome {
                         redraw: true,
                         osc52: Some(sequence),
                     }
                 }
                 crate::clipboard::CopyResult::Error(error) => {
-                    app.status = format!("复制失败：{error}");
+                    app.current.status = format!("复制失败：{error}");
                     EventOutcome::redraw()
                 }
             }
@@ -1104,17 +1104,6 @@ fn edge_scroll_direction(row: u16, viewport: ratatui::layout::Rect) -> i8 {
     }
 }
 
-fn clear_output_selection(app: &mut App) {
-    app.current.output_selection = None;
-    app.current.edge_scroll = EdgeScroll::default();
-}
-
-fn push_entry(app: &mut App, entry: DisplayEntry) {
-    clear_output_selection(app);
-    app.invalidate_output_layout();
-    app.current.entries.push(entry);
-}
-
 impl App {
     pub(crate) fn provider_label(&self) -> &'static str {
         self.config.provider.preset.label()
@@ -1135,47 +1124,27 @@ impl App {
     pub(crate) fn thinking_profile(&self) -> ThinkingProfile {
         thinking_profile(self.config.provider.preset, &self.config.provider.model)
     }
-
-    fn clear_output_selection(&mut self) {
-        clear_output_selection(self);
-    }
-
-    fn push_entry(&mut self, entry: DisplayEntry) {
-        push_entry(self, entry);
-    }
-
-    pub fn invalidate_output_layout(&mut self) {
-        self.current.message_layout.take();
-        self.current.output_layout_dirty = true;
-    }
 }
 
 fn cancel_active_request(app: &mut App) {
-    if let Some(approval) = take_pending_approval(app)
-        && let ApprovalAction::Agent(reply) = approval.action
-    {
-        let _ = reply.send(false);
+    if let Some(approval) = app.current.take_pending_approval() {
+        app.force_full_redraw = true;
+        if let ApprovalAction::Agent(reply) = approval.action {
+            let _ = reply.send(false);
+        }
     }
     if let Some(task) = app.current.active_task.take() {
         task.abort();
     }
-    finish_thinking(app, "思考已取消");
+    app.current.finish_thinking("思考已取消");
     app.current.busy = false;
     app.current.agent_phase = AgentPhase::Idle;
     app.current.model_phase = ModelPhase::Idle;
-    app.status = "已取消当前请求".into();
-    app.push_entry(DisplayEntry {
+    app.current.status = "已取消当前请求".into();
+    app.current.push_entry(DisplayEntry {
         kind: DisplayKind::System,
         content: DisplayContent::Markdown("当前请求已取消。".into()),
     });
-}
-
-fn take_pending_approval(app: &mut App) -> Option<PendingApproval> {
-    let approval = app.current.pending_approval.take();
-    if approval.is_some() {
-        app.force_full_redraw = true;
-    }
-    approval
 }
 
 fn scroll_messages(app: &mut App, delta: isize) {
@@ -1251,23 +1220,23 @@ fn submit_input(app: &mut App) -> Result<()> {
             return submit_input(app);
         }
         app.input.clear();
-        app.push_entry(DisplayEntry {
+        app.current.push_entry(DisplayEntry {
             kind: DisplayKind::Error,
             content: DisplayContent::Markdown(format!("未知命令，请使用 /help 查看命令：{input}")),
         });
         return Ok(());
     }
     let Some(runner) = app.current.runner.clone() else {
-        app.status = "请打开提供商设置配置 API Key".into();
+        app.current.status = "请打开提供商设置配置 API Key".into();
         return Ok(());
     };
     app.input.clear();
     app.file_suggestions.clear();
-    app.clear_output_selection();
+    app.current.clear_output_selection();
     app.current.message_scroll = 0;
     app.current.follow_output = true;
     app.current.output_scroll_top = None;
-    app.push_entry(DisplayEntry {
+    app.current.push_entry(DisplayEntry {
         kind: DisplayKind::User,
         content: DisplayContent::Markdown(input.clone()),
     });
@@ -1284,7 +1253,7 @@ fn submit_input(app: &mut App) -> Result<()> {
         });
         app.storage
             .append_context(&app.current.session_id, &label, &content)?;
-        app.push_entry(DisplayEntry {
+        app.current.push_entry(DisplayEntry {
             kind: DisplayKind::System,
             content: DisplayContent::Markdown(format!("已附加文件 @{label}")),
         });
@@ -1295,13 +1264,13 @@ fn submit_input(app: &mut App) -> Result<()> {
     app.current.busy = true;
     app.current.agent_phase = AgentPhase::Thinking;
     app.current.model_phase = ModelPhase::Idle;
-    app.status = "准备请求中…… | Esc 取消".into();
+    app.current.status = "准备请求中…… | Esc 取消".into();
     let items = app.current.conversation.clone();
     let events = app.current.agent_tx.clone();
     app.current.active_task = Some(tokio::spawn(async move {
         runner.run(items, events).await;
     }));
-    trim_app_entries(app);
+    app.current.trim_entries();
     Ok(())
 }
 
@@ -1429,7 +1398,7 @@ fn open_settings(app: &mut App) {
         app.config.provider.clone(),
         existing_key_preset,
     ));
-    app.status = "提供商设置".into();
+    app.current.status = "提供商设置".into();
 }
 
 fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -1440,7 +1409,7 @@ fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Esc => {
             app.palette = None;
-            app.status = "就绪".into();
+            app.current.status = "就绪".into();
         }
         KeyCode::Enter => {
             let selected = results.get(palette.selected).copied();
@@ -1449,7 +1418,7 @@ fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.palette = None;
             if let Some(command) = command {
                 if let Err(error) = execute_command(app, command) {
-                    app.status = format!("命令失败：{error}");
+                    app.current.status = format!("命令失败：{error}");
                 }
             }
         }
@@ -1474,14 +1443,14 @@ fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
 fn execute_command(app: &mut App, command: Command) -> Result<()> {
     match command {
         Command::Help => {
-            app.push_entry(DisplayEntry {
+            app.current.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(
                     "## 命令\n\n`/new` `/sessions` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 命令面板 | Ctrl+X 快捷键 | @ 文件 | ! Shell"
                         .into(),
                 ),
             });
-            app.status = "命令帮助".into();
+            app.current.status = "命令帮助".into();
         }
         Command::NewSession => create_session(app)?,
         Command::Sessions => {
@@ -1499,7 +1468,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            app.push_entry(DisplayEntry {
+            app.current.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(if listing.is_empty() {
                     "暂无会话".into()
@@ -1512,18 +1481,18 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         Command::Model(model) => {
             if let Some(model) = model {
                 if model.trim().is_empty() {
-                    app.status = "模型不能为空".into();
+                    app.current.status = "模型不能为空".into();
                 } else {
                     app.config.provider.model = model.trim().to_owned();
                     app.config.provider.normalize_thinking();
                     app.current.context_limit_tokens =
                         app.config.provider.resolved_context_window_tokens();
                     rebuild_runner(app)?;
-                    app.status = format!("模型已设置为 {}", app.config.provider.model);
+                    app.current.status = format!("模型已设置为 {}", app.config.provider.model);
                     let _ = app.config.save();
                 }
             } else {
-                app.status = format!("当前模型：{}", app.config.provider.model);
+                app.current.status = format!("当前模型：{}", app.config.provider.model);
             }
         }
         Command::Agent(agent) => {
@@ -1536,8 +1505,8 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                     // Force a fresh provider context so the new mode contract is
                     // sent as the stable system prefix on the next request.
                     app.storage.clear_response_id(&app.current.session_id)?;
-                    app.status = format!("Agent：{} | 模式：{}", name, app.current.mode);
-                    app.push_entry(DisplayEntry {
+                    app.current.status = format!("Agent：{} | 模式：{}", name, app.current.mode);
+                    app.current.push_entry(DisplayEntry {
                         kind: DisplayKind::System,
                         content: DisplayContent::Markdown(format!(
                             "Agent 模式已切换为 **{}**。下一次模型请求将使用 {} 执行约束。",
@@ -1546,15 +1515,15 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                         )),
                     });
                 } else {
-                    app.status = format!("未知 Agent：{name}");
+                    app.current.status = format!("未知 Agent：{name}");
                 }
             } else {
-                app.status = format!("当前 Agent 模式：{}", app.current.mode);
+                app.current.status = format!("当前 Agent 模式：{}", app.current.mode);
             }
         }
         Command::Mode(mode) => {
             switch_mode(app, mode)?;
-            app.push_entry(DisplayEntry {
+            app.current.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(format!(
                     "Agent 模式已切换为 **{}**。下一次模型请求将使用 {} 执行约束。",
@@ -1564,11 +1533,11 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             });
         }
         Command::Clear => {
-            app.invalidate_output_layout();
+            app.current.invalidate_output_layout();
             app.current.entries.clear();
-            reset_thinking_state(app);
-            app.clear_output_selection();
-            app.status = "显示已清空，会话历史仍保留".into();
+            app.current.reset_thinking_state();
+            app.current.clear_output_selection();
+            app.current.status = "显示已清空，会话历史仍保留".into();
         }
         Command::Quit => app.should_quit = true,
         Command::Rename(title) => {
@@ -1576,11 +1545,11 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             app.storage
                 .rename_session(&app.current.session_id, &title)?;
             refresh_sessions(app)?;
-            app.status = format!("会话已重命名为 {}", title.trim());
+            app.current.status = format!("会话已重命名为 {}", title.trim());
         }
         Command::Delete => {
             if app.sessions.len() <= 1 {
-                app.status = "不能删除最后一个会话，请先执行 /new".into();
+                app.current.status = "不能删除最后一个会话，请先执行 /new".into();
             } else {
                 let deleted = app.current.session_id.clone();
                 app.storage.delete_session(&deleted)?;
@@ -1590,23 +1559,23 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                     .context("no session remains after delete")?;
                 activate_session(app, next)?;
                 refresh_sessions(app)?;
-                app.status = "会话已删除".into();
+                app.current.status = "会话已删除".into();
             }
         }
         Command::Fork => {
             let fork = app.storage.fork_session(&app.current.session_id)?;
             activate_session(app, fork)?;
             refresh_sessions(app)?;
-            app.status = "会话已创建分支".into();
+            app.current.status = "会话已创建分支".into();
         }
         Command::Undo => {
             if app.storage.undo(&app.current.session_id)? {
                 app.storage.clear_response_id(&app.current.session_id)?;
                 let session_id = app.current.session_id.clone();
                 activate_session(app, session_id)?;
-                app.status = "已撤销上一轮".into();
+                app.current.status = "已撤销上一轮".into();
             } else {
-                app.status = "没有可撤销的内容".into();
+                app.current.status = "没有可撤销的内容".into();
             }
         }
         Command::Redo => {
@@ -1614,9 +1583,9 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 app.storage.clear_response_id(&app.current.session_id)?;
                 let session_id = app.current.session_id.clone();
                 activate_session(app, session_id)?;
-                app.status = "已重做上一轮".into();
+                app.current.status = "已重做上一轮".into();
             } else {
-                app.status = "没有可重做的内容".into();
+                app.current.status = "没有可重做的内容".into();
             }
         }
         Command::Compact => {
@@ -1630,7 +1599,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             }
             let session_id = app.current.session_id.clone();
             activate_session(app, session_id)?;
-            app.status = format!("已压缩 {hidden} 条旧消息");
+            app.current.status = format!("已压缩 {hidden} 条旧消息");
         }
         Command::Export(path) => export_session(app, path)?,
         Command::Diff => start_diff(app)?,
@@ -1711,7 +1680,7 @@ fn execute_leader_action(app: &mut App, action: LeaderAction) -> Result<()> {
                 query: String::new(),
                 selected: 0,
             });
-            app.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
+            app.current.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
             Ok(())
         }
         LeaderAction::Cluster => switch_mode(app, AgentMode::Cluster),
@@ -1746,7 +1715,7 @@ fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
     }
     std::fs::write(&target, output)
         .with_context(|| format!("cannot write export {}", target.display()))?;
-    app.status = format!("对话已导出到 {}", target.display());
+    app.current.status = format!("对话已导出到 {}", target.display());
     Ok(())
 }
 
@@ -1773,7 +1742,7 @@ fn start_diff(app: &mut App) -> Result<()> {
     let registry = app.registry.clone();
     let events = app.current.agent_tx.clone();
     app.current.busy = true;
-    app.status = "正在收集 Git diff…… | Esc 取消".into();
+    app.current.status = "正在收集 Git diff…… | Esc 取消".into();
     app.current.active_task = Some(tokio::spawn(async move {
         let call = ToolCall {
             id: format!("diff_{}", uuid::Uuid::new_v4()),
@@ -1798,7 +1767,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Esc => {
             app.settings = None;
-            app.status = "设置已取消".into();
+            app.current.status = "设置已取消".into();
         }
         KeyCode::Tab | KeyCode::Down => {
             if let Some(form) = &mut app.settings {
@@ -1831,7 +1800,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Enter => {
             if let Err(error) = apply_settings(app) {
-                app.status = format!("设置错误：{}", secrets::redact(&error.to_string()));
+                app.current.status = format!("设置错误：{}", secrets::redact(&error.to_string()));
             }
         }
         _ => {}
@@ -1880,7 +1849,7 @@ fn apply_settings(app: &mut App) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     app.settings = None;
-    app.status = format!(
+    app.current.status = format!(
         "就绪 | {} | {}{}",
         provider_config.preset.label(),
         provider_config.model,
@@ -1895,323 +1864,32 @@ fn apply_settings(app: &mut App) -> Result<()> {
 
 /// Routes an agent event to its owning session. Events for the active session
 /// are applied directly and trigger a redraw; events for a background session
-/// are applied by temporarily swapping the runtime in, without redrawing or
+/// are applied to that session's runtime in place, without redrawing or
 /// disturbing the active session's status.
 fn handle_routed_event(app: &mut App, routed: RoutedEvent) -> bool {
     let RoutedEvent { session_id, event } = routed;
-    if session_id == app.active_session {
-        handle_agent_event(app, event);
-        return true;
+    let is_active = session_id == app.active_session;
+    let outcome = {
+        let ctx = EventCtx {
+            storage: &app.storage,
+            workspace: &app.workspace,
+        };
+        if is_active {
+            app.current.handle_event(&ctx, event)
+        } else if let Some(rt) = app.background.get_mut(&session_id) {
+            rt.handle_event(&ctx, event)
+        } else {
+            return false;
+        }
+    };
+    if outcome.force_redraw && is_active {
+        app.force_full_redraw = true;
     }
-    if !app.background.contains_key(&session_id) {
-        return false;
+    if outcome.sessions_dirty && refresh_sessions(app).is_err() && is_active {
+        app.current.status = "就绪，但刷新会话失败".into();
     }
-    let saved_status = app.status.clone();
-    // Swap the background runtime into `current`, apply the event, then swap
-    // back, preserving both runtimes' in-flight state.
-    let target = app.background.remove(&session_id).unwrap();
-    let parked = std::mem::replace(&mut app.current, target);
-    app.background.insert(app.active_session.clone(), parked);
-    let previous_active = std::mem::replace(&mut app.active_session, session_id.clone());
-
-    handle_agent_event(app, event);
-
-    let updated = std::mem::replace(
-        &mut app.current,
-        app.background.remove(&previous_active).unwrap(),
-    );
-    app.background.insert(session_id, updated);
-    app.active_session = previous_active;
-    app.status = saved_status;
-    false
+    is_active
 }
-
-fn handle_agent_event(app: &mut App, event: AgentEvent) {
-    match event {
-        AgentEvent::ReasoningDelta(delta) => {
-            app.current.agent_phase = AgentPhase::Thinking;
-            app.current.model_phase = ModelPhase::Streaming;
-            update_thinking_line(app, &delta);
-        }
-        AgentEvent::ModelStreaming => {
-            begin_thinking(app);
-            app.current.agent_phase = AgentPhase::Thinking;
-            app.current.model_phase = ModelPhase::Streaming;
-            app.status = "等待模型流式响应".into();
-        }
-        AgentEvent::WebSearchStarted { query } => {
-            finish_thinking(app, "思考完成");
-            app.current.agent_phase = AgentPhase::ToolRunning;
-            app.current.model_phase = ModelPhase::Streaming;
-            let already_open = app.current.entries.last().is_some_and(|entry| {
-                matches!(&entry.content, DisplayContent::Tool(tool) if tool.name == "web_search" && tool.status == ToolDisplayStatus::Running)
-            });
-            if !already_open {
-                let call_id = format!("native-web-search-{}", uuid::Uuid::new_v4());
-                app.push_entry(DisplayEntry {
-                    kind: DisplayKind::Tool,
-                    content: DisplayContent::Tool(ToolDisplay {
-                        call_id,
-                        name: "web_search".into(),
-                        arguments: serde_json::json!({"query": query}),
-                        status: ToolDisplayStatus::Running,
-                        result: None,
-                    }),
-                });
-            }
-            app.status = "正在联网搜索".into();
-        }
-        AgentEvent::WebSearchResult {
-            title,
-            url,
-            snippet,
-        } => {
-            let context = format!("{title}\n{url}\n{snippet}");
-            if let Some(tool) =
-                app.current
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool)
-                            if tool.name == "web_search"
-                                && tool.status == ToolDisplayStatus::Running =>
-                        {
-                            Some(tool)
-                        }
-                        _ => None,
-                    })
-            {
-                let result = tool.result.get_or_insert_with(String::new);
-                if !result.is_empty() {
-                    result.push_str("\n\n");
-                }
-                result.push_str(&context);
-            }
-        }
-        AgentEvent::WebSearchCompleted { count } => {
-            if let Some(tool) =
-                app.current
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool)
-                            if tool.name == "web_search"
-                                && tool.status == ToolDisplayStatus::Running =>
-                        {
-                            Some(tool)
-                        }
-                        _ => None,
-                    })
-            {
-                tool.status = ToolDisplayStatus::Completed;
-                app.invalidate_output_layout();
-            }
-            app.current.agent_phase = AgentPhase::Thinking;
-            app.status = if count == 0 {
-                "联网搜索完成".into()
-            } else {
-                format!("联网搜索完成：{count} 条结果")
-            };
-        }
-        AgentEvent::Cancelled(reason) => {
-            finish_thinking(app, "思考已取消");
-            app.current.busy = false;
-            app.current.active_task = None;
-            if let Some(approval) = take_pending_approval(app)
-                && let ApprovalAction::Agent(reply) = approval.action
-            {
-                let _ = reply.send(false);
-            }
-            app.current.agent_phase = AgentPhase::Idle;
-            app.current.model_phase = ModelPhase::Idle;
-            app.status = if reason.contains("approval") {
-                "审批等待已取消".into()
-            } else {
-                "请求已取消".into()
-            };
-        }
-        AgentEvent::TextDelta(delta) => {
-            finish_thinking(app, "思考完成");
-            app.current.agent_phase = AgentPhase::StreamingText;
-            app.current.model_phase = ModelPhase::Streaming;
-            app.invalidate_output_layout();
-            if let Some(entry) = app.current.entries.last_mut()
-                && matches!(entry.kind, DisplayKind::Assistant)
-                && let DisplayContent::Markdown(text) = &mut entry.content
-            {
-                text.push_str(&delta);
-            } else {
-                app.push_entry(DisplayEntry {
-                    kind: DisplayKind::Assistant,
-                    content: DisplayContent::Markdown(delta),
-                });
-            }
-            app.status = "正在输出正文…… | Esc 取消".into();
-        }
-        AgentEvent::Approval {
-            call,
-            reason,
-            reply,
-        } => {
-            finish_thinking(app, "思考完成");
-            app.current.agent_phase = AgentPhase::WaitingApproval;
-            app.current.model_phase = ModelPhase::Idle;
-            app.status = "需要确认工具权限".into();
-            app.current.pending_approval = Some(PendingApproval {
-                call,
-                reason,
-                action: ApprovalAction::Agent(reply),
-                created_at: Instant::now(),
-            });
-        }
-        AgentEvent::ToolStarted(call) => {
-            finish_thinking(app, "思考完成");
-            app.current.agent_phase = AgentPhase::ToolRunning;
-            app.current.model_phase = ModelPhase::Idle;
-            app.status = format!("正在执行 {}……", ui::tool_display_name(&call.name));
-            app.push_entry(DisplayEntry {
-                kind: DisplayKind::Tool,
-                content: DisplayContent::Tool(ToolDisplay {
-                    call_id: call.id,
-                    name: call.name,
-                    arguments: call.arguments,
-                    status: ToolDisplayStatus::Running,
-                    result: None,
-                }),
-            });
-        }
-        AgentEvent::ToolFinished { call, result } => {
-            app.current.agent_phase = AgentPhase::Thinking;
-            let status = tool_result_status(&result);
-            if let Some(tool) =
-                app.current
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool) if tool.call_id == call.id => Some(tool),
-                        _ => None,
-                    })
-            {
-                tool.status = status;
-                tool.result = Some(result);
-                app.invalidate_output_layout();
-            } else {
-                app.push_entry(DisplayEntry {
-                    kind: DisplayKind::Tool,
-                    content: DisplayContent::Tool(ToolDisplay {
-                        call_id: call.id,
-                        name: call.name,
-                        arguments: call.arguments,
-                        status,
-                        result: Some(result),
-                    }),
-                });
-            }
-            app.status = "正在将工具结果交给模型……".into();
-        }
-        AgentEvent::Usage(usage) => {
-            app.current.context_used_tokens = usage
-                .input_tokens
-                .max(estimate_context_tokens(&app.current.conversation));
-            app.current.usage = usage;
-        }
-        AgentEvent::Completed { items } => {
-            finish_thinking(app, "思考完成");
-            app.current.conversation = items;
-            trim_conversation(&mut app.current.conversation);
-            app.current.busy = false;
-            app.current.active_task = None;
-            app.current.agent_phase = AgentPhase::Idle;
-            app.current.model_phase = ModelPhase::Completed;
-            app.status = if refresh_sessions(app).is_ok() {
-                "就绪".into()
-            } else {
-                "就绪，但刷新会话失败".into()
-            };
-        }
-        AgentEvent::SessionsChanged => {
-            if refresh_sessions(app).is_ok() && !app.current.busy {
-                app.status = "会话列表已更新".into();
-            }
-        }
-        AgentEvent::Failed(error) => {
-            finish_thinking(app, "思考失败");
-            app.push_entry(DisplayEntry {
-                kind: DisplayKind::Error,
-                content: DisplayContent::Markdown(secrets::redact(&error)),
-            });
-            app.current.busy = false;
-            app.current.active_task = None;
-            app.current.agent_phase = AgentPhase::Failed;
-            app.current.model_phase = ModelPhase::Failed;
-            app.status = "请求失败".into();
-        }
-        AgentEvent::LocalCommandFinished { command, result } => {
-            if command == "/diff" {
-                app.push_entry(DisplayEntry {
-                    kind: DisplayKind::Tool,
-                    content: DisplayContent::Diff(result),
-                });
-                app.current.busy = false;
-                app.current.active_task = None;
-                app.current.agent_phase = AgentPhase::Idle;
-                app.current.model_phase = ModelPhase::Completed;
-                app.status = "Git diff 已准备好".into();
-                trim_app_entries(app);
-                return;
-            }
-            app.push_entry(DisplayEntry {
-                kind: DisplayKind::Tool,
-                content: DisplayContent::Tool(ToolDisplay {
-                    call_id: format!("local-shell-{}", uuid::Uuid::new_v4()),
-                    name: "terminal_shell".into(),
-                    arguments: serde_json::json!({"command": command}),
-                    status: tool_result_status(&result),
-                    result: Some(result.clone()),
-                }),
-            });
-            app.current.conversation.push(ConversationItem::Context {
-                label: format!("shell: {command}"),
-                content: result.clone(),
-            });
-            if let Err(error) = app.storage.append_context(
-                &app.current.session_id,
-                &format!("shell: {command}"),
-                &result,
-            ) {
-                app.status = format!("命令已完成，但保存失败：{error}");
-            } else {
-                app.status = "Shell 命令已完成".into();
-            }
-            app.current.busy = false;
-            app.current.active_task = None;
-            app.current.agent_phase = AgentPhase::Idle;
-            app.current.model_phase = ModelPhase::Completed;
-        }
-    }
-    trim_app_entries(app);
-}
-
-fn tool_result_status(result: &str) -> ToolDisplayStatus {
-    let lower = result.to_ascii_lowercase();
-    if lower.starts_with("rejected by user") || lower.starts_with("denied by policy") {
-        ToolDisplayStatus::Rejected
-    } else if lower.starts_with("tool failed")
-        || lower.starts_with("security policy denied")
-        || lower.starts_with("process timed out")
-        || lower.starts_with("duplicate tool call")
-    {
-        ToolDisplayStatus::Failed
-    } else {
-        ToolDisplayStatus::Completed
-    }
-}
-
-const MAX_THINKING_LINE_BYTES: usize = 1024;
-const MAX_THINKING_BUFFER_BYTES: usize = 64 * 1024;
 
 // Kept as a small pure helper so terminals without Braille support can use the
 // ASCII sequence without changing the live row or layout.
@@ -2236,120 +1914,15 @@ pub(crate) fn braille_spinner_supported() -> bool {
         })
 }
 
-fn begin_thinking(app: &mut App) {
-    // Anchor the single live row before the next entry. TextDelta will append
-    // that assistant entry at the same index, so the row never moves.
-    app.invalidate_output_layout();
-    app.current.thinking_active = true;
-    app.current.thinking_last_line = "模型正在思考".into();
-    app.current.thinking_buffer.clear();
-    app.current.thinking_buffer_truncated = false;
-    app.current.thinking_animation_frame = 0;
-    app.current.thinking_anchor = Some(app.current.entries.len());
-    app.current.thinking_expanded = false;
-}
-
-fn finish_thinking(app: &mut App, line: &str) {
-    app.current.thinking_active = false;
-    app.current.thinking_animation_frame = 0;
-    persist_thinking_summary(app);
-    match line {
-        "思考失败" => app.current.thinking_result = ThinkingResult::Failed,
-        "思考已取消" => app.current.thinking_result = ThinkingResult::Cancelled,
-        _ => app.current.thinking_result = ThinkingResult::Completed,
-    }
-}
-
-/// Turns the buffered reasoning into a persistent "思考摘要" entry so every
-/// thinking round is kept in the task stream instead of being overwritten by
-/// the next round. The live row is then retired (anchor cleared).
-fn persist_thinking_summary(app: &mut App) {
-    let truncated = app.current.thinking_buffer_truncated;
-    let reasoning = app.current.thinking_buffer.trim().to_owned();
-    app.current.thinking_buffer.clear();
-    app.current.thinking_last_line.clear();
-    app.current.thinking_anchor = None;
-    app.current.thinking_buffer_truncated = false;
-    if reasoning.is_empty() {
-        return;
-    }
-    let content = if truncated {
-        format!("[较早思考内容已截断]\n\n{reasoning}")
-    } else {
-        reasoning
-    };
-    push_entry(
-        app,
-        DisplayEntry {
-            kind: DisplayKind::Thinking,
-            content: DisplayContent::Thinking(ThinkingDisplay {
-                id: format!("thinking-{}", uuid::Uuid::new_v4()),
-                content,
-            }),
-        },
-    );
-}
-
-fn reset_thinking_state(app: &mut App) {
-    app.current.thinking_active = false;
-    app.current.thinking_last_line.clear();
-    app.current.thinking_buffer.clear();
-    app.current.thinking_buffer_truncated = false;
-    app.current.thinking_animation_frame = 0;
-    app.current.thinking_anchor = None;
-    app.current.thinking_result = ThinkingResult::Completed;
-}
-
-fn update_thinking_line(app: &mut App, delta: &str) {
-    app.current.thinking_active = true;
-    app.current.thinking_buffer.push_str(delta);
-    if app.current.thinking_buffer.len() > MAX_THINKING_BUFFER_BYTES {
-        let minimum = app
-            .current
-            .thinking_buffer
-            .len()
-            .saturating_sub(MAX_THINKING_BUFFER_BYTES);
-        let start = app
-            .current
-            .thinking_buffer
-            .grapheme_indices(true)
-            .map(|(offset, _)| offset)
-            .find(|offset| *offset >= minimum)
-            .unwrap_or(app.current.thinking_buffer.len());
-        app.current.thinking_buffer.drain(..start);
-        app.current.thinking_buffer_truncated = true;
-    }
-    let latest = app
-        .current
-        .thinking_buffer
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("思考中");
-    app.current.thinking_last_line = utf8_tail(latest, MAX_THINKING_LINE_BYTES).to_owned();
-}
-
-fn utf8_tail(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let minimum = value.len().saturating_sub(max_bytes);
-    let start = value
-        .grapheme_indices(true)
-        .map(|(offset, _)| offset)
-        .find(|offset| *offset >= minimum)
-        .unwrap_or(value.len());
-    &value[start..]
-}
-
 fn resolve_approval(app: &mut App, approved: bool) {
-    if let Some(approval) = take_pending_approval(app) {
+    if let Some(approval) = app.current.take_pending_approval() {
+        app.force_full_redraw = true;
         match approval.action {
             ApprovalAction::Agent(reply) => {
                 let _ = reply.send(approved);
                 app.current.agent_phase = AgentPhase::Thinking;
                 app.current.model_phase = ModelPhase::Idle;
-                app.status = if approved {
+                app.current.status = if approved {
                     "已批准，开始执行工具……".into()
                 } else {
                     "已拒绝，将结果返回模型……".into()
@@ -2363,7 +1936,7 @@ fn resolve_approval(app: &mut App, approved: bool) {
                     app.current.busy = true;
                     app.current.agent_phase = AgentPhase::ToolRunning;
                     app.current.model_phase = ModelPhase::Idle;
-                    app.status = "正在执行 Shell 命令…… | Esc 取消".into();
+                    app.current.status = "正在执行 Shell 命令…… | Esc 取消".into();
                     app.current.active_task = Some(tokio::spawn(async move {
                         let result = registry
                             .execute_shell(&command)
@@ -2377,11 +1950,11 @@ fn resolve_approval(app: &mut App, approved: bool) {
                             .await;
                     }));
                 } else {
-                    app.push_entry(DisplayEntry {
+                    app.current.push_entry(DisplayEntry {
                         kind: DisplayKind::System,
                         content: DisplayContent::Markdown("Shell 命令已拒绝。".into()),
                     });
-                    app.status = "Shell 命令已拒绝".into();
+                    app.current.status = "Shell 命令已拒绝".into();
                     app.current.agent_phase = AgentPhase::Idle;
                 }
             }
@@ -2403,7 +1976,7 @@ fn request_shell_approval(app: &mut App, command: String) -> Result<()> {
     });
     app.current.agent_phase = AgentPhase::WaitingApproval;
     app.current.model_phase = ModelPhase::Idle;
-    app.status = "Shell 命令需要确认".into();
+    app.current.status = "Shell 命令需要确认".into();
     Ok(())
 }
 
@@ -2411,7 +1984,7 @@ fn create_session(app: &mut App) -> Result<()> {
     let session_id = app.storage.create_session(&app.workspace)?;
     activate_session(app, session_id)?;
     refresh_sessions(app)?;
-    app.status = "新会话已就绪".into();
+    app.current.status = "新会话已就绪".into();
     Ok(())
 }
 
@@ -2435,7 +2008,7 @@ fn switch_mode(app: &mut App, mode: AgentMode) -> Result<()> {
         .storage
         .set_session_mode(&app.current.session_id, mode.as_str());
     app.storage.clear_response_id(&app.current.session_id)?;
-    app.status = format!("模式已切换为 {}", mode.as_str().to_ascii_uppercase());
+    app.current.status = format!("模式已切换为 {}", mode.as_str().to_ascii_uppercase());
     Ok(())
 }
 
@@ -2461,7 +2034,7 @@ fn switch_session(app: &mut App, direction: i32) -> Result<()> {
     refresh_sessions(app)?;
     let rows = ui::flatten_session_tree(&app.sessions, &app.expanded_sessions);
     if rows.len() < 2 {
-        app.status = "当前只有一个会话 | Ctrl+N 新建会话".into();
+        app.current.status = "当前只有一个会话 | Ctrl+N 新建会话".into();
         return Ok(());
     }
     let current = rows
@@ -2544,6 +2117,7 @@ fn build_runtime(
     });
     SessionRuntime {
         session_id: session_id.to_owned(),
+        status: String::new(),
         entries,
         busy: false,
         agent_phase: AgentPhase::Idle,
@@ -2608,8 +2182,8 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     app.registry.set_mode(app.current.mode);
     app.input.clear();
     app.file_suggestions.clear();
-    app.invalidate_output_layout();
-    app.status = if app.current.runner.is_some() {
+    app.current.invalidate_output_layout();
+    app.current.status = if app.current.runner.is_some() {
         "就绪".into()
     } else {
         "需要配置提供商".into()
@@ -2719,104 +2293,6 @@ fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {
     entries
 }
 
-fn trim_entries(entries: &mut Vec<DisplayEntry>) -> usize {
-    const MAX_ENTRIES: usize = 1000;
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
-    let mut removed = 0;
-    while entries.len() > MAX_ENTRIES || display_entry_bytes(entries) > MAX_BYTES {
-        if entries.len() > MAX_ENTRIES {
-            let count = entries.len() - MAX_ENTRIES;
-            entries.drain(..count);
-            removed += count;
-        } else {
-            entries.remove(0);
-            removed += 1;
-        }
-    }
-    removed
-}
-
-fn trim_app_entries(app: &mut App) {
-    const MAX_ENTRIES: usize = 1000;
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
-    if app.current.entries.len() <= MAX_ENTRIES
-        && display_entry_bytes(&app.current.entries) <= MAX_BYTES
-    {
-        return;
-    }
-    app.invalidate_output_layout();
-    let removed = trim_entries(&mut app.current.entries);
-    app.current.thinking_anchor = app
-        .current
-        .thinking_anchor
-        .map(|anchor| anchor.saturating_sub(removed));
-    app.clear_output_selection();
-}
-
-fn trim_conversation(items: &mut Vec<ConversationItem>) {
-    const MAX_ITEMS: usize = 200;
-    const MAX_BYTES: usize = 1024 * 1024;
-    let mut removed = 0usize;
-    while items.len() > MAX_ITEMS || conversation_bytes(items) > MAX_BYTES {
-        if items.is_empty() {
-            break;
-        }
-        items.remove(0);
-        removed += 1;
-    }
-    if removed > 0 {
-        items.insert(
-            0,
-            ConversationItem::Message {
-                role: Role::System,
-                content: format!(
-                    "Earlier context was locally compacted ({removed} items omitted)."
-                ),
-            },
-        );
-    }
-}
-
-fn conversation_bytes(items: &[ConversationItem]) -> usize {
-    items
-        .iter()
-        .map(|item| match item {
-            ConversationItem::Message { content, .. }
-            | ConversationItem::Context { content, .. } => content.len(),
-            ConversationItem::ThinkingSummary { .. } => 0,
-            ConversationItem::ProviderItem { item } => item.to_string().len(),
-            ConversationItem::AssistantToolCalls { calls } => calls
-                .iter()
-                .map(|call| call.name.len() + call.arguments.to_string().len())
-                .sum(),
-            ConversationItem::ToolOutput { output, .. } => output.len(),
-        })
-        .sum()
-}
-
-fn estimate_context_tokens(items: &[ConversationItem]) -> u64 {
-    let bytes = conversation_bytes(items) as u64;
-    // A conservative, allocation-free estimate for mixed prose/JSON context.
-    (bytes.saturating_add(3) / 4).max(1)
-}
-
-fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
-    entries
-        .iter()
-        .map(|entry| match &entry.content {
-            DisplayContent::Markdown(value) => value.len(),
-            DisplayContent::Diff(value) => value.len(),
-            DisplayContent::Tool(tool) => {
-                tool.call_id.len()
-                    + tool.name.len()
-                    + tool.arguments.to_string().len()
-                    + tool.result.as_ref().map_or(0, String::len)
-            }
-            DisplayContent::Thinking(thinking) => thinking.id.len() + thinking.content.len(),
-        })
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventState, KeyModifiers, MouseEvent};
@@ -2824,6 +2300,18 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    use crate::session::{
+        MAX_THINKING_BUFFER_BYTES, MAX_THINKING_LINE_BYTES, estimate_context_tokens, trim_entries,
+    };
+
+    fn handle_event_for_test(app: &mut App, event: AgentEvent) -> crate::session::SessionOutcome {
+        let ctx = crate::session::EventCtx {
+            storage: &app.storage,
+            workspace: &app.workspace,
+        };
+        app.current.handle_event(&ctx, event)
+    }
 
     #[test]
     fn next_mode_cycles_in_build_plan_explore_cluster_order() {
@@ -2842,7 +2330,7 @@ mod tests {
             .unwrap();
         switch_mode(&mut app, AgentMode::Explore).unwrap();
         assert_eq!(app.current.mode, AgentMode::Explore);
-        assert!(app.status.contains("EXPLORE"));
+        assert!(app.current.status.contains("EXPLORE"));
         assert_eq!(
             app.storage.session_mode(&app.current.session_id).unwrap(),
             AgentMode::Explore.as_str()
@@ -3026,7 +2514,7 @@ mod tests {
         };
         assert!(handle_leader_mouse(&mut app, click_new).unwrap().is_some());
         assert!(!app.leader_pending);
-        assert!(app.status.contains("新会话"));
+        assert!(app.current.status.contains("新会话"));
 
         app.leader_pending = true;
         app.leader_hint_rect = Some(Rect::new(10, 4, 40, 11));
@@ -3042,7 +2530,7 @@ mod tests {
                 .is_some()
         );
         assert!(!app.leader_pending);
-        assert_eq!(app.status, "已取消");
+        assert_eq!(app.current.status, "已取消");
     }
 
     fn thinking_summary_count(app: &App) -> usize {
@@ -3080,6 +2568,7 @@ mod tests {
         let (router_tx, router_rx) = mpsc::channel(16);
         let runtime = SessionRuntime {
             session_id: session_id.clone(),
+            status: String::new(),
             entries: vec![DisplayEntry {
                 kind: DisplayKind::Assistant,
                 content: DisplayContent::Markdown("first line\n\n中文 🙂 long output".into()),
@@ -3120,7 +2609,6 @@ mod tests {
         App {
             workspace,
             input: InputBuffer::new(),
-            status: String::new(),
             context_meter_enabled: false,
             settings: None,
             palette: None,
@@ -3291,7 +2779,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.thinking_level(), ThinkingLevel::Max);
         assert!(!app.thinking_menu_open);
-        assert!(app.status.contains("配置保存失败"));
+        assert!(app.current.status.contains("配置保存失败"));
         assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
         assert_eq!(app.current.markdown_parse_count, parses);
 
@@ -3384,8 +2872,8 @@ mod tests {
             created_at: Instant::now(),
         });
         app.force_full_redraw = false;
-        handle_agent_event(&mut app, AgentEvent::Cancelled("cancelled".into()));
-        assert!(app.force_full_redraw);
+        let outcome = handle_event_for_test(&mut app, AgentEvent::Cancelled("cancelled".into()));
+        assert!(outcome.force_redraw);
     }
 
     #[test]
@@ -3433,9 +2921,9 @@ mod tests {
         let mut app = test_app(&temp);
         scroll_messages(&mut app, 1);
         assert!(!app.force_full_redraw);
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        handle_agent_event(&mut app, AgentEvent::ReasoningDelta("真实思考".into()));
-        handle_agent_event(&mut app, AgentEvent::TextDelta("正文".into()));
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta("真实思考".into()));
+        handle_event_for_test(&mut app, AgentEvent::TextDelta("正文".into()));
         assert!(!app.force_full_redraw);
     }
 
@@ -3448,7 +2936,7 @@ mod tests {
         let markdown_parses = app.current.markdown_parse_count;
         let footer_rebuilds = app.current.footer_rebuild_count;
 
-        app.status = "仅 Footer 变化".into();
+        app.current.status = "仅 Footer 变化".into();
         render_screen(&mut app, 80, 20);
         assert_eq!(app.current.output_layout_rebuild_count, layout_rebuilds);
         assert_eq!(app.current.markdown_parse_count, markdown_parses);
@@ -3507,7 +2995,7 @@ mod tests {
                 result: None,
             }),
         });
-        app.invalidate_output_layout();
+        app.current.invalidate_output_layout();
         let tool = render_screen(&mut app, 100, 24);
         assert!(tool[22].contains('●'));
         assert!(tool.iter().any(|line| line.contains("src/app.rs")));
@@ -3708,7 +3196,7 @@ mod tests {
         let mut app = test_app(&temp);
         let viewport = Rect::new(0, 0, 20, 4);
         crate::ui::update_message_layout(&mut app, viewport);
-        handle_agent_event(&mut app, AgentEvent::TextDelta(" NEW".into()));
+        handle_event_for_test(&mut app, AgentEvent::TextDelta(" NEW".into()));
         assert!(app.current.output_layout_dirty);
         assert!(app.current.message_layout.is_none());
 
@@ -3733,13 +3221,13 @@ mod tests {
         let entries = app.current.entries.len();
         let stored = app.storage.load_messages(&app.current.session_id).unwrap();
         let layout_text = app.current.message_layout.as_ref().unwrap().text.clone();
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
         assert!(app.current.thinking_active);
         assert_eq!(app.current.thinking_last_line, "模型正在思考");
         crate::ui::update_message_layout(&mut app, viewport);
         let rebuilds = app.current.output_layout_rebuild_count;
         let markdown_parses = app.current.markdown_parse_count;
-        handle_agent_event(
+        handle_event_for_test(
             &mut app,
             AgentEvent::ReasoningDelta("第一行\n\n最新".into()),
         );
@@ -3748,7 +3236,7 @@ mod tests {
             "⠋ 思考中  最新"
         );
         crate::ui::update_message_layout(&mut app, viewport);
-        handle_agent_event(&mut app, AgentEvent::ReasoningDelta("一行".into()));
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta("一行".into()));
 
         assert_eq!(app.current.thinking_last_line, "最新一行");
         assert_eq!(
@@ -3790,8 +3278,8 @@ mod tests {
     fn finish_thinking_skips_empty_buffer() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        handle_agent_event(
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(
             &mut app,
             AgentEvent::ToolStarted(ToolCall {
                 id: "call-empty".into(),
@@ -3807,9 +3295,9 @@ mod tests {
     fn reasoning_without_newlines_keeps_utf8_safe_tail() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
         let delta = format!("{}👩‍💻e\u{301}尾", "中文🙂".repeat(400));
-        handle_agent_event(&mut app, AgentEvent::ReasoningDelta(delta));
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta(delta));
 
         assert!(app.current.thinking_last_line.len() <= MAX_THINKING_LINE_BYTES);
         assert!(app.current.thinking_last_line.ends_with("👩‍💻e\u{301}尾"));
@@ -3821,30 +3309,30 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
 
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        handle_agent_event(
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(
             &mut app,
             AgentEvent::ReasoningDelta("正在分析工具结果".into()),
         );
-        handle_agent_event(&mut app, AgentEvent::TextDelta("answer".into()));
+        handle_event_for_test(&mut app, AgentEvent::TextDelta("answer".into()));
         assert!(!app.current.thinking_active);
         assert!(app.current.thinking_anchor.is_none());
         assert_eq!(app.current.thinking_result, ThinkingResult::Completed);
         assert_eq!(thinking_summary_count(&app), 1);
         assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("正在分析工具结果")));
 
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        handle_agent_event(&mut app, AgentEvent::ReasoningDelta("最后失败位置".into()));
-        handle_agent_event(&mut app, AgentEvent::Failed("failed".into()));
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta("最后失败位置".into()));
+        handle_event_for_test(&mut app, AgentEvent::Failed("failed".into()));
         assert!(!app.current.thinking_active);
         assert!(app.current.thinking_anchor.is_none());
         assert_eq!(app.current.thinking_result, ThinkingResult::Failed);
         assert_eq!(thinking_summary_count(&app), 2);
         assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("最后失败位置")));
 
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        handle_agent_event(&mut app, AgentEvent::ReasoningDelta("取消前内容".into()));
-        handle_agent_event(&mut app, AgentEvent::Cancelled("cancelled".into()));
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta("取消前内容".into()));
+        handle_event_for_test(&mut app, AgentEvent::Cancelled("cancelled".into()));
         assert!(!app.current.thinking_active);
         assert!(app.current.thinking_anchor.is_none());
         assert_eq!(app.current.thinking_result, ThinkingResult::Cancelled);
@@ -3874,7 +3362,7 @@ mod tests {
         let mut app = test_app(&temp);
         let viewport = Rect::new(0, 0, 20, 4);
         crate::ui::update_message_layout(&mut app, viewport);
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
         crate::ui::update_message_layout(&mut app, viewport);
         let rebuilds = app.current.output_layout_rebuild_count;
 
@@ -3893,8 +3381,8 @@ mod tests {
         let viewport = Rect::new(0, 0, 40, 8);
 
         for round in 0..3 {
-            handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-            handle_agent_event(
+            handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+            handle_event_for_test(
                 &mut app,
                 AgentEvent::ReasoningDelta(format!("第 {round} 轮")),
             );
@@ -3909,7 +3397,7 @@ mod tests {
                     .count(),
                 layout.live_thinking_rows
             );
-            handle_agent_event(
+            handle_event_for_test(
                 &mut app,
                 AgentEvent::ToolStarted(ToolCall {
                     id: format!("call-{round}"),
@@ -3938,14 +3426,14 @@ mod tests {
             0
         );
 
-        app.push_entry(DisplayEntry {
+        app.current.push_entry(DisplayEntry {
             kind: DisplayKind::User,
             content: DisplayContent::Markdown("next request".into()),
         });
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
         crate::ui::update_message_layout(&mut app, viewport);
         let initial_rebuilds = app.current.output_layout_rebuild_count;
-        handle_agent_event(&mut app, AgentEvent::ReasoningDelta("真实摘要".into()));
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta("真实摘要".into()));
         crate::ui::update_message_layout(&mut app, viewport);
         assert_eq!(app.current.output_layout_rebuild_count, initial_rebuilds);
         let layout = app.current.message_layout.as_ref().unwrap();
@@ -3956,7 +3444,7 @@ mod tests {
             .unwrap();
         assert!(layout.position_at_visual_row(live_row, 0).is_none());
 
-        handle_agent_event(&mut app, AgentEvent::TextDelta("answer".into()));
+        handle_event_for_test(&mut app, AgentEvent::TextDelta("answer".into()));
         crate::ui::update_message_layout(&mut app, viewport);
         assert_eq!(
             app.current.output_layout_rebuild_count,
@@ -3990,7 +3478,7 @@ mod tests {
     fn tool_click_toggle_rebuilds_once_per_toggle() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        app.push_entry(DisplayEntry {
+        app.current.push_entry(DisplayEntry {
             kind: DisplayKind::Tool,
             content: DisplayContent::Tool(ToolDisplay {
                 call_id: "call-read".into(),
@@ -4038,7 +3526,7 @@ mod tests {
     fn thinking_summary_click_toggles_expansion() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        app.push_entry(DisplayEntry {
+        app.current.push_entry(DisplayEntry {
             kind: DisplayKind::Thinking,
             content: DisplayContent::Thinking(ThinkingDisplay {
                 id: "thinking-0".into(),
@@ -4101,7 +3589,7 @@ mod tests {
                 }),
             })
             .collect();
-        app.invalidate_output_layout();
+        app.current.invalidate_output_layout();
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 80, 20));
         let layout = app.current.message_layout.as_ref().unwrap();
         assert_eq!(
@@ -4138,8 +3626,8 @@ mod tests {
             arguments: serde_json::json!({"path":"src/app.rs"}),
         };
         let initial_len = app.current.entries.len();
-        handle_agent_event(&mut app, AgentEvent::ToolStarted(call.clone()));
-        handle_agent_event(
+        handle_event_for_test(&mut app, AgentEvent::ToolStarted(call.clone()));
+        handle_event_for_test(
             &mut app,
             AgentEvent::ToolFinished {
                 call,
@@ -4159,8 +3647,8 @@ mod tests {
     fn clicking_thinking_title_expands_and_collapses_live_rows() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        handle_agent_event(
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(
             &mut app,
             AgentEvent::ReasoningDelta("第一行\n第二行".into()),
         );
@@ -4212,7 +3700,7 @@ mod tests {
     fn dragging_from_tool_summary_does_not_toggle_it() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        app.push_entry(DisplayEntry {
+        app.current.push_entry(DisplayEntry {
             kind: DisplayKind::Tool,
             content: DisplayContent::Tool(ToolDisplay {
                 call_id: "drag-tool".into(),
@@ -4282,8 +3770,8 @@ mod tests {
     fn thinking_expansion_and_buffer_limit_are_utf8_safe() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        handle_agent_event(&mut app, AgentEvent::ModelStreaming);
-        handle_agent_event(
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(
             &mut app,
             AgentEvent::ReasoningDelta(format!("第一行\n{}尾🙂", "中文👩‍💻".repeat(20_000))),
         );
@@ -4324,7 +3812,7 @@ mod tests {
             content: DisplayContent::Markdown("x".into()),
         }));
 
-        trim_app_entries(&mut app);
+        app.current.trim_entries();
         assert_eq!(app.current.entries.len(), 1000);
         assert!(app.current.output_layout_dirty);
         assert!(app.current.message_layout.is_none());

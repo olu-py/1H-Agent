@@ -124,12 +124,12 @@ pub fn activity_view(app: &App) -> ActivityView {
         (ActivityState::Working, "●", "正在生成回复".into())
     } else if app.current.agent_phase == AgentPhase::Completed {
         (ActivityState::Success, "✓", "已完成".into())
-    } else if app.status.contains("已取消") {
+    } else if app.current.status.contains("已取消") {
         (ActivityState::Cancelled, "■", "已取消".into())
     } else {
         (ActivityState::Idle, "○", "就绪".into())
     };
-    let detail = supplemental_status(&app.status, &text);
+    let detail = supplemental_status(&app.current.status, &text);
     ActivityView {
         state,
         symbol,
