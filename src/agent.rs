@@ -165,6 +165,168 @@ struct PartialToolCall {
     arguments: String,
 }
 
+/// Accumulates the common per-round streaming state: assistant/reasoning text,
+/// partial tool calls, and completed tool calls. The streaming loop and partial
+/// convergence are shared by the main agent and child agents.
+struct StreamCollector {
+    assistant_text: String,
+    reasoning_text: String,
+    partials: HashMap<String, PartialToolCall>,
+    completed_calls: Vec<ToolCall>,
+    completed_ids: HashSet<String>,
+    saw_done: bool,
+    max_text_bytes: Option<usize>,
+}
+
+impl StreamCollector {
+    fn new(max_text_bytes: Option<usize>) -> Self {
+        Self {
+            assistant_text: String::new(),
+            reasoning_text: String::new(),
+            partials: HashMap::new(),
+            completed_calls: Vec::new(),
+            completed_ids: HashSet::new(),
+            saw_done: false,
+            max_text_bytes,
+        }
+    }
+
+    /// Accumulates text/tool-call state. Returns the event unchanged when it
+    /// needs caller-level side effects (web search, provider items, usage,
+    /// response id, or reasoning forwarding); returns None when fully handled.
+    fn on_event(&mut self, event: ModelEvent) -> Option<ModelEvent> {
+        match event {
+            ModelEvent::TextDelta(delta) => {
+                if let Some(max_bytes) = self.max_text_bytes {
+                    append_text_bounded(&mut self.assistant_text, &delta, max_bytes);
+                } else {
+                    self.assistant_text.push_str(&delta);
+                }
+                Some(ModelEvent::TextDelta(delta))
+            }
+            ModelEvent::ReasoningDelta(delta) => {
+                append_reasoning_bounded(&mut self.reasoning_text, &delta);
+                Some(ModelEvent::ReasoningDelta(delta))
+            }
+            ModelEvent::ToolCallDelta {
+                slot,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                let partial = self.partials.entry(slot).or_default();
+                if let Some(id) = id {
+                    partial.id = id;
+                }
+                if let Some(name) = name {
+                    partial.name = name;
+                }
+                partial.arguments.push_str(&arguments_delta);
+                None
+            }
+            ModelEvent::ToolCallComplete(call) => {
+                self.completed_ids.insert(call.id.clone());
+                self.completed_calls.push(call);
+                None
+            }
+            ModelEvent::Done => {
+                self.saw_done = true;
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    fn finish_partials(&mut self, error_kind: &str) -> Result<(), String> {
+        for partial in std::mem::take(&mut self.partials).into_values() {
+            if self.completed_ids.contains(&partial.id) || partial.name.is_empty() {
+                continue;
+            }
+            let arguments: Value = serde_json::from_str(if partial.arguments.is_empty() {
+                "{}"
+            } else {
+                &partial.arguments
+            })
+            .map_err(|error| format!("invalid {error_kind} arguments: {error}"))?;
+            self.completed_calls.push(ToolCall {
+                id: if partial.id.is_empty() {
+                    format!("call_{}", uuid::Uuid::new_v4())
+                } else {
+                    partial.id
+                },
+                name: partial.name,
+                arguments,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// What a forwarded stream event should do on the UI channel.
+enum Forwarded {
+    /// Send this agent event, propagating send failures.
+    Send(AgentEvent),
+    /// Send this agent event, ignoring send failures.
+    SendIgnore(AgentEvent),
+    /// The event was handled locally and needs no UI forwarding.
+    Ignore,
+}
+
+/// Why a single model stream round failed.
+enum StreamFailure {
+    /// A caller-side event handler failed (fatal).
+    Handler(String),
+    /// The provider returned an error for this request (replayable when the
+    /// round produced no output).
+    Provider(String),
+    /// The spawned provider task failed to join (fatal).
+    Join(String),
+    /// The stream ended without a Done marker (fatal).
+    EndedWithoutCompletion,
+}
+
+/// Streams one model request into `collector`, forwarding events the collector
+/// does not own to `forward`, then sending the resulting agent events to the UI.
+async fn stream_once(
+    provider: &OpenAiClient,
+    request: ModelRequest,
+    collector: &mut StreamCollector,
+    channel_capacity: usize,
+    ui_events: &mpsc::Sender<AgentEvent>,
+    mut forward: impl FnMut(ModelEvent) -> Result<Forwarded, String>,
+) -> Result<(), StreamFailure> {
+    let (model_tx, mut model_rx) = mpsc::channel(channel_capacity);
+    let provider = provider.clone();
+    let provider_task = tokio::spawn(async move { provider.stream(request, model_tx).await });
+    while let Some(event) = model_rx.recv().await {
+        if let Some(event) = collector.on_event(event) {
+            match forward(event).map_err(StreamFailure::Handler)? {
+                Forwarded::Send(agent_event) => ui_events
+                    .send(agent_event)
+                    .await
+                    .map_err(|_| StreamFailure::Handler("UI event receiver closed".to_owned()))?,
+                Forwarded::SendIgnore(agent_event) => {
+                    let _ = ui_events.send(agent_event).await;
+                }
+                Forwarded::Ignore => {}
+            }
+        }
+        if collector.saw_done {
+            break;
+        }
+    }
+    let provider_result = provider_task
+        .await
+        .map_err(|error| StreamFailure::Join(error.to_string()))?;
+    if let Err(error) = provider_result {
+        return Err(StreamFailure::Provider(error.to_string()));
+    }
+    if !collector.saw_done {
+        return Err(StreamFailure::EndedWithoutCompletion);
+    }
+    Ok(())
+}
+
 impl AgentRunner {
     pub fn new(
         provider: OpenAiClient,
@@ -260,30 +422,22 @@ impl AgentRunner {
                 )
                 .kind,
             };
-            let (model_tx, mut model_rx) = mpsc::channel(128);
             ui_events
                 .send(AgentEvent::ModelStreaming)
                 .await
                 .map_err(|_| "UI event receiver closed".to_owned())?;
-            let provider = self.provider.clone();
-            let provider_task =
-                tokio::spawn(async move { provider.stream(request, model_tx).await });
-
-            let mut assistant_text = String::new();
-            let mut reasoning_text = String::new();
-            let mut partials: HashMap<String, PartialToolCall> = HashMap::new();
-            let mut completed_calls = Vec::new();
-            let mut completed_ids = HashSet::new();
-            let mut saw_done = false;
+            let mut collector = StreamCollector::new(None);
             let mut search_results = 0usize;
             let mut search_bytes = 0usize;
-            while let Some(event) = model_rx.recv().await {
-                match event {
+            match stream_once(
+                &self.provider,
+                request,
+                &mut collector,
+                128,
+                ui_events,
+                |event| match event {
                     ModelEvent::WebSearchStarted { query } => {
-                        ui_events
-                            .send(AgentEvent::WebSearchStarted { query })
-                            .await
-                            .map_err(|_| "UI event receiver closed".to_owned())?;
+                        Ok(Forwarded::Send(AgentEvent::WebSearchStarted { query }))
                     }
                     ModelEvent::WebSearchResult {
                         title,
@@ -303,27 +457,23 @@ impl AgentRunner {
                             self.storage
                                 .append_context(&self.session_id, &label, &content)
                                 .map_err(|error| error.to_string())?;
-                            ui_events
-                                .send(AgentEvent::WebSearchResult {
-                                    title,
-                                    url,
-                                    snippet,
-                                })
-                                .await
-                                .map_err(|_| "UI event receiver closed".to_owned())?;
+                            Ok(Forwarded::Send(AgentEvent::WebSearchResult {
+                                title,
+                                url,
+                                snippet,
+                            }))
+                        } else {
+                            Ok(Forwarded::Ignore)
                         }
                     }
                     ModelEvent::WebSearchCompleted { count } => {
-                        ui_events
-                            .send(AgentEvent::WebSearchCompleted {
-                                count: if count == 0 {
-                                    search_results
-                                } else {
-                                    count.min(10)
-                                },
-                            })
-                            .await
-                            .map_err(|_| "UI event receiver closed".to_owned())?;
+                        Ok(Forwarded::Send(AgentEvent::WebSearchCompleted {
+                            count: if count == 0 {
+                                search_results
+                            } else {
+                                count.min(10)
+                            },
+                        }))
                     }
                     ModelEvent::ProviderItem(item) => {
                         let encoded = serde_json::to_vec(&item)
@@ -336,40 +486,15 @@ impl AgentRunner {
                                     .map_err(|error| error.to_string())?;
                             }
                         }
+                        Ok(Forwarded::Ignore)
                     }
                     ModelEvent::ReasoningDelta(delta) => {
-                        append_reasoning_bounded(&mut reasoning_text, &delta);
-                        ui_events
-                            .send(AgentEvent::ReasoningDelta(delta))
-                            .await
-                            .map_err(|_| "UI event receiver closed".to_owned())?;
+                        Ok(Forwarded::Send(AgentEvent::ReasoningDelta(delta)))
                     }
                     ModelEvent::TextDelta(delta) => {
-                        assistant_text.push_str(&delta);
-                        ui_events
-                            .send(AgentEvent::TextDelta(delta))
-                            .await
-                            .map_err(|_| "UI event receiver closed".to_owned())?;
+                        Ok(Forwarded::Send(AgentEvent::TextDelta(delta)))
                     }
-                    ModelEvent::ToolCallDelta {
-                        slot,
-                        id,
-                        name,
-                        arguments_delta,
-                    } => {
-                        let partial = partials.entry(slot).or_default();
-                        if let Some(id) = id {
-                            partial.id = id;
-                        }
-                        if let Some(name) = name {
-                            partial.name = name;
-                        }
-                        partial.arguments.push_str(&arguments_delta);
-                    }
-                    ModelEvent::ToolCallComplete(call) => {
-                        completed_ids.insert(call.id.clone());
-                        completed_calls.push(call);
-                    }
+                    ModelEvent::Usage(usage) => Ok(Forwarded::SendIgnore(AgentEvent::Usage(usage))),
                     ModelEvent::ResponseId(id) => {
                         if self.provider_config.use_previous_response_id {
                             previous_response_id = Some(id.clone());
@@ -377,56 +502,39 @@ impl AgentRunner {
                                 .save_response_id(&self.session_id, &id)
                                 .map_err(|error| error.to_string())?;
                         }
+                        Ok(Forwarded::Ignore)
                     }
-                    ModelEvent::Usage(usage) => {
-                        let _ = ui_events.send(AgentEvent::Usage(usage)).await;
+                    ModelEvent::ToolCallDelta { .. }
+                    | ModelEvent::ToolCallComplete(_)
+                    | ModelEvent::Done => Ok(Forwarded::Ignore),
+                },
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(StreamFailure::Provider(error)) => {
+                    if previous_response_id.is_some()
+                        && collector.assistant_text.is_empty()
+                        && collector.partials.is_empty()
+                        && collector.completed_calls.is_empty()
+                    {
+                        // Compatible endpoints can expire or reject server-side state.
+                        // Replay the canonical local history once instead.
+                        previous_response_id = None;
+                        request_cursor = 0;
+                        continue;
                     }
-                    ModelEvent::Done => {
-                        saw_done = true;
-                        break;
-                    }
+                    return Err(error);
+                }
+                Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
+                    return Err(error);
+                }
+                Err(StreamFailure::EndedWithoutCompletion) => {
+                    return Err("model stream ended without completion".into());
                 }
             }
-            let provider_result = provider_task.await.map_err(|error| error.to_string())?;
-            if let Err(error) = provider_result {
-                if previous_response_id.is_some()
-                    && assistant_text.is_empty()
-                    && partials.is_empty()
-                    && completed_calls.is_empty()
-                {
-                    // Compatible endpoints can expire or reject server-side state.
-                    // Replay the canonical local history once instead.
-                    previous_response_id = None;
-                    request_cursor = 0;
-                    continue;
-                }
-                return Err(error.to_string());
-            }
-            if !saw_done {
-                return Err("model stream ended without completion".into());
-            }
-
-            for partial in partials.into_values() {
-                if completed_ids.contains(&partial.id) || partial.name.is_empty() {
-                    continue;
-                }
-                let arguments: Value = serde_json::from_str(if partial.arguments.is_empty() {
-                    "{}"
-                } else {
-                    &partial.arguments
-                })
-                .map_err(|error| format!("invalid tool arguments: {error}"))?;
-                completed_calls.push(ToolCall {
-                    id: if partial.id.is_empty() {
-                        format!("call_{}", uuid::Uuid::new_v4())
-                    } else {
-                        partial.id
-                    },
-                    name: partial.name,
-                    arguments,
-                });
-            }
-            let reasoning_text = reasoning_text.trim();
+            collector.finish_partials("tool")?;
+            let reasoning_text = collector.reasoning_text.trim();
             if !reasoning_text.is_empty() {
                 items.push(ConversationItem::ThinkingSummary {
                     content: reasoning_text.to_owned(),
@@ -435,16 +543,16 @@ impl AgentRunner {
                     .append_thinking_summary(&self.session_id, reasoning_text)
                     .map_err(|error| error.to_string())?;
             }
-            if !assistant_text.is_empty() {
+            if !collector.assistant_text.is_empty() {
                 items.push(ConversationItem::Message {
                     role: Role::Assistant,
-                    content: assistant_text.clone(),
+                    content: collector.assistant_text.clone(),
                 });
                 self.storage
-                    .append_message(&self.session_id, Role::Assistant, &assistant_text)
+                    .append_message(&self.session_id, Role::Assistant, &collector.assistant_text)
                     .map_err(|error| error.to_string())?;
             }
-            if completed_calls.is_empty() {
+            if collector.completed_calls.is_empty() {
                 ui_events
                     .send(AgentEvent::Completed {
                         items: items.clone(),
@@ -455,16 +563,16 @@ impl AgentRunner {
             }
 
             items.push(ConversationItem::AssistantToolCalls {
-                calls: completed_calls.clone(),
+                calls: collector.completed_calls.clone(),
             });
             self.storage
-                .append_tool_calls(&self.session_id, &completed_calls)
+                .append_tool_calls(&self.session_id, &collector.completed_calls)
                 .map_err(|error| error.to_string())?;
             // When Responses server state is enabled, the response already owns the
             // assistant text and tool calls. Only subsequent tool outputs are new.
             request_cursor = items.len();
             let mut spawn_tasks: Vec<ToolCall> = Vec::new();
-            for call in completed_calls {
+            for call in collector.completed_calls {
                 let signature = tool_call_signature(&call);
                 if executed_tool_calls.contains(&signature) {
                     let result = "Duplicate tool call was not executed. Reuse the previous result or choose a different action.".to_owned();
@@ -784,108 +892,57 @@ impl AgentRunner {
                 thinking_budget_tokens: provider_config.thinking_budget_tokens,
                 thinking_profile_kind,
             };
-            let (events, mut receiver) = mpsc::channel(512);
-            let provider = self.provider.clone();
-            let task = tokio::spawn(async move { provider.stream(request, events).await });
-
-            let mut assistant_text = String::new();
-            let mut partials: HashMap<String, PartialToolCall> = HashMap::new();
-            let mut completed_calls: Vec<ToolCall> = Vec::new();
-            let mut completed_ids = HashSet::new();
-            let mut saw_done = false;
-            while let Some(event) = receiver.recv().await {
-                match event {
-                    ModelEvent::TextDelta(delta) => {
-                        append_text_bounded(&mut assistant_text, &delta, 256 * 1024);
-                    }
-                    ModelEvent::ToolCallDelta {
-                        slot,
-                        id,
-                        name,
-                        arguments_delta,
-                    } => {
-                        let partial = partials.entry(slot).or_default();
-                        if let Some(id) = id {
-                            partial.id = id;
-                        }
-                        if let Some(name) = name {
-                            partial.name = name;
-                        }
-                        partial.arguments.push_str(&arguments_delta);
-                    }
-                    ModelEvent::ToolCallComplete(call) => {
-                        completed_ids.insert(call.id.clone());
-                        completed_calls.push(call);
-                    }
-                    ModelEvent::Done => {
-                        saw_done = true;
-                        break;
-                    }
-                    ModelEvent::ReasoningDelta(_)
-                    | ModelEvent::Usage(_)
-                    | ModelEvent::ResponseId(_)
-                    | ModelEvent::WebSearchStarted { .. }
-                    | ModelEvent::WebSearchResult { .. }
-                    | ModelEvent::WebSearchCompleted { .. }
-                    | ModelEvent::ProviderItem(_) => {}
+            let mut collector = StreamCollector::new(Some(256 * 1024));
+            match stream_once(
+                &self.provider,
+                request,
+                &mut collector,
+                512,
+                ui_events,
+                |_| Ok(Forwarded::Ignore),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(StreamFailure::Provider(error)) => {
+                    append_text_bounded(
+                        &mut full_output,
+                        &format!("\n[child failed: {error}]"),
+                        256 * 1024,
+                    );
+                    break;
+                }
+                Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
+                    return Err(error);
+                }
+                Err(StreamFailure::EndedWithoutCompletion) => {
+                    append_text_bounded(
+                        &mut full_output,
+                        "\n[child stream ended without completion]",
+                        256 * 1024,
+                    );
+                    break;
                 }
             }
-            let provider_result = task.await.map_err(|error| error.to_string())?;
-            if let Err(error) = provider_result {
-                append_text_bounded(
-                    &mut full_output,
-                    &format!("\n[child failed: {error}]"),
-                    256 * 1024,
-                );
-                break;
-            }
-            if !saw_done {
-                append_text_bounded(
-                    &mut full_output,
-                    "\n[child stream ended without completion]",
-                    256 * 1024,
-                );
-                break;
-            }
-            append_text_bounded(&mut full_output, &assistant_text, 256 * 1024);
-
-            for partial in partials.into_values() {
-                if completed_ids.contains(&partial.id) || partial.name.is_empty() {
-                    continue;
-                }
-                let arguments: Value = serde_json::from_str(if partial.arguments.is_empty() {
-                    "{}"
-                } else {
-                    &partial.arguments
-                })
-                .map_err(|error| format!("invalid child tool arguments: {error}"))?;
-                completed_calls.push(ToolCall {
-                    id: if partial.id.is_empty() {
-                        format!("call_{}", uuid::Uuid::new_v4())
-                    } else {
-                        partial.id
-                    },
-                    name: partial.name,
-                    arguments,
-                });
-            }
-            if completed_calls.is_empty() {
+            append_text_bounded(&mut full_output, &collector.assistant_text, 256 * 1024);
+            collector.finish_partials("child tool")?;
+            if collector.completed_calls.is_empty() {
                 break;
             }
 
-            if !assistant_text.is_empty() {
+            if !collector.assistant_text.is_empty() {
                 items.push(ConversationItem::Message {
                     role: Role::Assistant,
-                    content: assistant_text,
+                    content: std::mem::take(&mut collector.assistant_text),
                 });
             }
             items.push(ConversationItem::AssistantToolCalls {
-                calls: completed_calls.clone(),
+                calls: collector.completed_calls.clone(),
             });
             self.storage
-                .append_tool_calls(&child_id, &completed_calls)
+                .append_tool_calls(&child_id, &collector.completed_calls)
                 .map_err(|error| error.to_string())?;
-            for tool_call in completed_calls {
+            for tool_call in std::mem::take(&mut collector.completed_calls) {
                 tool_call_count += 1;
                 let result = self.execute_child_tool(&tool_call, ui_events).await;
                 self.storage
