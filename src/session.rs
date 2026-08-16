@@ -1,5 +1,10 @@
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Instant,
+};
 
+use serde_json::Value;
 use tokio::{sync::mpsc, task::JoinHandle};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -121,11 +126,7 @@ impl SessionRuntime {
                 url,
                 snippet,
             } => {
-                let context = format!(
-                    "{title}
-{url}
-{snippet}"
-                );
+                let context = format!("{title}\n{url}\n{snippet}");
                 if let Some(tool) = self
                     .entries
                     .iter_mut()
@@ -142,11 +143,7 @@ impl SessionRuntime {
                 {
                     let result = tool.result.get_or_insert_with(String::new);
                     if !result.is_empty() {
-                        result.push_str(
-                            "
-
-",
-                        );
+                        result.push_str("\n\n");
                     }
                     result.push_str(&context);
                 }
@@ -393,11 +390,7 @@ impl SessionRuntime {
             return;
         }
         let content = if truncated {
-            format!(
-                "[较早思考内容已截断]
-
-{reasoning}"
-            )
+            format!("[较早思考内容已截断]\n\n{reasoning}")
         } else {
             reasoning
         };
@@ -478,6 +471,41 @@ impl SessionRuntime {
             .thinking_anchor
             .map(|anchor| anchor.saturating_sub(removed));
         self.clear_output_selection();
+    }
+    pub fn scroll_messages(&mut self, delta: isize) {
+        let Some(layout) = &self.message_layout else {
+            if delta > 0 {
+                self.message_scroll = self.message_scroll.saturating_add(delta as usize);
+                self.follow_output = false;
+            } else {
+                self.message_scroll = self.message_scroll.saturating_sub(delta.unsigned_abs());
+                if self.message_scroll == 0 {
+                    self.follow_output = true;
+                }
+            }
+            return;
+        };
+        let max_scroll = layout.max_scroll();
+        let current = self
+            .output_scroll_top
+            .unwrap_or(layout.scroll)
+            .min(max_scroll);
+        let next = next_output_scroll_top(current, max_scroll, delta);
+        if delta < 0 && next == max_scroll {
+            self.output_scroll_top = None;
+            self.follow_output = true;
+            self.message_scroll = 0;
+        } else {
+            self.output_scroll_top = Some(next);
+            self.follow_output = false;
+            self.message_scroll = max_scroll.saturating_sub(next);
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.message_scroll = 0;
+        self.follow_output = true;
+        self.output_scroll_top = None;
     }
 }
 
@@ -591,4 +619,110 @@ fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
             DisplayContent::Thinking(thinking) => thinking.id.len() + thinking.content.len(),
         })
         .sum()
+}
+
+pub(crate) fn next_output_scroll_top(current: usize, max_scroll: usize, delta: isize) -> usize {
+    let current = current.min(max_scroll);
+    if delta > 0 {
+        current.saturating_sub(delta as usize)
+    } else {
+        current.saturating_add(delta.unsigned_abs()).min(max_scroll)
+    }
+}
+
+pub(crate) fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {
+    let mut entries = Vec::new();
+    let mut tool_entries = HashMap::<String, usize>::new();
+    let mut thinking_index = 0usize;
+    for item in conversation {
+        match item {
+            ConversationItem::Message { role, content } => entries.push(DisplayEntry {
+                kind: match role {
+                    Role::User => DisplayKind::User,
+                    Role::Assistant => DisplayKind::Assistant,
+                    Role::System => DisplayKind::System,
+                },
+                content: DisplayContent::Markdown(content.clone()),
+            }),
+            ConversationItem::ThinkingSummary { content } => {
+                let id = format!("thinking-{thinking_index}");
+                thinking_index += 1;
+                entries.push(DisplayEntry {
+                    kind: DisplayKind::Thinking,
+                    content: DisplayContent::Thinking(ThinkingDisplay {
+                        id,
+                        content: content.clone(),
+                    }),
+                });
+            }
+            ConversationItem::Context { label, content } => entries.push(DisplayEntry {
+                kind: DisplayKind::System,
+                content: DisplayContent::Markdown(format!("### @{label}\n\n{content}")),
+            }),
+            ConversationItem::ProviderItem { item } => {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("web_search_call") {
+                    entries.push(DisplayEntry {
+                        kind: DisplayKind::Tool,
+                        content: DisplayContent::Tool(ToolDisplay {
+                            call_id: item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("native-web-search-{}", entries.len())),
+                            name: "web_search".into(),
+                            arguments: item.get("action").cloned().unwrap_or_default(),
+                            status: ToolDisplayStatus::Completed,
+                            result: None,
+                        }),
+                    });
+                }
+            }
+            ConversationItem::AssistantToolCalls { calls } => {
+                for call in calls {
+                    tool_entries.insert(call.id.clone(), entries.len());
+                    entries.push(DisplayEntry {
+                        kind: DisplayKind::Tool,
+                        content: DisplayContent::Tool(ToolDisplay {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            status: ToolDisplayStatus::Running,
+                            result: None,
+                        }),
+                    });
+                }
+            }
+            ConversationItem::ToolOutput { call_id, output } => {
+                if let Some(tool) = tool_entries
+                    .get(call_id)
+                    .and_then(|index| entries.get_mut(*index))
+                    .and_then(|entry| match &mut entry.content {
+                        DisplayContent::Tool(tool) => Some(tool),
+                        _ => None,
+                    })
+                {
+                    tool.status = tool_result_status(output);
+                    tool.result = Some(output.clone());
+                } else {
+                    entries.push(DisplayEntry {
+                        kind: DisplayKind::Tool,
+                        content: DisplayContent::Tool(ToolDisplay {
+                            call_id: call_id.clone(),
+                            name: "tool".into(),
+                            arguments: Value::Null,
+                            status: tool_result_status(output),
+                            result: Some(output.clone()),
+                        }),
+                    });
+                }
+            }
+        }
+    }
+    if entries.is_empty() {
+        entries.push(DisplayEntry {
+            kind: DisplayKind::System,
+            content: DisplayContent::Markdown("1H-Agent 已就绪，请输入任务并按 Enter。".into()),
+        });
+    }
+    entries
 }

@@ -22,7 +22,6 @@ use crossterm::{
 use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
-use serde_json::Value;
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
@@ -37,7 +36,7 @@ use crate::{
     secrets,
     security::Workspace,
     session::{
-        EventCtx, SessionRuntime, estimate_context_tokens, tool_result_status, trim_conversation,
+        EventCtx, SessionRuntime, display_entries, estimate_context_tokens, trim_conversation,
     },
     settings::SettingsForm,
     storage::{SessionSummary, Storage},
@@ -458,31 +457,31 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             true
         }
         KeyCode::PageUp if !app.current.busy => {
-            scroll_messages(app, 5);
+            app.current.scroll_messages(5);
             true
         }
         KeyCode::PageDown if !app.current.busy => {
-            scroll_messages(app, -5);
+            app.current.scroll_messages(-5);
             true
         }
         KeyCode::Up if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
-            scroll_messages(app, 3);
+            app.current.scroll_messages(3);
             true
         }
         KeyCode::Down if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
-            scroll_messages(app, -3);
+            app.current.scroll_messages(-3);
             true
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            scroll_to_bottom(app);
+            app.current.scroll_to_bottom();
             true
         }
         KeyCode::PageUp if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
-            scroll_messages(app, 5);
+            app.current.scroll_messages(5);
             true
         }
         KeyCode::PageDown if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
-            scroll_messages(app, -5);
+            app.current.scroll_messages(-5);
             true
         }
         KeyCode::Char('x')
@@ -825,11 +824,11 @@ fn handle_navigation_mouse(
 fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> EventOutcome {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            scroll_messages(app, MOUSE_WHEEL_SCROLL_LINES);
+            app.current.scroll_messages(MOUSE_WHEEL_SCROLL_LINES);
             EventOutcome::redraw()
         }
         MouseEventKind::ScrollDown => {
-            scroll_messages(app, -MOUSE_WHEEL_SCROLL_LINES);
+            app.current.scroll_messages(-MOUSE_WHEEL_SCROLL_LINES);
             EventOutcome::redraw()
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1043,7 +1042,8 @@ fn auto_scroll_selection(app: &mut App) {
     {
         return;
     }
-    scroll_messages(app, if direction < 0 { 1 } else { -1 });
+    app.current
+        .scroll_messages(if direction < 0 { 1 } else { -1 });
     let Some(layout) = &app.current.message_layout else {
         return;
     };
@@ -1145,55 +1145,6 @@ fn cancel_active_request(app: &mut App) {
         kind: DisplayKind::System,
         content: DisplayContent::Markdown("当前请求已取消。".into()),
     });
-}
-
-fn scroll_messages(app: &mut App, delta: isize) {
-    let Some(layout) = &app.current.message_layout else {
-        if delta > 0 {
-            app.current.message_scroll = app.current.message_scroll.saturating_add(delta as usize);
-            app.current.follow_output = false;
-        } else {
-            app.current.message_scroll = app
-                .current
-                .message_scroll
-                .saturating_sub(delta.unsigned_abs());
-            if app.current.message_scroll == 0 {
-                app.current.follow_output = true;
-            }
-        }
-        return;
-    };
-    let max_scroll = layout.max_scroll();
-    let current = app
-        .current
-        .output_scroll_top
-        .unwrap_or(layout.scroll)
-        .min(max_scroll);
-    let next = next_output_scroll_top(current, max_scroll, delta);
-    if delta < 0 && next == max_scroll {
-        app.current.output_scroll_top = None;
-        app.current.follow_output = true;
-        app.current.message_scroll = 0;
-    } else {
-        app.current.output_scroll_top = Some(next);
-        app.current.follow_output = false;
-        app.current.message_scroll = max_scroll.saturating_sub(next);
-    }
-}
-
-fn next_output_scroll_top(current: usize, max_scroll: usize, delta: isize) -> usize {
-    let current = current.min(max_scroll);
-    if delta > 0 {
-        current.saturating_sub(delta as usize)
-    } else {
-        current.saturating_add(delta.unsigned_abs()).min(max_scroll)
-    }
-}
-
-fn scroll_to_bottom(app: &mut App) {
-    app.current.message_scroll = 0;
-    app.current.follow_output = true;
-    app.current.output_scroll_top = None;
 }
 
 fn submit_input(app: &mut App) -> Result<()> {
@@ -2196,103 +2147,6 @@ fn refresh_sessions(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {
-    let mut entries = Vec::new();
-    let mut tool_entries = HashMap::<String, usize>::new();
-    let mut thinking_index = 0usize;
-    for item in conversation {
-        match item {
-            ConversationItem::Message { role, content } => entries.push(DisplayEntry {
-                kind: match role {
-                    Role::User => DisplayKind::User,
-                    Role::Assistant => DisplayKind::Assistant,
-                    Role::System => DisplayKind::System,
-                },
-                content: DisplayContent::Markdown(content.clone()),
-            }),
-            ConversationItem::ThinkingSummary { content } => {
-                let id = format!("thinking-{thinking_index}");
-                thinking_index += 1;
-                entries.push(DisplayEntry {
-                    kind: DisplayKind::Thinking,
-                    content: DisplayContent::Thinking(ThinkingDisplay {
-                        id,
-                        content: content.clone(),
-                    }),
-                });
-            }
-            ConversationItem::Context { label, content } => entries.push(DisplayEntry {
-                kind: DisplayKind::System,
-                content: DisplayContent::Markdown(format!("### @{label}\n\n{content}")),
-            }),
-            ConversationItem::ProviderItem { item } => {
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("web_search_call") {
-                    entries.push(DisplayEntry {
-                        kind: DisplayKind::Tool,
-                        content: DisplayContent::Tool(ToolDisplay {
-                            call_id: item
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| format!("native-web-search-{}", entries.len())),
-                            name: "web_search".into(),
-                            arguments: item.get("action").cloned().unwrap_or_default(),
-                            status: ToolDisplayStatus::Completed,
-                            result: None,
-                        }),
-                    });
-                }
-            }
-            ConversationItem::AssistantToolCalls { calls } => {
-                for call in calls {
-                    tool_entries.insert(call.id.clone(), entries.len());
-                    entries.push(DisplayEntry {
-                        kind: DisplayKind::Tool,
-                        content: DisplayContent::Tool(ToolDisplay {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                            status: ToolDisplayStatus::Running,
-                            result: None,
-                        }),
-                    });
-                }
-            }
-            ConversationItem::ToolOutput { call_id, output } => {
-                if let Some(tool) = tool_entries
-                    .get(call_id)
-                    .and_then(|index| entries.get_mut(*index))
-                    .and_then(|entry| match &mut entry.content {
-                        DisplayContent::Tool(tool) => Some(tool),
-                        _ => None,
-                    })
-                {
-                    tool.status = tool_result_status(output);
-                    tool.result = Some(output.clone());
-                } else {
-                    entries.push(DisplayEntry {
-                        kind: DisplayKind::Tool,
-                        content: DisplayContent::Tool(ToolDisplay {
-                            call_id: call_id.clone(),
-                            name: "tool".into(),
-                            arguments: Value::Null,
-                            status: tool_result_status(output),
-                            result: Some(output.clone()),
-                        }),
-                    });
-                }
-            }
-        }
-    }
-    if entries.is_empty() {
-        entries.push(DisplayEntry {
-            kind: DisplayKind::System,
-            content: DisplayContent::Markdown("1H-Agent 已就绪，请输入任务并按 Enter。".into()),
-        });
-    }
-    entries
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventState, KeyModifiers, MouseEvent};
@@ -2302,7 +2156,8 @@ mod tests {
     use super::*;
 
     use crate::session::{
-        MAX_THINKING_BUFFER_BYTES, MAX_THINKING_LINE_BYTES, estimate_context_tokens, trim_entries,
+        MAX_THINKING_BUFFER_BYTES, MAX_THINKING_LINE_BYTES, estimate_context_tokens,
+        next_output_scroll_top, trim_entries,
     };
 
     fn handle_event_for_test(app: &mut App, event: AgentEvent) -> crate::session::SessionOutcome {
@@ -2919,7 +2774,7 @@ mod tests {
     fn ordinary_updates_do_not_request_full_redraw() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        scroll_messages(&mut app, 1);
+        app.current.scroll_messages(1);
         assert!(!app.force_full_redraw);
         handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
         handle_event_for_test(&mut app, AgentEvent::ReasoningDelta("真实思考".into()));
@@ -3157,9 +3012,9 @@ mod tests {
         let visual_lines_ptr = layout.visual_lines.as_ptr();
         let line_count = layout.lines.len();
         let visual_line_count = layout.visual_lines.len();
-        scroll_messages(&mut app, 1);
+        app.current.scroll_messages(1);
         crate::ui::update_message_layout(&mut app, viewport);
-        scroll_messages(&mut app, -1);
+        app.current.scroll_messages(-1);
         crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 8, 5));
 
         let layout = app.current.message_layout.as_ref().unwrap();
