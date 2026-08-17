@@ -10,11 +10,16 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::Value;
-use std::{collections::HashSet, ops::Range};
+use std::{
+    collections::{HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
+    ops::Range,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    agent::ChildSessionStatus,
     app::{
         App, CommandPaletteState, DisplayContent, DisplayKind, LeaderAction, ThinkingDisplay,
         ToolDisplay, ToolDisplayStatus,
@@ -71,8 +76,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         app.thinking_menu_rect = None;
     }
-    if app.current.pending_approval.is_some() {
-        draw_approval(frame, area, app, &theme);
+    if app.provider_menu_open {
+        draw_provider_menu(frame, area, layout.footer, app, &theme);
+    } else {
+        app.provider_menu_rect = None;
+    }
+    if app.model_menu_open {
+        draw_model_menu(frame, area, layout.footer, app, &theme);
+    } else {
+        app.model_menu_rect = None;
     }
     app.settings_rect = app.settings.as_ref().map(|settings| match settings {
         SettingsState::List(_) => centered_rect(78, 20, area),
@@ -87,6 +99,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.leader_pending {
         draw_leader_hint(frame, area, app, &theme);
+    }
+    if app.has_pending_approval() {
+        draw_approval(frame, area, app, &theme);
     }
 }
 
@@ -243,12 +258,14 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiThe
         };
         let indent = "  ".repeat(row.depth);
         let marker = if active { ">" } else { " " };
-        let child_status = app.child_status.get(&row.id).map(|status| status.label());
+        let child_progress = app.child_status.get(&row.id);
         let waiting_approval = app.session_waiting_approval(&row.id);
-        let status_text = match (child_status, waiting_approval) {
+        let status_text = match (child_progress, waiting_approval) {
             (_, true) => " ⏳审批".to_owned(),
-            (Some("完成"), false) => String::new(),
-            (Some(label), false) => format!(" ·{label}"),
+            (Some(progress), false) if progress.status == ChildSessionStatus::Completed => {
+                String::new()
+            }
+            (Some(progress), false) => format!(" ·{}", progress.label()),
             (None, false) => String::new(),
         };
         let style = if active {
@@ -292,7 +309,6 @@ fn draw_messages(
 ) {
     let block = message_block();
     update_message_layout(app, viewport);
-    let thinking_lines = live_thinking_lines(app, viewport.width.max(1) as usize);
     let Some(layout) = &app.current.message_layout else {
         frame.render_widget(
             Paragraph::new(Vec::<Line<'static>>::new()).block(block),
@@ -306,7 +322,7 @@ fn draw_messages(
         .iter()
         .skip(layout.scroll)
         .take(layout.viewport.height as usize)
-        .map(|line| render_visual_line(layout, line, selection, &thinking_lines, theme))
+        .map(|line| render_visual_line(layout, line, selection, theme))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(visible_lines)
@@ -317,7 +333,6 @@ fn draw_messages(
 }
 
 pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
-    let thinking_lines = live_thinking_lines(app, viewport.width.max(1) as usize);
     let cached_width = app
         .current
         .message_layout
@@ -353,8 +368,19 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
         layout.update_viewport(viewport);
     }
 
+    let existing_live_rows = app
+        .current
+        .message_layout
+        .as_ref()
+        .map_or(0, |layout| layout.live_thinking_lines.len());
+    let thinking_update =
+        live_thinking_lines(app, viewport.width.max(1) as usize, existing_live_rows);
     if let Some(layout) = &mut app.current.message_layout {
-        layout.set_live_thinking_lines(&thinking_lines);
+        if let Some(lines) = thinking_update.lines {
+            layout.set_live_thinking_lines(lines);
+        } else {
+            layout.set_live_thinking_title(thinking_update.title);
+        }
         let max_scroll = layout.max_scroll();
         let anchored_scroll =
             app.layout_restore_anchor
@@ -386,22 +412,20 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
 }
 
 fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
-    #[cfg(test)]
-    {
-        app.current.markdown_parse_count += app
-            .current
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.content, DisplayContent::Markdown(_)))
-            .count();
-    }
     let theme = UiTheme::default();
     let mut lines = Vec::new();
     let mut interactions = Vec::new();
     let mut thinking_before = None;
     let mut in_tool_group = false;
-    for (entry_index, entry) in app.current.entries.iter().enumerate() {
-        if app.current.thinking_anchor == Some(entry_index) {
+    let mut parsed_markdown = 0usize;
+    let current = &mut app.current;
+    let entries = &current.entries;
+    let expanded_tools = &current.expanded_tools;
+    let expanded_thinking = &current.expanded_thinking;
+    let thinking_anchor = current.thinking_anchor;
+    let render_cache = &mut current.markdown_render_cache;
+    for (entry_index, entry) in entries.iter().enumerate() {
+        if thinking_anchor == Some(entry_index) {
             thinking_before = Some(lines.len());
             in_tool_group = false;
         }
@@ -417,14 +441,14 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
             }
             render_tool(
                 tool,
-                app.current.expanded_tools.contains(&tool.call_id),
+                expanded_tools.contains(&tool.call_id),
                 width,
                 &mut lines,
                 &mut interactions,
             );
-            let group_ends = app.current.entries.get(entry_index + 1).is_none_or(|next| {
+            let group_ends = entries.get(entry_index + 1).is_none_or(|next| {
                 !matches!(next.content, DisplayContent::Tool(_))
-                    || app.current.thinking_anchor == Some(entry_index + 1)
+                    || thinking_anchor == Some(entry_index + 1)
             });
             if group_ends {
                 push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
@@ -434,9 +458,22 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
         }
         in_tool_group = false;
         if let DisplayContent::Thinking(thinking) = &entry.content {
+            let expanded = expanded_thinking.contains(&thinking.id);
+            let expanded_body = expanded.then(|| {
+                let (rendered, parsed) = cached_markdown(
+                    render_cache,
+                    entry_index,
+                    &thinking.content,
+                    theme.style(VisualRole::Primary),
+                    1,
+                );
+                parsed_markdown += usize::from(parsed);
+                rendered
+            });
             render_thinking_summary(
                 thinking,
-                app.current.expanded_thinking.contains(&thinking.id),
+                expanded,
+                expanded_body.as_deref(),
                 width,
                 &mut lines,
                 &mut interactions,
@@ -489,7 +526,10 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
                         None,
                     );
                 } else {
-                    for line in render_markdown(text, content_style) {
+                    let (rendered, parsed) =
+                        cached_markdown(render_cache, entry_index, text, content_style, 0);
+                    parsed_markdown += usize::from(parsed);
+                    for line in rendered {
                         push_rendered_line(&mut lines, &mut interactions, line, None);
                     }
                 }
@@ -504,14 +544,45 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
         }
         push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
     }
-    if app.current.thinking_anchor.is_some() && thinking_before.is_none() {
+    if thinking_anchor.is_some() && thinking_before.is_none() {
         thinking_before = Some(lines.len());
+    }
+    #[cfg(test)]
+    {
+        current.markdown_parse_count += parsed_markdown;
     }
     RenderedMessageLines {
         lines,
         interactions,
         thinking_before,
     }
+}
+
+fn cached_markdown(
+    cache: &mut std::collections::HashMap<usize, crate::output::CachedMarkdown>,
+    entry_index: usize,
+    text: &str,
+    base: Style,
+    variant: u8,
+) -> (Vec<Line<'static>>, bool) {
+    let mut hasher = DefaultHasher::new();
+    variant.hash(&mut hasher);
+    text.hash(&mut hasher);
+    let fingerprint = hasher.finish();
+    if let Some(cached) = cache.get(&entry_index)
+        && cached.fingerprint == fingerprint
+    {
+        return (cached.lines.clone(), false);
+    }
+    let lines = render_markdown(text, base);
+    cache.insert(
+        entry_index,
+        crate::output::CachedMarkdown {
+            fingerprint,
+            lines: lines.clone(),
+        },
+    );
+    (lines, true)
 }
 
 fn push_rendered_line(
@@ -528,12 +599,12 @@ fn render_visual_line(
     layout: &MessageLayout,
     visual: &VisualLine,
     selection: Option<OutputSelection>,
-    thinking_lines: &[String],
     theme: &UiTheme,
 ) -> Line<'static> {
     if visual.synthetic {
         return Line::from(Span::styled(
-            thinking_lines
+            layout
+                .live_thinking_lines
                 .get(visual.start)
                 .cloned()
                 .unwrap_or_default(),
@@ -546,30 +617,66 @@ fn render_visual_line(
     let local_start = visual.start.saturating_sub(line.start);
     let local_end = visual.end.saturating_sub(line.start);
     let selected_range = selection.and_then(OutputSelection::range);
-    let mut spans = Vec::new();
-    let mut span_offset = 0usize;
-    for source in &line.styled.spans {
-        let source_text = source.content.as_ref();
-        for (offset, grapheme) in source_text.grapheme_indices(true) {
-            let grapheme_start = span_offset + offset;
-            let grapheme_end = grapheme_start + grapheme.len();
-            if grapheme_end <= local_start || grapheme_start >= local_end {
-                continue;
-            }
-            let global_start = line.start + grapheme_start;
-            let global_end = line.start + grapheme_end;
-            let is_selected =
-                selected_range.is_some_and(|(start, end)| start < global_end && end > global_start);
-            let style = if is_selected {
-                source.style.fg(Color::Black).bg(Color::Cyan)
-            } else {
-                source.style
-            };
-            spans.push(Span::styled(grapheme.to_owned(), style));
+    let first_run = line
+        .style_runs
+        .partition_point(|run| run.end <= local_start);
+    let mut parts = Vec::<(String, Style)>::new();
+    for run in line.style_runs.iter().skip(first_run) {
+        if run.start >= local_end {
+            break;
         }
-        span_offset += source_text.len();
+        let start = run.start.max(local_start);
+        let end = run.end.min(local_end);
+        if start >= end {
+            continue;
+        }
+        let global_start = line.start + start;
+        let global_end = line.start + end;
+        if let Some((selected_start, selected_end)) = selected_range
+            && selected_start < global_end
+            && selected_end > global_start
+        {
+            let before_end = selected_start.clamp(global_start, global_end);
+            push_styled_slice(
+                &mut parts,
+                &line.text[start..before_end - line.start],
+                run.style,
+            );
+            let highlighted_start = selected_start.max(global_start);
+            let highlighted_end = selected_end.min(global_end);
+            push_styled_slice(
+                &mut parts,
+                &line.text[highlighted_start - line.start..highlighted_end - line.start],
+                run.style.fg(Color::Black).bg(Color::Cyan),
+            );
+            push_styled_slice(
+                &mut parts,
+                &line.text[highlighted_end - line.start..end],
+                run.style,
+            );
+        } else {
+            push_styled_slice(&mut parts, &line.text[start..end], run.style);
+        }
     }
-    Line::from(spans)
+    Line::from(
+        parts
+            .into_iter()
+            .map(|(text, style)| Span::styled(text, style))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn push_styled_slice(parts: &mut Vec<(String, Style)>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some((previous, previous_style)) = parts.last_mut()
+        && *previous_style == style
+    {
+        previous.push_str(text);
+    } else {
+        parts.push((text.to_owned(), style));
+    }
 }
 
 fn render_markdown(text: &str, base: Style) -> Vec<Line<'static>> {
@@ -1250,6 +1357,7 @@ fn render_tool(
 fn render_thinking_summary(
     thinking: &ThinkingDisplay,
     expanded: bool,
+    expanded_body: Option<&[Line<'static>]>,
     width: usize,
     lines: &mut Vec<Line<'static>>,
     interactions: &mut Vec<Option<InteractionTarget>>,
@@ -1306,8 +1414,14 @@ fn render_thinking_summary(
         );
         return;
     }
-    for line in render_markdown(&thinking.content, theme.style(VisualRole::Primary)) {
-        push_rendered_line(lines, interactions, line, None);
+    if let Some(body) = expanded_body {
+        for line in body {
+            push_rendered_line(lines, interactions, line.clone(), None);
+        }
+    } else {
+        for line in render_markdown(&thinking.content, theme.style(VisualRole::Primary)) {
+            push_rendered_line(lines, interactions, line, None);
+        }
     }
 }
 
@@ -1499,7 +1613,7 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App, view: &InputView
         ),
         area,
     );
-    if !app.current.busy && app.settings.is_none() && app.current.pending_approval.is_none() {
+    if !app.current.busy && app.settings.is_none() && !app.has_pending_approval() {
         let cursor_x = area.x + 1 + cursor_column as u16;
         let cursor_y = area.y + 1 + cursor_row.min(area.height.saturating_sub(3));
         frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), cursor_y));
@@ -1525,6 +1639,156 @@ fn draw_footer(
     }
     frame.render_widget(Paragraph::new(lines), area);
     app.thinking_control_rect = thinking_control_rect(area, view);
+    (app.provider_control_rect, app.model_control_rect) = provider_model_rects(area, view, app);
+}
+
+fn provider_model_rects(area: Rect, view: &UiViewModel, app: &App) -> (Option<Rect>, Option<Rect>) {
+    let Some(secondary) = view.footer.secondary.as_ref() else {
+        return (None, None);
+    };
+    let right = clip_segments(&secondary.right, area.width as usize);
+    let right_width = segment_width(&right);
+    let left_budget = (area.width as usize)
+        .saturating_sub(right_width.saturating_add(usize::from(right_width > 0)));
+    let left = clip_segments(&secondary.left, left_budget);
+    let Some(text) = left.first().map(|segment| segment.text.as_str()) else {
+        return (None, None);
+    };
+    let prefix = format!("{} · ", mode_label(app.current.mode));
+    if !text.starts_with(&prefix) || area.height < 2 {
+        return (None, None);
+    }
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str()) as u16;
+    let visible_width = UnicodeWidthStr::width(text) as u16;
+    let provider_width = UnicodeWidthStr::width(app.provider_label()) as u16;
+    let separator_width = UnicodeWidthStr::width(" · ") as u16;
+    let model_width = UnicodeWidthStr::width(app.model_name()) as u16;
+    let provider_x = area.x.saturating_add(prefix_width);
+    let model_x = provider_x
+        .saturating_add(provider_width)
+        .saturating_add(separator_width);
+    let provider = (provider_width > 0
+        && visible_width >= prefix_width.saturating_add(provider_width))
+    .then(|| Rect::new(provider_x, area.y.saturating_add(1), provider_width, 1));
+    let model = (model_width > 0
+        && visible_width
+            >= prefix_width
+                .saturating_add(provider_width)
+                .saturating_add(separator_width)
+                .saturating_add(model_width))
+    .then(|| Rect::new(model_x, area.y.saturating_add(1), model_width, 1));
+    (provider, model)
+}
+
+fn draw_provider_menu(
+    frame: &mut Frame<'_>,
+    screen: Rect,
+    footer: Rect,
+    app: &mut App,
+    theme: &UiTheme,
+) {
+    let choices = crate::app::provider_choices(app);
+    let content_width = choices
+        .iter()
+        .map(|preset| UnicodeWidthStr::width(preset.label()))
+        .max()
+        .unwrap_or(12)
+        .saturating_add(4) as u16;
+    let width = content_width.clamp(20, 36).min(screen.width);
+    let height = (choices.len() as u16).saturating_add(2).min(screen.height);
+    let control = app
+        .provider_control_rect
+        .unwrap_or(Rect::new(footer.x, footer.y, 0, 0));
+    let x = control.x.min(screen.right().saturating_sub(width));
+    let y = footer.y.saturating_sub(height);
+    let area = Rect::new(x, y, width, height);
+    app.provider_menu_rect = Some(area);
+
+    let items = choices
+        .iter()
+        .enumerate()
+        .map(|(index, preset)| {
+            let selected = index == app.provider_menu_selected;
+            ListItem::new(Line::from(Span::styled(
+                format!("{} {}", if selected { "›" } else { " " }, preset.label()),
+                if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Primary)
+                },
+            )))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(" 选择供应商 ")
+                .borders(Borders::ALL)
+                .border_style(theme.focus_border),
+        ),
+        area,
+    );
+}
+
+fn draw_model_menu(
+    frame: &mut Frame<'_>,
+    screen: Rect,
+    footer: Rect,
+    app: &mut App,
+    theme: &UiTheme,
+) {
+    let choices = crate::app::model_choices(app);
+    let content_width = choices
+        .iter()
+        .map(|model| UnicodeWidthStr::width(model.as_str()))
+        .max()
+        .unwrap_or(12)
+        .saturating_add(4) as u16;
+    let width = content_width.clamp(24, 52).min(screen.width);
+    let height = (choices.len() as u16)
+        .saturating_add(2)
+        .min(14)
+        .min(screen.height);
+    let control = app
+        .model_control_rect
+        .unwrap_or(Rect::new(footer.x, footer.y, 0, 0));
+    let x = control.x.min(screen.right().saturating_sub(width));
+    let y = footer.y.saturating_sub(height);
+    let area = Rect::new(x, y, width, height);
+    app.model_menu_rect = Some(area);
+
+    let visible = area.height.saturating_sub(2) as usize;
+    let scroll = app
+        .model_menu_selected
+        .saturating_sub(visible.saturating_sub(1));
+    let items = choices
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(index, model)| {
+            let selected = index == app.model_menu_selected;
+            ListItem::new(Line::from(Span::styled(
+                format!("{} {}", if selected { "›" } else { " " }, model),
+                if selected {
+                    theme.selected
+                } else {
+                    theme.style(VisualRole::Primary)
+                },
+            )))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(format!(" {} 模型 ", app.provider_label()))
+                .borders(Borders::ALL)
+                .border_style(theme.focus_border),
+        ),
+        area,
+    );
 }
 
 fn thinking_control_rect(area: Rect, view: &UiViewModel) -> Option<Rect> {
@@ -1682,12 +1946,17 @@ fn render_segments(segments: &[UiSegment], theme: &UiTheme) -> Vec<Span<'static>
 
 fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) {
     let popup = centered_rect(76, 18, area);
-    let approval = app
-        .current
-        .pending_approval
-        .as_ref()
-        .expect("approval exists");
+    let approval = app.pending_approval().expect("approval exists");
     let mut lines = approval_lines(&approval.call, &approval.reason);
+    if let Some(title) = approval.source_title.as_deref() {
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("来源  子 Agent · {title}"),
+                Style::default().fg(Color::Cyan),
+            )),
+        );
+    }
     let waited = approval.created_at.elapsed().as_secs();
     lines.push(Line::from(Span::styled(
         format!("已等待 {:02}:{:02}", waited / 60, waited % 60),
@@ -2240,8 +2509,140 @@ pub(crate) fn live_thinking_line_with_braille(app: &App, braille: bool) -> Strin
     live_thinking_lines_with_braille(app, usize::MAX, braille).join("\n")
 }
 
-fn live_thinking_lines(app: &App, width: usize) -> Vec<String> {
-    live_thinking_lines_with_braille(app, width, crate::app::braille_spinner_supported())
+struct LiveThinkingUpdate {
+    title: String,
+    lines: Option<Vec<String>>,
+}
+
+fn live_thinking_lines(app: &mut App, width: usize, existing_rows: usize) -> LiveThinkingUpdate {
+    live_thinking_lines_cached(
+        app,
+        width,
+        crate::app::braille_spinner_supported(),
+        existing_rows,
+    )
+}
+
+fn live_thinking_lines_cached(
+    app: &mut App,
+    width: usize,
+    braille: bool,
+    existing_rows: usize,
+) -> LiveThinkingUpdate {
+    if app.current.thinking_anchor.is_none() {
+        return LiveThinkingUpdate {
+            title: String::new(),
+            lines: (existing_rows != 0).then(Vec::new),
+        };
+    }
+    if !app.current.thinking_expanded {
+        let lines = live_thinking_lines_with_braille(app, width, braille);
+        let title = lines.into_iter().next().unwrap_or_default();
+        return LiveThinkingUpdate {
+            title: title.clone(),
+            lines: (existing_rows != 1).then(|| vec![title]),
+        };
+    }
+
+    let width = width.max(1);
+    let status = if app.current.thinking_active {
+        "思考中"
+    } else {
+        match app.current.thinking_result {
+            crate::app::ThinkingResult::Completed => "思考完成",
+            crate::app::ThinkingResult::Failed => "思考失败",
+            crate::app::ThinkingResult::Cancelled => "思考已取消",
+        }
+    };
+    let title = if app.current.thinking_active {
+        format!(
+            "▾ {} {status}",
+            crate::app::thinking_animation_glyph(app.current.thinking_animation_frame, braille)
+        )
+    } else {
+        format!("▾ {status}")
+    };
+    let title = fit_text_tail(&title, width);
+
+    let buffer = &app.current.thinking_buffer;
+    let reasoning = buffer.trim();
+    if reasoning.is_empty() {
+        let mut lines = vec![title.clone()];
+        if app.current.thinking_buffer_truncated {
+            lines.extend(wrap_grapheme_lines("  [较早思考内容已截断]", width));
+        }
+        lines.extend(wrap_grapheme_lines(
+            &format!("  {}", app.current.thinking_last_line),
+            width,
+        ));
+        return LiveThinkingUpdate {
+            title,
+            lines: Some(lines),
+        };
+    }
+    let source_start = reasoning.as_ptr() as usize - buffer.as_ptr() as usize;
+    let epoch = app.current.thinking_buffer_epoch;
+    let cache = &mut app.current.live_thinking_layout_cache;
+    let prefix_unchanged = cache.width == width
+        && cache.buffer_epoch == epoch
+        && cache.source_start == source_start
+        && cache.processed_len <= reasoning.len()
+        && reasoning.is_char_boundary(cache.processed_len);
+    let mut body_changed = !prefix_unchanged;
+    if body_changed {
+        #[cfg(test)]
+        let rebuilds = cache.full_rebuilds + 1;
+        cache.clear();
+        cache.width = width;
+        cache.buffer_epoch = epoch;
+        cache.source_start = source_start;
+        cache.current_row = "  ".into();
+        cache.current_width = 2;
+        #[cfg(test)]
+        {
+            cache.full_rebuilds = rebuilds;
+        }
+    }
+    let tail = &reasoning[cache.processed_len..];
+    body_changed |= !tail.is_empty();
+    #[cfg(test)]
+    {
+        cache.processed_bytes += tail.len();
+    }
+    append_wrapped_thinking(cache, tail, width);
+    cache.processed_len = reasoning.len();
+    let lines = (body_changed || existing_rows <= 1).then(|| {
+        let mut lines = vec![title.clone()];
+        if app.current.thinking_buffer_truncated {
+            lines.extend(wrap_grapheme_lines("  [较早思考内容已截断]", width));
+        }
+        lines.extend(cache.rows.iter().cloned());
+        lines.push(cache.current_row.clone());
+        lines
+    });
+    LiveThinkingUpdate { title, lines }
+}
+
+fn append_wrapped_thinking(
+    cache: &mut crate::session::LiveThinkingLayoutCache,
+    value: &str,
+    width: usize,
+) {
+    for grapheme in value.graphemes(true) {
+        if grapheme == "\n" || grapheme == "\r\n" {
+            cache.rows.push(std::mem::take(&mut cache.current_row));
+            cache.current_row = "  ".into();
+            cache.current_width = 2;
+            continue;
+        }
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if cache.current_width > 0 && cache.current_width.saturating_add(grapheme_width) > width {
+            cache.rows.push(std::mem::take(&mut cache.current_row));
+            cache.current_width = 0;
+        }
+        cache.current_row.push_str(grapheme);
+        cache.current_width = cache.current_width.saturating_add(grapheme_width);
+    }
 }
 
 fn live_thinking_lines_with_braille(app: &App, width: usize, braille: bool) -> Vec<String> {
@@ -2391,6 +2792,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_visual_line_renders_only_the_visible_style_slices() {
+        let text = "中🙂e\u{301}".repeat(6_000);
+        let layout = MessageLayout::new(
+            vec![Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Green),
+            ))],
+            Rect::new(0, 0, 80, 24),
+            0,
+        );
+        assert!(layout.visual_lines.len() > 100);
+        let visual = &layout.visual_lines[layout.visual_lines.len() / 2];
+        let rendered = render_visual_line(&layout, visual, None, &UiTheme::default());
+        assert_eq!(rendered.spans.len(), 1);
+
+        let line = &layout.lines[visual.logical_line];
+        let local_start = visual.start - line.start;
+        let first = line.text[local_start..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(offset, _)| visual.start + offset)
+            .unwrap();
+        let selected = render_visual_line(
+            &layout,
+            visual,
+            Some(OutputSelection {
+                anchor: first,
+                active: visual.end,
+                dragging: false,
+            }),
+            &UiTheme::default(),
+        );
+        assert!(selected.spans.len() <= 2);
+    }
+
+    #[test]
     fn leader_action_at_maps_rows_and_rejects_borders_and_gaps() {
         let rect = Rect::new(10, 4, 40, 11);
         // Block::bordered() inner starts at (11, 5); the first action is drawn
@@ -2419,7 +2856,7 @@ mod tests {
 
         let mut lines = Vec::new();
         let mut interactions = Vec::new();
-        render_thinking_summary(&thinking, false, 40, &mut lines, &mut interactions);
+        render_thinking_summary(&thinking, false, None, 40, &mut lines, &mut interactions);
         assert_eq!(lines.len(), 1);
         assert_eq!(interactions, vec![target.clone()]);
         let collapsed = lines[0].to_string();
@@ -2429,7 +2866,7 @@ mod tests {
 
         lines.clear();
         interactions.clear();
-        render_thinking_summary(&thinking, true, 40, &mut lines, &mut interactions);
+        render_thinking_summary(&thinking, true, None, 40, &mut lines, &mut interactions);
         assert_eq!(interactions.first(), Some(&target));
         let expanded = lines
             .iter()

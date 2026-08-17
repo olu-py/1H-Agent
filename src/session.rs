@@ -15,7 +15,7 @@ use crate::{
         AgentPhase, ApprovalAction, DisplayContent, DisplayEntry, DisplayKind, ModelPhase,
         PendingApproval, ThinkingDisplay, ThinkingResult, ToolDisplay, ToolDisplayStatus,
     },
-    output::{EdgeScroll, MessageLayout, OutputSelection},
+    output::{CachedMarkdown, EdgeScroll, MessageLayout, OutputSelection},
     provider::{ConversationItem, Role, Usage},
     secrets,
     storage::Storage,
@@ -37,6 +37,27 @@ pub struct SessionOutcome {
     pub force_redraw: bool,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct LiveThinkingLayoutCache {
+    pub width: usize,
+    pub source_start: usize,
+    pub processed_len: usize,
+    pub buffer_epoch: u64,
+    pub rows: Vec<String>,
+    pub current_row: String,
+    pub current_width: usize,
+    #[cfg(test)]
+    pub full_rebuilds: usize,
+    #[cfg(test)]
+    pub processed_bytes: usize,
+}
+
+impl LiveThinkingLayoutCache {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Per-session runtime state. Each open session owns its own conversation,
 /// display entries, agent runner, and streaming/thinking state, so multiple
 /// agents can run in the background while the user switches between sessions.
@@ -51,6 +72,8 @@ pub struct SessionRuntime {
     pub thinking_active: bool,
     pub thinking_buffer: String,
     pub thinking_buffer_truncated: bool,
+    pub(crate) thinking_buffer_epoch: u64,
+    pub(crate) live_thinking_layout_cache: LiveThinkingLayoutCache,
     pub thinking_animation_frame: usize,
     pub thinking_anchor: Option<usize>,
     pub(crate) thinking_result: ThinkingResult,
@@ -68,6 +91,7 @@ pub struct SessionRuntime {
     pub output_scroll_top: Option<usize>,
     pub output_selection: Option<OutputSelection>,
     pub message_layout: Option<MessageLayout>,
+    pub markdown_render_cache: HashMap<usize, CachedMarkdown>,
     pub output_layout_dirty: bool,
     #[cfg(test)]
     pub output_layout_rebuild_count: usize,
@@ -213,6 +237,8 @@ impl SessionRuntime {
             AgentEvent::Approval {
                 call,
                 reason,
+                source_session_id,
+                source_title,
                 reply,
             } => {
                 self.finish_thinking("思考完成");
@@ -222,6 +248,8 @@ impl SessionRuntime {
                 self.pending_approval = Some(PendingApproval {
                     call,
                     reason,
+                    source_session_id,
+                    source_title,
                     action: ApprovalAction::Agent(reply),
                     created_at: Instant::now(),
                 });
@@ -294,7 +322,7 @@ impl SessionRuntime {
                 }
                 outcome.sessions_dirty = true;
             }
-            AgentEvent::ChildSessionStatus { .. } => {}
+            AgentEvent::ChildSessionProgress { .. } => {}
             AgentEvent::Failed(error) => {
                 self.finish_thinking("思考失败");
                 self.push_entry(DisplayEntry {
@@ -362,6 +390,8 @@ impl SessionRuntime {
         self.thinking_last_line = "模型正在思考".into();
         self.thinking_buffer.clear();
         self.thinking_buffer_truncated = false;
+        self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
+        self.live_thinking_layout_cache.clear();
         self.thinking_animation_frame = 0;
         self.thinking_anchor = Some(self.entries.len());
         self.thinking_expanded = false;
@@ -388,6 +418,8 @@ impl SessionRuntime {
         self.thinking_last_line.clear();
         self.thinking_anchor = None;
         self.thinking_buffer_truncated = false;
+        self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
+        self.live_thinking_layout_cache.clear();
         if reasoning.is_empty() {
             return;
         }
@@ -410,6 +442,8 @@ impl SessionRuntime {
         self.thinking_last_line.clear();
         self.thinking_buffer.clear();
         self.thinking_buffer_truncated = false;
+        self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
+        self.live_thinking_layout_cache.clear();
         self.thinking_animation_frame = 0;
         self.thinking_anchor = None;
         self.thinking_result = ThinkingResult::Completed;
@@ -431,6 +465,7 @@ impl SessionRuntime {
                 .unwrap_or(self.thinking_buffer.len());
             self.thinking_buffer.drain(..start);
             self.thinking_buffer_truncated = true;
+            self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
         }
         let latest = self
             .thinking_buffer
@@ -469,12 +504,18 @@ impl SessionRuntime {
         }
         self.invalidate_output_layout();
         let removed = trim_entries(&mut self.entries);
+        self.markdown_render_cache.clear();
         self.thinking_anchor = self
             .thinking_anchor
             .map(|anchor| anchor.saturating_sub(removed));
         self.clear_output_selection();
     }
-    pub fn scroll_messages(&mut self, delta: isize) {
+    pub fn scroll_messages(&mut self, delta: isize) -> bool {
+        let previous = (
+            self.message_scroll,
+            self.follow_output,
+            self.output_scroll_top,
+        );
         let Some(layout) = &self.message_layout else {
             if delta > 0 {
                 self.message_scroll = self.message_scroll.saturating_add(delta as usize);
@@ -485,7 +526,12 @@ impl SessionRuntime {
                     self.follow_output = true;
                 }
             }
-            return;
+            return previous
+                != (
+                    self.message_scroll,
+                    self.follow_output,
+                    self.output_scroll_top,
+                );
         };
         let max_scroll = layout.max_scroll();
         let current = self
@@ -502,6 +548,12 @@ impl SessionRuntime {
             self.follow_output = false;
             self.message_scroll = max_scroll.saturating_sub(next);
         }
+        previous
+            != (
+                self.message_scroll,
+                self.follow_output,
+                self.output_scroll_top,
+            )
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -573,6 +625,10 @@ pub(crate) fn trim_conversation_bounded(
         if items.is_empty() {
             break;
         }
+        items.remove(0);
+        removed += 1;
+    }
+    while matches!(items.first(), Some(ConversationItem::ToolOutput { .. })) {
         items.remove(0);
         removed += 1;
     }

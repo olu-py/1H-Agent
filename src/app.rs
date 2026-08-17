@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -22,12 +22,12 @@ use crossterm::{
 use futures_util::StreamExt;
 use ignore::WalkBuilder;
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
-use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::{
-    agent::{AgentEvent, AgentRunner, ChildSessionStatus},
+    agent::{AgentEvent, AgentRunner, ChildSessionProgress, ChildSessionStatus},
     commands::{self, AgentMode, Command},
     config::{Config, ProviderPreset, ThinkingLevel, ThinkingProfile, thinking_profile},
     input::InputBuffer,
@@ -45,6 +45,7 @@ use crate::{
 };
 
 const MOUSE_WHEEL_SCROLL_LINES: isize = 1;
+const DEFERRED_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
 pub(crate) use crate::model::ThinkingResult;
 pub use crate::model::{
@@ -71,6 +72,14 @@ pub struct App {
     pub thinking_menu_rect: Option<Rect>,
     pub session_panel_rect: Option<Rect>,
     pub input_mode_rect: Option<Rect>,
+    pub provider_control_rect: Option<Rect>,
+    pub model_control_rect: Option<Rect>,
+    pub provider_menu_open: bool,
+    pub provider_menu_rect: Option<Rect>,
+    pub provider_menu_selected: usize,
+    pub model_menu_open: bool,
+    pub model_menu_rect: Option<Rect>,
+    pub model_menu_selected: usize,
     pub leader_hint_rect: Option<Rect>,
     pub force_full_redraw: bool,
     pub mouse_press_target: Option<InteractionTarget>,
@@ -81,10 +90,12 @@ pub struct App {
     pub file_selected: usize,
     pub sessions: Vec<SessionSummary>,
     pub expanded_sessions: HashSet<String>,
-    pub child_status: HashMap<String, ChildSessionStatus>,
+    pub child_status: HashMap<String, ChildSessionProgress>,
+    pub child_batches: HashMap<String, HashSet<String>>,
     storage: Storage,
     config: Config,
     registry: Arc<ToolRegistry>,
+    approval_lock: Arc<Mutex<()>>,
     active_secret: Option<(ProviderPreset, String)>,
     active_session: String,
     pub current: SessionRuntime,
@@ -120,7 +131,14 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
     registry.set_external_config(config.browser.clone(), config.mcp_servers.clone());
     let _ = registry.initialize_mcp().await;
     let (router_tx, router_rx) = mpsc::channel(256);
-    let (active_secret, initial_status) = match secrets::api_key_cached(config.provider.preset) {
+    let approval_lock = Arc::new(Mutex::new(()));
+    // Concentrate all keyring access at startup. Runtime provider switching,
+    // restored sessions, settings, and cross-provider children are cache-only.
+    for preset in ProviderPreset::ALL {
+        let _ = secrets::api_key_cached(preset);
+    }
+    let (active_secret, initial_status) = match secrets::api_key_cached_only(config.provider.preset)
+    {
         Ok(api_key) => (
             Some((config.provider.preset, api_key)),
             format!(
@@ -149,6 +167,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         &config,
         &registry,
         &router_tx,
+        &approval_lock,
         active_secret.as_ref(),
         &session_id,
     );
@@ -166,6 +185,14 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         thinking_menu_rect: None,
         session_panel_rect: None,
         input_mode_rect: None,
+        provider_control_rect: None,
+        model_control_rect: None,
+        provider_menu_open: false,
+        provider_menu_rect: None,
+        provider_menu_selected: 0,
+        model_menu_open: false,
+        model_menu_rect: None,
+        model_menu_selected: 0,
         leader_hint_rect: None,
         force_full_redraw: false,
         mouse_press_target: None,
@@ -177,9 +204,11 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         sessions,
         expanded_sessions: HashSet::new(),
         child_status: HashMap::new(),
+        child_batches: HashMap::new(),
         storage,
         config,
         registry,
+        approval_lock,
         active_secret,
         active_session: session_id,
         current: runtime,
@@ -250,6 +279,7 @@ async fn event_loop(
     let mut terminal_events = EventStream::new();
     let mut edge_scroll_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut thinking_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    let mut deferred_redraw_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     terminal.draw(|frame| ui::draw(frame, app))?;
 
     while !app.should_quit {
@@ -294,8 +324,19 @@ async fn event_loop(
                 pending::<()>().await;
             }
         };
+        let deferred_redraw_tick = async {
+            if let Some(timer) = deferred_redraw_timer.as_mut() {
+                timer.await;
+            } else {
+                pending::<()>().await;
+            }
+        };
         let mut redraw = false;
         tokio::select! {
+            _ = deferred_redraw_tick => {
+                deferred_redraw_timer = None;
+                redraw = true;
+            }
             _ = edge_scroll_tick => {
                 edge_scroll_timer = None;
                 auto_scroll_selection(app);
@@ -309,8 +350,13 @@ async fn event_loop(
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(event)) => {
+                        let coalesce = should_coalesce_terminal_redraw(&event);
                         let outcome = handle_terminal_event(app, event).await?;
                         redraw = outcome.redraw;
+                        if redraw && coalesce {
+                            schedule_deferred_redraw(&mut deferred_redraw_timer);
+                            redraw = false;
+                        }
                         if let Some(sequence) = outcome.osc52 {
                             execute!(terminal.backend_mut(), Print(sequence))?;
                         }
@@ -321,11 +367,18 @@ async fn event_loop(
             }
             agent_event = app.router_rx.recv() => {
                 if let Some(routed) = agent_event {
+                    let coalesce = should_coalesce_stream_redraw(&app.active_session, &routed);
                     redraw = handle_routed_event(app, routed);
+                    if redraw && coalesce {
+                        schedule_deferred_redraw(&mut deferred_redraw_timer);
+                        redraw = false;
+                    }
                 }
             }
         }
         if redraw {
+            // An immediate frame includes any scroll and stream updates accumulated so far.
+            deferred_redraw_timer = None;
             if app.force_full_redraw {
                 terminal.clear()?;
                 app.force_full_redraw = false;
@@ -390,6 +443,12 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         if let Some(outcome) = handle_thinking_mouse(app, mouse)? {
             return Ok(outcome);
         }
+        if let Some(outcome) = handle_provider_mouse(app, mouse)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = handle_model_mouse(app, mouse)? {
+            return Ok(outcome);
+        }
         if let Some(outcome) = handle_navigation_mouse(app, mouse)? {
             return Ok(outcome);
         }
@@ -397,17 +456,19 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             mouse.kind,
             app.settings.is_some(),
             app.palette.is_some(),
-            app.current.pending_approval.is_some(),
+            app.has_pending_approval(),
         ) {
             return Ok(handle_output_mouse(app, mouse));
         }
         return Ok(EventOutcome::default());
     }
     if matches!(event, Event::Resize(_, _)) {
-        if app.current.pending_approval.is_some()
+        if app.has_pending_approval()
             || app.settings.is_some()
             || app.palette.is_some()
             || app.thinking_menu_open
+            || app.provider_menu_open
+            || app.model_menu_open
         {
             app.force_full_redraw = true;
         }
@@ -423,23 +484,7 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         app.should_quit = true;
         return Ok(EventOutcome::default());
     }
-    if app.settings.is_some() {
-        let redraw = settings_key_handled(key.code, key.modifiers);
-        handle_settings_key(app, key.code, key.modifiers);
-        return Ok(EventOutcome {
-            redraw,
-            osc52: None,
-        });
-    }
-    if app.palette.is_some() {
-        let redraw = palette_key_handled(key.code, key.modifiers);
-        handle_palette_key(app, key.code, key.modifiers);
-        return Ok(EventOutcome {
-            redraw,
-            osc52: None,
-        });
-    }
-    if app.current.pending_approval.is_some() {
+    if app.has_pending_approval() {
         let redraw = matches!(
             key.code,
             KeyCode::Char('y')
@@ -450,10 +495,41 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         );
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => resolve_approval(app, true),
-            KeyCode::Char('n') | KeyCode::Char('N') => resolve_approval(app, false),
-            KeyCode::Esc => cancel_active_request(app),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => resolve_approval(app, false),
             _ => {}
         }
+        return Ok(EventOutcome {
+            redraw,
+            osc52: None,
+        });
+    }
+    if app.settings.is_some() {
+        let redraw = settings_key_handled(key.code, key.modifiers);
+        handle_settings_key(app, key.code, key.modifiers);
+        return Ok(EventOutcome {
+            redraw,
+            osc52: None,
+        });
+    }
+    if app.provider_menu_open {
+        let redraw = provider_menu_key_handled(key.code);
+        handle_provider_menu_key(app, key.code)?;
+        return Ok(EventOutcome {
+            redraw,
+            osc52: None,
+        });
+    }
+    if app.model_menu_open {
+        let redraw = model_menu_key_handled(key.code);
+        handle_model_menu_key(app, key.code)?;
+        return Ok(EventOutcome {
+            redraw,
+            osc52: None,
+        });
+    }
+    if app.palette.is_some() {
+        let redraw = palette_key_handled(key.code, key.modifiers);
+        handle_palette_key(app, key.code, key.modifiers);
         return Ok(EventOutcome {
             redraw,
             osc52: None,
@@ -470,33 +546,23 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             app.current.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
             true
         }
-        KeyCode::PageUp if !app.current.busy => {
-            app.current.scroll_messages(5);
-            true
-        }
-        KeyCode::PageDown if !app.current.busy => {
-            app.current.scroll_messages(-5);
-            true
-        }
+        KeyCode::PageUp if !app.current.busy => app.current.scroll_messages(5),
+        KeyCode::PageDown if !app.current.busy => app.current.scroll_messages(-5),
         KeyCode::Up if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app.current.scroll_messages(3);
-            true
+            app.current.scroll_messages(3)
         }
         KeyCode::Down if !app.current.busy && key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app.current.scroll_messages(-3);
-            true
+            app.current.scroll_messages(-3)
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.current.scroll_to_bottom();
             true
         }
         KeyCode::PageUp if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.current.scroll_messages(5);
-            true
+            app.current.scroll_messages(5)
         }
         KeyCode::PageDown if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.current.scroll_messages(-5);
-            true
+            app.current.scroll_messages(-5)
         }
         KeyCode::Char('x')
             if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
@@ -536,17 +602,8 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         }
         KeyCode::Esc => {
             app.leader_pending = false;
-            if let Some(task) = app.current.active_task.take() {
-                task.abort();
-                app.current.finish_thinking("思考已取消");
-                app.current.busy = false;
-                app.current.agent_phase = AgentPhase::Idle;
-                app.current.model_phase = ModelPhase::Idle;
-                app.current.status = "已取消".into();
-                app.current.push_entry(DisplayEntry {
-                    kind: DisplayKind::System,
-                    content: DisplayContent::Markdown("请求已取消。".into()),
-                });
+            if app.current.active_task.is_some() {
+                cancel_active_request(app);
             }
             true
         }
@@ -756,15 +813,292 @@ fn handle_thinking_mouse(
         return Ok(Some(EventOutcome::redraw()));
     }
     if !app.current.busy
-        && app.current.pending_approval.is_none()
+        && !app.has_pending_approval()
         && app
             .thinking_control_rect
             .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
     {
+        app.model_menu_open = false;
+        app.model_menu_rect = None;
+        app.provider_menu_open = false;
+        app.provider_menu_rect = None;
         app.thinking_menu_open = true;
         return Ok(Some(EventOutcome::redraw()));
     }
     Ok(None)
+}
+
+pub(crate) fn model_choices(app: &App) -> Vec<String> {
+    let mut choices = app
+        .config
+        .provider
+        .preset
+        .selectable_models()
+        .iter()
+        .map(|model| (*model).to_owned())
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        choices.push(app.config.provider.model.clone());
+    } else if !choices
+        .iter()
+        .any(|model| model == &app.config.provider.model)
+    {
+        choices.insert(0, app.config.provider.model.clone());
+    }
+    choices
+}
+
+pub(crate) fn provider_choices(app: &App) -> Vec<ProviderPreset> {
+    let mut choices = app
+        .config
+        .providers
+        .iter()
+        .map(|provider| provider.preset)
+        .collect::<Vec<_>>();
+    if !choices.contains(&app.config.provider.preset) {
+        choices.insert(0, app.config.provider.preset);
+    }
+    choices
+}
+
+fn apply_provider_choice(app: &mut App, preset: ProviderPreset) -> Result<()> {
+    if preset == app.config.provider.preset {
+        return Ok(());
+    }
+    let Some(provider) = app.config.provider_for(preset) else {
+        app.current.status = "供应商连接不存在".into();
+        return Ok(());
+    };
+    let api_key = app
+        .active_secret
+        .as_ref()
+        .filter(|(active, _)| *active == preset)
+        .map(|(_, key)| key.clone())
+        .or_else(|| secrets::api_key_cached_only(preset).ok());
+    let Some(api_key) = api_key else {
+        app.current.status = format!("{} 的 API Key 不可用，请在供应商设置中补充", preset.label());
+        return Ok(());
+    };
+
+    app.storage.clear_response_id(&app.current.session_id)?;
+    app.config.provider = provider;
+    app.active_secret = Some((preset, api_key));
+    app.current.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
+    rebuild_runner(app)?;
+    app.current.status = match app.config.save() {
+        Ok(()) => format!(
+            "已切换到 {} · {}",
+            preset.label(),
+            app.config.provider.model
+        ),
+        Err(error) => format!(
+            "供应商已切换；配置保存失败：{}",
+            secrets::redact(&error.to_string())
+        ),
+    };
+    Ok(())
+}
+
+fn handle_provider_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return Ok(app.provider_menu_open.then(EventOutcome::default));
+    }
+    if app.provider_menu_open {
+        let selected = app
+            .provider_menu_rect
+            .filter(|rect| point_in_rect(mouse.column, mouse.row, *rect))
+            .and_then(|rect| {
+                let inner = ratatui::widgets::Block::bordered().inner(rect);
+                if !point_in_rect(mouse.column, mouse.row, inner) {
+                    return None;
+                }
+                let index = mouse.row.saturating_sub(inner.y) as usize;
+                provider_choices(app).get(index).copied()
+            });
+        app.provider_menu_open = false;
+        app.provider_menu_rect = None;
+        if let Some(preset) = selected {
+            apply_provider_choice(app, preset)?;
+        }
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    if app.current.busy
+        || app.has_pending_approval()
+        || app.settings.is_some()
+        || app.palette.is_some()
+        || app.leader_pending
+    {
+        return Ok(None);
+    }
+    if app
+        .provider_control_rect
+        .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
+    {
+        app.thinking_menu_open = false;
+        app.thinking_menu_rect = None;
+        app.model_menu_open = false;
+        app.model_menu_rect = None;
+        let choices = provider_choices(app);
+        app.provider_menu_selected = choices
+            .iter()
+            .position(|preset| *preset == app.config.provider.preset)
+            .unwrap_or(0);
+        app.provider_menu_open = true;
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    Ok(None)
+}
+
+fn provider_menu_key_handled(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::Enter
+    )
+}
+
+fn handle_provider_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
+    let choices = provider_choices(app);
+    if choices.is_empty() {
+        app.provider_menu_open = false;
+        return Ok(());
+    }
+    match code {
+        KeyCode::Esc => {
+            app.provider_menu_open = false;
+            app.provider_menu_rect = None;
+        }
+        KeyCode::Up => {
+            app.provider_menu_selected =
+                (app.provider_menu_selected + choices.len() - 1) % choices.len();
+        }
+        KeyCode::Down => {
+            app.provider_menu_selected = (app.provider_menu_selected + 1) % choices.len();
+        }
+        KeyCode::Enter => {
+            apply_provider_choice(app, choices[app.provider_menu_selected])?;
+            app.provider_menu_open = false;
+            app.provider_menu_rect = None;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_model_choice(app: &mut App, model: String) -> Result<()> {
+    if model.trim().is_empty() {
+        return Ok(());
+    }
+    app.config.provider.model = model;
+    app.config.provider.normalize_thinking();
+    app.config.upsert_provider(app.config.provider.clone());
+    app.current.context_limit_tokens = app.config.provider.resolved_context_window_tokens();
+    app.storage.clear_response_id(&app.current.session_id)?;
+    rebuild_runner(app)?;
+    let status = match app.config.save() {
+        Ok(()) => format!("模型已设置为 {}", app.config.provider.model),
+        Err(error) => format!(
+            "模型已更新；配置保存失败：{}",
+            secrets::redact(&error.to_string())
+        ),
+    };
+    app.current.status = status;
+    Ok(())
+}
+
+fn handle_model_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return Ok(app.model_menu_open.then(EventOutcome::default));
+    }
+    if app.model_menu_open {
+        let Some(rect) = app.model_menu_rect else {
+            app.model_menu_open = false;
+            return Ok(Some(EventOutcome::redraw()));
+        };
+        if !point_in_rect(mouse.column, mouse.row, rect) {
+            app.model_menu_open = false;
+            app.model_menu_rect = None;
+            return Ok(Some(EventOutcome::redraw()));
+        }
+        let inner = ratatui::widgets::Block::bordered().inner(rect);
+        let choices = model_choices(app);
+        let visible = inner.height as usize;
+        let scroll = app
+            .model_menu_selected
+            .saturating_sub(visible.saturating_sub(1));
+        let index = scroll + mouse.row.saturating_sub(inner.y) as usize;
+        if let Some(model) = choices.get(index).cloned() {
+            apply_model_choice(app, model)?;
+        }
+        app.model_menu_open = false;
+        app.model_menu_rect = None;
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    if app.current.busy
+        || app.has_pending_approval()
+        || app.settings.is_some()
+        || app.palette.is_some()
+        || app.leader_pending
+    {
+        return Ok(None);
+    }
+    if app
+        .model_control_rect
+        .is_some_and(|rect| point_in_rect(mouse.column, mouse.row, rect))
+    {
+        app.thinking_menu_open = false;
+        app.thinking_menu_rect = None;
+        app.provider_menu_open = false;
+        app.provider_menu_rect = None;
+        let choices = model_choices(app);
+        app.model_menu_selected = choices
+            .iter()
+            .position(|model| model == &app.config.provider.model)
+            .unwrap_or(0);
+        app.model_menu_open = true;
+        return Ok(Some(EventOutcome::redraw()));
+    }
+    Ok(None)
+}
+
+fn model_menu_key_handled(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::Enter
+    )
+}
+
+fn handle_model_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
+    let choices = model_choices(app);
+    if choices.is_empty() {
+        app.model_menu_open = false;
+        return Ok(());
+    }
+    match code {
+        KeyCode::Esc => {
+            app.model_menu_open = false;
+            app.model_menu_rect = None;
+        }
+        KeyCode::Up => {
+            app.model_menu_selected = (app.model_menu_selected + choices.len() - 1) % choices.len();
+        }
+        KeyCode::Down => {
+            app.model_menu_selected = (app.model_menu_selected + 1) % choices.len();
+        }
+        KeyCode::Enter => {
+            let model = choices[app.model_menu_selected].clone();
+            apply_model_choice(app, model)?;
+            app.model_menu_open = false;
+            app.model_menu_rect = None;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn point_in_rect(column: u16, row: u16, rect: Rect) -> bool {
@@ -836,7 +1170,7 @@ fn handle_navigation_mouse(
     if mouse.kind != MouseEventKind::Down(MouseButton::Left)
         || app.settings.is_some()
         || app.palette.is_some()
-        || app.current.pending_approval.is_some()
+        || app.has_pending_approval()
         || app.leader_pending
     {
         return Ok(None);
@@ -879,14 +1213,14 @@ fn handle_navigation_mouse(
 
 fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> EventOutcome {
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            app.current.scroll_messages(MOUSE_WHEEL_SCROLL_LINES);
-            EventOutcome::redraw()
-        }
-        MouseEventKind::ScrollDown => {
-            app.current.scroll_messages(-MOUSE_WHEEL_SCROLL_LINES);
-            EventOutcome::redraw()
-        }
+        MouseEventKind::ScrollUp => EventOutcome {
+            redraw: app.current.scroll_messages(MOUSE_WHEEL_SCROLL_LINES),
+            osc52: None,
+        },
+        MouseEventKind::ScrollDown => EventOutcome {
+            redraw: app.current.scroll_messages(-MOUSE_WHEEL_SCROLL_LINES),
+            osc52: None,
+        },
         MouseEventKind::Down(MouseButton::Left) => {
             app.mouse_dragged = false;
             app.mouse_press_position = Some((mouse.column, mouse.row));
@@ -981,6 +1315,7 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                                     })
                             });
                     }
+                    let live_thinking_target = matches!(&target, InteractionTarget::Thinking);
                     match target {
                         InteractionTarget::Tool(call_id) => {
                             if !app.current.expanded_tools.insert(call_id.clone()) {
@@ -996,7 +1331,9 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                             }
                         }
                     }
-                    app.current.invalidate_output_layout();
+                    if !live_thinking_target {
+                        app.current.invalidate_output_layout();
+                    }
                 }
                 app.mouse_dragged = false;
                 return EventOutcome::redraw();
@@ -1104,7 +1441,8 @@ fn auto_scroll_selection(app: &mut App) {
     {
         return;
     }
-    app.current
+    let _ = app
+        .current
         .scroll_messages(if direction < 0 { 1 } else { -1 });
     let Some(layout) = &app.current.message_layout else {
         return;
@@ -1416,7 +1754,7 @@ fn open_settings(app: &mut App) {
 fn available_key_presets() -> HashSet<ProviderPreset> {
     ProviderPreset::ALL
         .iter()
-        .filter_map(|preset| secrets::api_key_cached(*preset).ok().map(|_| *preset))
+        .filter_map(|preset| secrets::api_key_cached_only(*preset).ok().map(|_| *preset))
         .collect()
 }
 
@@ -1482,7 +1820,7 @@ fn remove_settings_provider(app: &mut App) -> Result<()> {
             .first()
             .cloned()
             .unwrap_or_else(|| ProviderPreset::OpenAi.defaults());
-        app.active_secret = secrets::api_key_cached(app.config.provider.preset)
+        app.active_secret = secrets::api_key_cached_only(app.config.provider.preset)
             .ok()
             .map(|key| (app.config.provider.preset, key));
         rebuild_runner(app)?;
@@ -1575,13 +1913,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 if model.trim().is_empty() {
                     app.current.status = "模型不能为空".into();
                 } else {
-                    app.config.provider.model = model.trim().to_owned();
-                    app.config.provider.normalize_thinking();
-                    app.current.context_limit_tokens =
-                        app.config.provider.resolved_context_window_tokens();
-                    rebuild_runner(app)?;
-                    app.current.status = format!("模型已设置为 {}", app.config.provider.model);
-                    let _ = app.config.save();
+                    apply_model_choice(app, model.trim().to_owned())?;
                 }
             } else {
                 app.current.status = format!("当前模型：{}", app.config.provider.model);
@@ -1828,6 +2160,7 @@ fn rebuild_runner(app: &mut App) -> Result<()> {
             app.current.session_id.clone(),
         )
         .with_cluster_config(app.config.cluster.clone())
+        .with_approval_lock(app.approval_lock.clone())
         .with_configured_agents(app.config.agents.clone())
         .with_child_role(child_role)
         .with_child_provider_resolver(child_provider_resolver),
@@ -2032,14 +2365,30 @@ fn apply_settings(app: &mut App) -> Result<()> {
 fn handle_routed_event(app: &mut App, routed: RoutedEvent) -> bool {
     let RoutedEvent { session_id, event } = routed;
     let is_active = session_id == app.active_session;
-    if let AgentEvent::ChildSessionStatus {
+    if let AgentEvent::ChildSessionProgress {
         session_id: child_id,
-        status,
+        progress,
     } = &event
     {
-        app.child_status.insert(child_id.clone(), *status);
+        let previous_batch_finished = app.child_batches.get(&session_id).is_some_and(|children| {
+            !children.is_empty()
+                && children.iter().all(|child| {
+                    app.child_status
+                        .get(child)
+                        .is_some_and(|progress| progress.status.is_terminal())
+                })
+        });
+        if progress.status == ChildSessionStatus::Queued && previous_batch_finished {
+            app.child_batches.remove(&session_id);
+        }
+        app.child_batches
+            .entry(session_id.clone())
+            .or_default()
+            .insert(child_id.clone());
+        app.child_status.insert(child_id.clone(), progress.clone());
         let _ = refresh_sessions(app);
-        return is_active;
+        update_cluster_batch_status(app, &session_id);
+        return true;
     }
     let outcome = {
         let ctx = EventCtx {
@@ -2060,7 +2409,57 @@ fn handle_routed_event(app: &mut App, routed: RoutedEvent) -> bool {
     if outcome.sessions_dirty && refresh_sessions(app).is_err() && is_active {
         app.current.status = "就绪，但刷新会话失败".into();
     }
-    is_active
+    is_active || app.has_pending_approval()
+}
+
+fn update_cluster_batch_status(app: &mut App, parent_id: &str) {
+    let Some(children) = app.child_batches.get(parent_id) else {
+        return;
+    };
+    let total = children.len();
+    let completed = children
+        .iter()
+        .filter(|child| {
+            app.child_status
+                .get(*child)
+                .is_some_and(|progress| progress.status.is_terminal())
+        })
+        .count();
+    let queued = children
+        .iter()
+        .filter(|child| {
+            app.child_status
+                .get(*child)
+                .is_some_and(|progress| progress.status == ChildSessionStatus::Queued)
+        })
+        .count();
+    let running = total.saturating_sub(completed + queued);
+    let status = format!("集群 {completed}/{total} 完成 · {running} 运行 · {queued} 排队");
+    if let Some(runtime) = app.runtime_mut(parent_id) {
+        runtime.status = status;
+    }
+}
+
+fn should_coalesce_stream_redraw(active_session: &str, routed: &RoutedEvent) -> bool {
+    routed.session_id == active_session
+        && matches!(
+            &routed.event,
+            AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_)
+        )
+}
+
+fn should_coalesce_terminal_redraw(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+    )
+}
+
+fn schedule_deferred_redraw(timer: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    if timer.is_none() {
+        *timer = Some(Box::pin(tokio::time::sleep(DEFERRED_REDRAW_INTERVAL)));
+    }
 }
 
 // Kept as a small pure helper so terminals without Braille support can use the
@@ -2087,29 +2486,34 @@ pub(crate) fn braille_spinner_supported() -> bool {
 }
 
 fn resolve_approval(app: &mut App, approved: bool) {
-    if let Some(approval) = app.current.take_pending_approval() {
+    if let Some((owner, approval)) = app.take_pending_approval_global() {
         app.force_full_redraw = true;
         match approval.action {
             ApprovalAction::Agent(reply) => {
                 let _ = reply.send(approved);
-                app.current.agent_phase = AgentPhase::Thinking;
-                app.current.model_phase = ModelPhase::Idle;
-                app.current.status = if approved {
-                    "已批准，开始执行工具……".into()
-                } else {
-                    "已拒绝，将结果返回模型……".into()
-                };
+                if let Some(runtime) = app.runtime_mut(&owner) {
+                    runtime.agent_phase = AgentPhase::Thinking;
+                    runtime.model_phase = ModelPhase::Idle;
+                    runtime.status = if approved {
+                        "已批准，开始执行工具……".into()
+                    } else {
+                        "已拒绝，将结果返回模型……".into()
+                    };
+                }
             }
             ApprovalAction::Shell(command) => {
                 if approved {
                     let registry = app.registry.clone();
-                    let events = app.current.agent_tx.clone();
+                    let Some(runtime) = app.runtime_mut(&owner) else {
+                        return;
+                    };
+                    let events = runtime.agent_tx.clone();
                     let command_for_event = command.clone();
-                    app.current.busy = true;
-                    app.current.agent_phase = AgentPhase::ToolRunning;
-                    app.current.model_phase = ModelPhase::Idle;
-                    app.current.status = "正在执行 Shell 命令…… | Esc 取消".into();
-                    app.current.active_task = Some(tokio::spawn(async move {
+                    runtime.busy = true;
+                    runtime.agent_phase = AgentPhase::ToolRunning;
+                    runtime.model_phase = ModelPhase::Idle;
+                    runtime.status = "正在执行 Shell 命令…… | Esc 取消".into();
+                    runtime.active_task = Some(tokio::spawn(async move {
                         let result = registry
                             .execute_shell(&command)
                             .await
@@ -2121,13 +2525,13 @@ fn resolve_approval(app: &mut App, approved: bool) {
                             })
                             .await;
                     }));
-                } else {
-                    app.current.push_entry(DisplayEntry {
+                } else if let Some(runtime) = app.runtime_mut(&owner) {
+                    runtime.push_entry(DisplayEntry {
                         kind: DisplayKind::System,
                         content: DisplayContent::Markdown("Shell 命令已拒绝。".into()),
                     });
-                    app.current.status = "Shell 命令已拒绝".into();
-                    app.current.agent_phase = AgentPhase::Idle;
+                    runtime.status = "Shell 命令已拒绝".into();
+                    runtime.agent_phase = AgentPhase::Idle;
                 }
             }
         }
@@ -2143,6 +2547,8 @@ fn request_shell_approval(app: &mut App, command: String) -> Result<()> {
     app.current.pending_approval = Some(PendingApproval {
         call,
         reason: "! 命令将通过 workspace Shell 执行".into(),
+        source_session_id: None,
+        source_title: None,
         action: ApprovalAction::Shell(command),
         created_at: Instant::now(),
     });
@@ -2273,6 +2679,7 @@ fn build_runtime(
     config: &Config,
     registry: &Arc<ToolRegistry>,
     router_tx: &mpsc::Sender<RoutedEvent>,
+    approval_lock: &Arc<Mutex<()>>,
     active_secret: Option<&(ProviderPreset, String)>,
     session_id: &str,
 ) -> SessionRuntime {
@@ -2294,7 +2701,7 @@ fn build_runtime(
     let runtime_key = active_secret
         .filter(|(preset, _)| *preset == provider_config.preset)
         .map(|(_, api_key)| api_key.clone())
-        .or_else(|| secrets::api_key_cached(provider_config.preset).ok());
+        .or_else(|| secrets::api_key_cached_only(provider_config.preset).ok());
     let runner = runtime_key.as_ref().and_then(|api_key| {
         OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())
             .ok()
@@ -2307,6 +2714,7 @@ fn build_runtime(
                     session_id.to_owned(),
                 )
                 .with_cluster_config(config.cluster.clone())
+                .with_approval_lock(approval_lock.clone())
                 .with_configured_agents(config.agents.clone())
                 .with_child_role(child_role.clone())
                 .with_child_provider_resolver(child_provider_resolver)
@@ -2341,6 +2749,8 @@ fn build_runtime(
         thinking_active: false,
         thinking_buffer: String::new(),
         thinking_buffer_truncated: false,
+        thinking_buffer_epoch: 0,
+        live_thinking_layout_cache: Default::default(),
         thinking_animation_frame: 0,
         thinking_anchor: None,
         thinking_result: ThinkingResult::Completed,
@@ -2358,6 +2768,7 @@ fn build_runtime(
         output_scroll_top: None,
         output_selection: None,
         message_layout: None,
+        markdown_render_cache: HashMap::new(),
         output_layout_dirty: true,
         #[cfg(test)]
         output_layout_rebuild_count: 0,
@@ -2387,6 +2798,7 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
             &app.config,
             &app.registry,
             &app.router_tx,
+            &app.approval_lock,
             active_secret.as_ref(),
             &session_id,
         )
@@ -2413,6 +2825,63 @@ fn refresh_sessions(app: &mut App) -> Result<()> {
 }
 
 impl App {
+    pub(crate) fn has_pending_approval(&self) -> bool {
+        self.pending_approval().is_some()
+    }
+
+    pub(crate) fn pending_approval(&self) -> Option<&PendingApproval> {
+        let current = self
+            .current
+            .pending_approval
+            .as_ref()
+            .map(|approval| (approval.created_at, approval));
+        self.background
+            .values()
+            .filter_map(|runtime| {
+                runtime
+                    .pending_approval
+                    .as_ref()
+                    .map(|approval| (approval.created_at, approval))
+            })
+            .chain(current)
+            .min_by_key(|(created_at, _)| *created_at)
+            .map(|(_, approval)| approval)
+    }
+
+    fn take_pending_approval_global(&mut self) -> Option<(String, PendingApproval)> {
+        let mut owner = self
+            .current
+            .pending_approval
+            .as_ref()
+            .map(|approval| (approval.created_at, self.active_session.clone()));
+        for (session_id, runtime) in &self.background {
+            if let Some(approval) = &runtime.pending_approval
+                && owner
+                    .as_ref()
+                    .is_none_or(|(created_at, _)| approval.created_at < *created_at)
+            {
+                owner = Some((approval.created_at, session_id.clone()));
+            }
+        }
+        let (_, owner) = owner?;
+        let approval = if owner == self.active_session {
+            self.current.take_pending_approval()
+        } else {
+            self.background
+                .get_mut(&owner)
+                .and_then(SessionRuntime::take_pending_approval)
+        }?;
+        Some((owner, approval))
+    }
+
+    fn runtime_mut(&mut self, session_id: &str) -> Option<&mut SessionRuntime> {
+        if session_id == self.active_session {
+            Some(&mut self.current)
+        } else {
+            self.background.get_mut(session_id)
+        }
+    }
+
     /// Whether a session currently has an approval prompt waiting. This is used
     /// by the session panel so background parent sessions are not stuck waiting
     /// for an invisible approval.
@@ -2662,6 +3131,74 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_click_opens_picker_and_applies_clicked_model() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.model_control_rect = Some(Rect::new(20, 20, 22, 1));
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_model_mouse(&mut app, click(20)).unwrap();
+        assert!(app.model_menu_open);
+        assert_eq!(model_choices(&app).first().unwrap(), "gpt-5-mini");
+
+        app.model_menu_rect = Some(Rect::new(10, 10, 40, 8));
+        handle_model_mouse(&mut app, click(12)).unwrap();
+        assert!(!app.model_menu_open);
+        assert_eq!(app.config.provider.model, "gpt-5");
+        assert_eq!(
+            app.config
+                .provider_for(ProviderPreset::OpenAi)
+                .unwrap()
+                .model,
+            "gpt-5"
+        );
+    }
+
+    #[test]
+    fn provider_and_model_text_open_independent_pickers() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.config
+            .upsert_provider(ProviderPreset::OpenAi.defaults());
+        app.config.upsert_provider(ProviderPreset::Qwen.defaults());
+        app.active_secret = Some((ProviderPreset::Qwen, "test-key".into()));
+        app.provider_control_rect = Some(Rect::new(10, 20, 6, 1));
+        app.model_control_rect = Some(Rect::new(19, 20, 10, 1));
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_provider_mouse(&mut app, click(12, 20)).unwrap();
+        assert!(app.provider_menu_open);
+        assert!(!app.model_menu_open);
+        assert_eq!(
+            provider_choices(&app),
+            vec![ProviderPreset::OpenAi, ProviderPreset::Qwen]
+        );
+
+        app.provider_menu_rect = Some(Rect::new(10, 10, 30, 4));
+        handle_provider_mouse(&mut app, click(12, 12)).unwrap();
+        assert!(!app.provider_menu_open);
+        assert_eq!(app.config.provider.preset, ProviderPreset::Qwen);
+        assert_eq!(
+            app.config.provider.model,
+            ProviderPreset::Qwen.defaults().model
+        );
+
+        handle_model_mouse(&mut app, click(20, 20)).unwrap();
+        assert!(app.model_menu_open);
+        assert!(!app.provider_menu_open);
+    }
+
+    #[test]
     fn execute_leader_action_mode_uses_next_mode() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
@@ -2702,16 +3239,95 @@ mod tests {
             &mut app,
             RoutedEvent {
                 session_id: active_session,
-                event: AgentEvent::ChildSessionStatus {
+                event: AgentEvent::ChildSessionProgress {
                     session_id: child_id.clone(),
-                    status: ChildSessionStatus::Running,
+                    progress: ChildSessionProgress {
+                        status: ChildSessionStatus::WaitingModel,
+                        turn: 1,
+                        max_turns: 3,
+                        tool: None,
+                        updated_at: Instant::now(),
+                    },
                 },
             },
         );
         assert!(redraw);
         assert_eq!(
-            app.child_status.get(&child_id),
-            Some(&ChildSessionStatus::Running)
+            app.child_status
+                .get(&child_id)
+                .map(|progress| progress.status),
+            Some(ChildSessionStatus::WaitingModel)
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_batch_status_tracks_queued_running_and_completed_children() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let parent = app.active_session.clone();
+        let route = |app: &mut App, child: &str, status| {
+            handle_routed_event(
+                app,
+                RoutedEvent {
+                    session_id: parent.clone(),
+                    event: AgentEvent::ChildSessionProgress {
+                        session_id: child.into(),
+                        progress: ChildSessionProgress {
+                            status,
+                            turn: 1,
+                            max_turns: 3,
+                            tool: None,
+                            updated_at: Instant::now(),
+                        },
+                    },
+                },
+            )
+        };
+
+        assert!(route(&mut app, "child-a", ChildSessionStatus::Queued));
+        assert!(route(&mut app, "child-b", ChildSessionStatus::Queued));
+        assert!(route(&mut app, "child-a", ChildSessionStatus::WaitingModel));
+        assert_eq!(app.current.status, "集群 0/2 完成 · 1 运行 · 1 排队");
+        assert!(route(&mut app, "child-a", ChildSessionStatus::Completed));
+        assert_eq!(app.current.status, "集群 1/2 完成 · 0 运行 · 1 排队");
+    }
+
+    #[tokio::test]
+    async fn background_child_approval_is_globally_visible_and_routed() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let owner = app.active_session.clone();
+        let other = app.storage.create_session(&app.workspace).unwrap();
+        activate_session(&mut app, other).unwrap();
+
+        let (reply, answer) = oneshot::channel();
+        app.background.get_mut(&owner).unwrap().pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "background-approval".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/lib.rs"}),
+            },
+            reason: "test background routing".into(),
+            source_session_id: Some("child-session".into()),
+            source_title: Some("background-child".into()),
+            action: ApprovalAction::Agent(reply),
+            created_at: Instant::now(),
+        });
+
+        assert!(app.has_pending_approval());
+        assert_eq!(
+            app.pending_approval()
+                .and_then(|approval| approval.source_title.as_deref()),
+            Some("background-child")
+        );
+        let screen = render_screen(&mut app, 80, 24);
+        assert!(screen.iter().any(|line| line.contains("background-child")));
+        resolve_approval(&mut app, true);
+        assert!(answer.await.unwrap());
+        assert!(!app.has_pending_approval());
+        assert_eq!(
+            app.background.get(&owner).unwrap().status,
+            "已批准，开始执行工具……"
         );
     }
 
@@ -2798,6 +3414,7 @@ mod tests {
         ));
         let (agent_tx, _agent_rx) = mpsc::channel(8);
         let (router_tx, router_rx) = mpsc::channel(16);
+        let approval_lock = Arc::new(Mutex::new(()));
         let runtime = SessionRuntime {
             session_id: session_id.clone(),
             status: String::new(),
@@ -2812,6 +3429,8 @@ mod tests {
             thinking_active: false,
             thinking_buffer: String::new(),
             thinking_buffer_truncated: false,
+            thinking_buffer_epoch: 0,
+            live_thinking_layout_cache: Default::default(),
             thinking_animation_frame: 0,
             thinking_anchor: None,
             thinking_result: ThinkingResult::Completed,
@@ -2829,6 +3448,7 @@ mod tests {
             output_scroll_top: None,
             output_selection: None,
             message_layout: None,
+            markdown_render_cache: HashMap::new(),
             output_layout_dirty: true,
             output_layout_rebuild_count: 0,
             markdown_parse_count: 0,
@@ -2852,6 +3472,14 @@ mod tests {
             thinking_menu_rect: None,
             session_panel_rect: None,
             input_mode_rect: None,
+            provider_control_rect: None,
+            model_control_rect: None,
+            provider_menu_open: false,
+            provider_menu_rect: None,
+            provider_menu_selected: 0,
+            model_menu_open: false,
+            model_menu_rect: None,
+            model_menu_selected: 0,
             leader_hint_rect: None,
             force_full_redraw: false,
             mouse_press_target: None,
@@ -2863,9 +3491,11 @@ mod tests {
             sessions,
             expanded_sessions: HashSet::new(),
             child_status: HashMap::new(),
+            child_batches: HashMap::new(),
             storage,
             config,
             registry,
+            approval_lock,
             active_secret: None,
             active_session: session_id,
             current: runtime,
@@ -2918,6 +3548,8 @@ mod tests {
                 arguments: serde_json::json!({"path":"src/ui.rs"}),
             },
             reason: "test".into(),
+            source_session_id: None,
+            source_title: None,
             action: ApprovalAction::Agent(reply),
             created_at: Instant::now(),
         });
@@ -3065,6 +3697,8 @@ mod tests {
                     arguments: serde_json::json!({"path":"src/ui.rs"}),
                 },
                 reason: "risk text".into(),
+                source_session_id: None,
+                source_title: None,
                 action: ApprovalAction::Agent(reply),
                 created_at: Instant::now(),
             });
@@ -3089,6 +3723,8 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
             reason: "cancel".into(),
+            source_session_id: None,
+            source_title: None,
             action: ApprovalAction::Agent(reply),
             created_at: Instant::now(),
         });
@@ -3103,6 +3739,8 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
             reason: "cancel".into(),
+            source_session_id: None,
+            source_title: None,
             action: ApprovalAction::Agent(reply),
             created_at: Instant::now(),
         });
@@ -3123,6 +3761,8 @@ mod tests {
                 arguments: serde_json::json!({"path":"src/ui.rs"}),
             },
             reason: "unique-risk-text".into(),
+            source_session_id: None,
+            source_title: None,
             action: ApprovalAction::Agent(reply),
             created_at: Instant::now(),
         });
@@ -3209,6 +3849,8 @@ mod tests {
                 arguments: serde_json::json!({"path":"src/ui.rs"}),
             },
             reason: "将修改工作区文件".into(),
+            source_session_id: None,
+            source_title: None,
             action: ApprovalAction::Agent(reply),
             created_at: Instant::now(),
         });
@@ -3807,6 +4449,51 @@ mod tests {
     }
 
     #[test]
+    fn expanding_thinking_summaries_parses_only_each_target_once() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.current.entries = vec![
+            DisplayEntry {
+                kind: DisplayKind::Assistant,
+                content: DisplayContent::Markdown("**正文**".into()),
+            },
+            DisplayEntry {
+                kind: DisplayKind::Thinking,
+                content: DisplayContent::Thinking(ThinkingDisplay {
+                    id: "thinking-a".into(),
+                    content: "# 摘要 A\n\n正文".into(),
+                }),
+            },
+            DisplayEntry {
+                kind: DisplayKind::Thinking,
+                content: DisplayContent::Thinking(ThinkingDisplay {
+                    id: "thinking-b".into(),
+                    content: "# 摘要 B\n\n正文".into(),
+                }),
+            },
+        ];
+        app.current.invalidate_output_layout();
+        let viewport = Rect::new(0, 0, 40, 20);
+        crate::ui::update_message_layout(&mut app, viewport);
+        let initial_parses = app.current.markdown_parse_count;
+
+        app.current.expanded_thinking.insert("thinking-a".into());
+        app.current.invalidate_output_layout();
+        crate::ui::update_message_layout(&mut app, viewport);
+        assert_eq!(app.current.markdown_parse_count, initial_parses + 1);
+
+        app.current.expanded_thinking.remove("thinking-a");
+        app.current.invalidate_output_layout();
+        crate::ui::update_message_layout(&mut app, viewport);
+        assert_eq!(app.current.markdown_parse_count, initial_parses + 1);
+
+        app.current.expanded_thinking.insert("thinking-b".into());
+        app.current.invalidate_output_layout();
+        crate::ui::update_message_layout(&mut app, viewport);
+        assert_eq!(app.current.markdown_parse_count, initial_parses + 2);
+    }
+
+    #[test]
     fn three_tools_render_as_one_group_and_keep_stable_expansion_ids() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
@@ -3907,7 +4594,10 @@ mod tests {
         handle_output_mouse(&mut app, click(MouseEventKind::Down(MouseButton::Left)));
         handle_output_mouse(&mut app, click(MouseEventKind::Up(MouseButton::Left)));
         assert!(app.current.thinking_expanded);
+        assert!(!app.current.output_layout_dirty);
+        let rebuilds = app.current.output_layout_rebuild_count;
         crate::ui::update_message_layout(&mut app, viewport);
+        assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
         assert!(
             app.current
                 .message_layout
@@ -3929,6 +4619,131 @@ mod tests {
                 .live_thinking_rows,
             1
         );
+    }
+
+    #[test]
+    fn live_thinking_layout_reuses_body_and_only_processes_appended_tail() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        app.current.thinking_expanded = true;
+        let initial = "中文🙂".repeat(4_000);
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta(initial.clone()));
+        let viewport = Rect::new(0, 0, 40, 20);
+        crate::ui::update_message_layout(&mut app, viewport);
+        let rebuilds = app.current.live_thinking_layout_cache.full_rebuilds;
+        let processed = app.current.live_thinking_layout_cache.processed_bytes;
+        let body_ptr = app
+            .current
+            .message_layout
+            .as_ref()
+            .unwrap()
+            .live_thinking_lines[1]
+            .as_ptr();
+        assert_eq!(processed, initial.len());
+
+        app.current.thinking_animation_frame += 1;
+        crate::ui::update_message_layout(&mut app, viewport);
+        assert_eq!(
+            app.current.live_thinking_layout_cache.full_rebuilds,
+            rebuilds
+        );
+        assert_eq!(
+            app.current.live_thinking_layout_cache.processed_bytes,
+            processed
+        );
+        assert_eq!(
+            app.current
+                .message_layout
+                .as_ref()
+                .unwrap()
+                .live_thinking_lines[1]
+                .as_ptr(),
+            body_ptr
+        );
+
+        let tail = "\n尾部👩‍💻";
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta(tail.into()));
+        crate::ui::update_message_layout(&mut app, viewport);
+        assert_eq!(
+            app.current.live_thinking_layout_cache.full_rebuilds,
+            rebuilds
+        );
+        assert_eq!(
+            app.current.live_thinking_layout_cache.processed_bytes,
+            processed + tail.len()
+        );
+
+        crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 50, 20));
+        assert_eq!(
+            app.current.live_thinking_layout_cache.full_rebuilds,
+            rebuilds + 1
+        );
+        assert_eq!(
+            app.current.live_thinking_layout_cache.processed_bytes,
+            initial.len() + tail.len()
+        );
+
+        let rebuilds_after_resize = app.current.live_thinking_layout_cache.full_rebuilds;
+        handle_event_for_test(
+            &mut app,
+            AgentEvent::ReasoningDelta("追加内容🙂".repeat(8_000)),
+        );
+        assert!(app.current.thinking_buffer_truncated);
+        crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 50, 20));
+        assert_eq!(
+            app.current.live_thinking_layout_cache.full_rebuilds,
+            rebuilds_after_resize + 1
+        );
+        assert_eq!(
+            app.current.live_thinking_layout_cache.processed_bytes,
+            app.current.thinking_buffer.trim().len()
+        );
+    }
+
+    #[test]
+    fn stream_redraw_coalescing_is_limited_to_active_text_deltas() {
+        let routed = |session_id: &str, event| RoutedEvent {
+            session_id: session_id.into(),
+            event,
+        };
+        assert!(should_coalesce_stream_redraw(
+            "active",
+            &routed("active", AgentEvent::TextDelta("a".into()))
+        ));
+        assert!(should_coalesce_stream_redraw(
+            "active",
+            &routed("active", AgentEvent::ReasoningDelta("a".into()))
+        ));
+        assert!(!should_coalesce_stream_redraw(
+            "active",
+            &routed("background", AgentEvent::TextDelta("a".into()))
+        ));
+        assert!(!should_coalesce_stream_redraw(
+            "active",
+            &routed("active", AgentEvent::ModelStreaming)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deferred_redraw_deadline_is_shared_without_being_reset() {
+        let scroll = Event::Mouse(wheel_event(MouseEventKind::ScrollUp));
+        assert!(should_coalesce_terminal_redraw(&scroll));
+        assert!(!should_coalesce_terminal_redraw(&Event::Mouse(
+            wheel_event(MouseEventKind::Down(MouseButton::Left))
+        )));
+        assert!(!should_coalesce_terminal_redraw(&Event::Key(KeyEvent {
+            code: KeyCode::PageUp,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })));
+
+        let mut timer = None;
+        schedule_deferred_redraw(&mut timer);
+        let first_deadline = timer.as_ref().unwrap().deadline();
+        schedule_deferred_redraw(&mut timer);
+        assert_eq!(timer.as_ref().unwrap().deadline(), first_deadline);
     }
 
     #[test]
@@ -4098,15 +4913,20 @@ mod tests {
         assert!(max_scroll >= 3);
         assert_eq!(app.current.output_layout_rebuild_count, 1);
 
-        handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
+        assert!(handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp)).redraw);
         assert_eq!(app.current.output_scroll_top, Some(max_scroll - 1));
         assert_eq!(app.current.message_scroll, 1);
         assert_eq!(app.current.output_layout_rebuild_count, 1);
 
-        handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
-        handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
+        assert!(handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp)).redraw);
+        assert!(handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp)).redraw);
         assert_eq!(app.current.output_scroll_top, Some(max_scroll - 3));
         assert_eq!(app.current.message_scroll, 3);
+
+        assert!(handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown)).redraw);
+        assert!(handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown)).redraw);
+        assert_eq!(app.current.output_scroll_top, Some(max_scroll - 1));
+        assert_eq!(app.current.message_scroll, 1);
         assert_eq!(app.current.output_layout_rebuild_count, 1);
     }
 
@@ -4121,21 +4941,22 @@ mod tests {
         app.current.output_scroll_top = Some(0);
         app.current.follow_output = false;
         app.current.message_scroll = max_scroll;
-        handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp));
+        assert!(!handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollUp)).redraw);
         assert_eq!(app.current.output_scroll_top, Some(0));
         assert_eq!(app.current.message_scroll, max_scroll);
 
-        handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown));
+        assert!(handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown)).redraw);
         assert_eq!(app.current.output_scroll_top, Some(1));
         assert_eq!(app.current.message_scroll, max_scroll - 1);
 
         app.current.output_scroll_top = Some(max_scroll);
         app.current.follow_output = false;
         app.current.message_scroll = 0;
-        handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown));
+        assert!(handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown)).redraw);
         assert_eq!(app.current.output_scroll_top, None);
         assert!(app.current.follow_output);
         assert_eq!(app.current.message_scroll, 0);
+        assert!(!handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown)).redraw);
         assert_eq!(app.current.output_layout_rebuild_count, 1);
     }
 }

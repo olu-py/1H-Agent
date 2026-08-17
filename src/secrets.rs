@@ -51,6 +51,13 @@ pub fn api_key_cached(preset: ProviderPreset) -> Result<String, SecretError> {
     result
 }
 
+/// Reads only the process cache and never touches the OS keyring. Runtime UI,
+/// session restoration, and child-agent paths use this after startup preloads
+/// every connected provider.
+pub fn api_key_cached_only(preset: ProviderPreset) -> Result<String, SecretError> {
+    cached_key(preset).unwrap_or_else(|| Err(SecretError::Missing(preset.label().into())))
+}
+
 pub fn api_key(preset: ProviderPreset) -> Result<String, SecretError> {
     let variables: &[&str] = match preset {
         ProviderPreset::OpenAi => &["OPENAI_API_KEY", "AGENT_API_KEY"],
@@ -141,5 +148,14 @@ mod tests {
             cached_key(ProviderPreset::DeepSeek),
             Some(Err(SecretError::Missing(_)))
         ));
+    }
+
+    #[test]
+    fn cache_only_lookup_returns_a_preloaded_key() {
+        remember_key(ProviderPreset::Custom, Ok("cached-custom".into()));
+        assert_eq!(
+            api_key_cached_only(ProviderPreset::Custom).unwrap(),
+            "cached-custom"
+        );
     }
 }

@@ -292,13 +292,15 @@ pub struct RuntimeConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ClusterConfig {
-    /// Upper bounds for child-agent fan-out. `None` means unlimited. These
-    /// fields are intentionally not enforced yet; they reserve the
-    /// configuration surface so existing TOML files stay valid when limits
-    /// are implemented.
+    /// Maximum active children. Missing values use the safe default of four.
     pub max_parallel_children: Option<usize>,
+    /// Reserved count limits; parallel execution is currently bounded by
+    /// `max_parallel_children`.
     pub max_children_per_turn: Option<usize>,
     pub max_children_per_session: Option<usize>,
+    /// Active model/tool time available to one child. Queueing and approval
+    /// waits are excluded from this budget.
+    pub child_active_timeout_seconds: u64,
     /// Bounds applied to each child agent's working context and tool output.
     /// These are enforced in `agent::run_child`.
     pub child_max_output_bytes: usize,
@@ -310,9 +312,10 @@ pub struct ClusterConfig {
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
-            max_parallel_children: None,
+            max_parallel_children: Some(4),
             max_children_per_turn: None,
             max_children_per_session: None,
+            child_active_timeout_seconds: 300,
             child_max_output_bytes: 256 * 1024,
             child_max_tool_output_bytes: 128 * 1024,
             child_max_context_items: 48,
@@ -370,6 +373,8 @@ pub struct CustomCommandConfig {
 pub struct AgentConfig {
     pub name: String,
     pub mode: AgentMode,
+    /// Optional hard turn limit. Zero means unlimited; the child active
+    /// execution budget remains the production safety bound.
     pub max_turns: usize,
     pub allowed_tools: Vec<String>,
     pub system_prompt: String,
@@ -380,7 +385,7 @@ impl Default for AgentConfig {
         Self {
             name: String::new(),
             mode: AgentMode::Explore,
-            max_turns: 3,
+            max_turns: 0,
             allowed_tools: Vec::new(),
             system_prompt: String::new(),
         }
@@ -499,6 +504,15 @@ impl Config {
             .cluster
             .child_max_output_bytes
             .clamp(16 * 1024, 1024 * 1024);
+        config.cluster.max_parallel_children = Some(
+            config
+                .cluster
+                .max_parallel_children
+                .unwrap_or(4)
+                .clamp(1, 32),
+        );
+        config.cluster.child_active_timeout_seconds =
+            config.cluster.child_active_timeout_seconds.clamp(30, 3600);
         config.cluster.child_max_tool_output_bytes = config
             .cluster
             .child_max_tool_output_bytes
@@ -509,9 +523,6 @@ impl Config {
             .cluster
             .child_max_context_bytes
             .clamp(16 * 1024, 1024 * 1024);
-        for agent in &mut config.agents {
-            agent.max_turns = agent.max_turns.clamp(1, 8);
-        }
         for (tool, permission) in &config.permissions.tools {
             if !matches!(permission.as_str(), "allow" | "ask" | "deny") {
                 anyhow::bail!("permission for {tool} must be allow, ask, or deny");
@@ -1189,6 +1200,8 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.provider.kind, ProviderKind::Responses);
         assert!(config.runtime.max_fetch_bytes >= config.runtime.max_tool_output_bytes);
+        assert_eq!(config.cluster.max_parallel_children, Some(4));
+        assert_eq!(config.cluster.child_active_timeout_seconds, 300);
     }
 
     #[test]

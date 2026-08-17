@@ -1,13 +1,27 @@
-use ratatui::{layout::Rect, text::Line};
+use ratatui::{layout::Rect, style::Style, text::Line};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Debug)]
 pub struct LayoutLine {
     pub text: String,
-    pub styled: Line<'static>,
+    pub style_runs: Vec<StyleRun>,
     pub start: usize,
     pub interaction: Option<InteractionTarget>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StyleRun {
+    /// Byte offsets local to `LayoutLine::text`.
+    pub start: usize,
+    pub end: usize,
+    pub style: Style,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedMarkdown {
+    pub fingerprint: u64,
+    pub lines: Vec<Line<'static>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -37,6 +51,7 @@ pub struct MessageLayout {
     pub visual_lines: Vec<VisualLine>,
     pub live_thinking_before: Option<usize>,
     pub live_thinking_rows: usize,
+    pub live_thinking_lines: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,15 +112,33 @@ impl MessageLayout {
                 text.push('\n');
             }
             let start = text.len();
-            let line_text = styled
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
+            let mut line_text = String::new();
+            let mut style_runs = Vec::<StyleRun>::new();
+            for span in styled.spans {
+                let span_text = span.content.as_ref();
+                if span_text.is_empty() {
+                    continue;
+                }
+                let run_start = line_text.len();
+                line_text.push_str(span_text);
+                let run_end = line_text.len();
+                if let Some(previous) = style_runs.last_mut()
+                    && previous.end == run_start
+                    && previous.style == span.style
+                {
+                    previous.end = run_end;
+                } else {
+                    style_runs.push(StyleRun {
+                        start: run_start,
+                        end: run_end,
+                        style: span.style,
+                    });
+                }
+            }
             text.push_str(&line_text);
             layout_lines.push(LayoutLine {
                 text: line_text,
-                styled,
+                style_runs,
                 start,
                 interaction: interactions.get(index).cloned().flatten(),
             });
@@ -128,6 +161,7 @@ impl MessageLayout {
             visual_lines,
             live_thinking_before,
             live_thinking_rows,
+            live_thinking_lines: Vec::new(),
         }
     }
 
@@ -161,7 +195,7 @@ impl MessageLayout {
         self
     }
 
-    pub fn set_live_thinking_lines(&mut self, lines: &[String]) {
+    pub fn set_live_thinking_lines(&mut self, lines: Vec<String>) {
         if self.live_thinking_rows == lines.len() {
             for (index, visual) in self
                 .visual_lines
@@ -178,6 +212,7 @@ impl MessageLayout {
                     0
                 };
             }
+            self.live_thinking_lines = lines;
             return;
         }
         self.visual_lines.retain(|line| !line.synthetic);
@@ -206,7 +241,18 @@ impl MessageLayout {
             }
         }
         self.live_thinking_rows = lines.len();
+        self.live_thinking_lines = lines;
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub fn set_live_thinking_title(&mut self, title: String) {
+        let Some(first) = self.live_thinking_lines.first_mut() else {
+            return;
+        };
+        *first = title;
+        if let Some(visual) = self.visual_lines.iter_mut().find(|line| line.synthetic) {
+            visual.clickable_width = UnicodeWidthStr::width(first.as_str()).min(self.width);
+        }
     }
 
     pub fn hit_test(&self, column: u16, row: u16) -> Option<usize> {
@@ -548,7 +594,7 @@ mod tests {
             0,
             Some(0),
         );
-        layout.set_live_thinking_lines(&["⠋ 思考中  正在分析项目".into()]);
+        layout.set_live_thinking_lines(vec!["⠋ 思考中  正在分析项目".into()]);
         let width = UnicodeWidthStr::width("⠋ 思考中  正在分析项目") as u16;
         assert_eq!(
             layout.interaction_at(30 + width - 1, 1),
@@ -556,7 +602,7 @@ mod tests {
         );
         assert_eq!(layout.interaction_at(30 + width, 1), None);
 
-        layout.set_live_thinking_lines(&["▾ ⠙ 思考中".into(), "  正在分析项目".into()]);
+        layout.set_live_thinking_lines(vec!["▾ ⠙ 思考中".into(), "  正在分析项目".into()]);
         assert_eq!(
             layout.interaction_at(30, 1),
             Some(InteractionTarget::Thinking)

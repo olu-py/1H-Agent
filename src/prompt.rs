@@ -31,6 +31,17 @@ pub fn system_prompt(preset: ProviderPreset, mode: AgentMode) -> String {
     } else {
         ""
     };
+    let cluster_rules = if mode == AgentMode::Cluster {
+        format!(
+            "{cluster_rules}\n- Production child agents have no implicit eight-turn cap. Omit `max_turns` for iterative work; use it only as an explicit hard limit."
+        )
+    } else {
+        cluster_rules.to_owned()
+    };
+    let cluster_rules = cluster_rules.replace(
+        "Set `max_turns` explicitly to match the task: 1 for pure-text deliverables, 3-8 for read+write+self-check tasks.",
+        "Set `max_turns` only when a hard turn limit is required; omit it for iterative production work.",
+    );
 
     format!(
         "You are 1H-Agent, a local Rust/Tokio terminal coding agent.\n\n\

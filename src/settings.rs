@@ -33,7 +33,7 @@ impl SettingsState {
         let connected = providers
             .iter()
             .filter_map(|provider| {
-                secrets::api_key_cached(provider.preset)
+                secrets::api_key_cached_only(provider.preset)
                     .ok()
                     .map(|_| provider.preset)
             })
@@ -320,7 +320,7 @@ impl SettingsForm {
         }
         match active {
             Some((preset, key)) if *preset == self.provider.preset => Ok(key.clone()),
-            _ => Ok(secrets::api_key_cached(self.provider.preset)?),
+            _ => Ok(secrets::api_key_cached_only(self.provider.preset)?),
         }
     }
 }

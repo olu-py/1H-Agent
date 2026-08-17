@@ -66,6 +66,7 @@ native_web_search = "disabled"
 | 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` / 点击会话行（父会话点击展开/收起子会话） |
 | 切换模式 | `Ctrl+X` 后按 `m` / `/plan` `/build` `/explore` `/cluster` / 点击输入框标题的模式标签 |
 | 命令面板 / 命令 | `Ctrl+P` / `/` |
+| 选择模型 | 点击输入框下方的“Provider · 模型” / `/model <模型名>` |
 | 引用文件 / 执行命令 | `@path` / `!command`（命令须审批） |
 | 滚动 / 回到底部 | `PageUp`、`PageDown` / `Ctrl+L` |
 | 输出选择 / 复制 | 在任务输出区按住鼠标左键拖选，松开后自动复制 |

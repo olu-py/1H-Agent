@@ -96,7 +96,7 @@ pub struct UiViewModel {
 }
 
 pub fn activity_view(app: &App) -> ActivityView {
-    let (state, symbol, text) = if let Some(approval) = &app.current.pending_approval {
+    let (state, symbol, text) = if let Some(approval) = app.pending_approval() {
         (
             ActivityState::Warning,
             "!",
@@ -172,7 +172,14 @@ pub fn contextual_shortcuts(app: &App) -> Vec<ShortcutHint> {
             hint("Esc", "关闭", 1),
         ];
     }
-    if app.current.pending_approval.is_some() {
+    if app.model_menu_open {
+        return vec![
+            hint("↑↓", "选择模型", 3),
+            hint("Enter", "应用", 2),
+            hint("Esc", "关闭", 1),
+        ];
+    }
+    if app.has_pending_approval() {
         return vec![hint("Y", "批准", 1), hint("N", "拒绝", 2)];
     }
     if app.current.busy {
@@ -238,7 +245,7 @@ impl UiViewModel {
         let thinking = ThinkingControlView {
             label: format!("思考 {} ▾", app.thinking_level().label()),
             enabled: !app.current.busy
-                && app.current.pending_approval.is_none()
+                && !app.has_pending_approval()
                 && app.settings.is_none()
                 && app.palette.is_none(),
             options: profile
@@ -271,7 +278,7 @@ impl UiViewModel {
             right: shortcut_segments(&shortcuts),
         };
         let secondary = (height == HeightClass::Normal).then(|| {
-            if let Some(approval) = &app.current.pending_approval {
+            if let Some(approval) = app.pending_approval() {
                 let path = approval
                     .call
                     .arguments
@@ -306,8 +313,8 @@ impl UiViewModel {
             footer: FooterView { primary, secondary },
             input: InputView {
                 title: format!(" 输入 · {} ", mode_label(app.current.mode)),
-                enabled: !app.current.busy && app.current.pending_approval.is_none(),
-                warning: app.current.pending_approval.is_some(),
+                enabled: !app.current.busy && !app.has_pending_approval(),
+                warning: app.has_pending_approval(),
             },
             context,
             thinking,

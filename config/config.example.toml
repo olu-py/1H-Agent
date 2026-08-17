@@ -36,11 +36,13 @@ command_timeout_seconds = 60
 max_tool_output_bytes = 1048576
 max_fetch_bytes = 10485760
 
-# Cluster mode (AI 集群) child-agent budgets. Fan-out fields are reserved and
-# currently unlimited when unset or null; child context/output budgets below
-# are enforced per child agent.
+# Cluster mode (AI 集群) child-agent concurrency and execution budgets.
+# Per-turn/session fan-out counts remain reserved; active children are bounded
+# by max_parallel_children.
 [cluster]
-# max_parallel_children = 3
+max_parallel_children = 4
+# Active model/tool time per child. Queueing and approval waits are excluded.
+child_active_timeout_seconds = 300
 # max_children_per_turn = 8
 # max_children_per_session = 24
 child_max_output_bytes = 262144
@@ -86,6 +88,6 @@ keep_alive_seconds = 30
 # [[agents]]
 # name = "reviewer"
 # mode = "explore"
-# max_turns = 3
+# max_turns = 3 # optional hard limit; omit or set 0 for unlimited turns
 # allowed_tools = ["file_read", "file_search", "git"]
 # system_prompt = "Review code for correctness and security."

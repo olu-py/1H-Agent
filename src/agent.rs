@@ -2,12 +2,16 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::{
+    sync::{Mutex, Semaphore, mpsc, oneshot},
+    time::timeout,
+};
 
 use crate::{
     config::{
@@ -264,23 +268,202 @@ fn summarize_child_trail(items: &[ConversationItem], max_items: usize, max_bytes
     summary
 }
 
+fn incremental_request_cursor(items: &[ConversationItem]) -> usize {
+    items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                item,
+                ConversationItem::Message {
+                    role: Role::User,
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| items.len().saturating_sub(1))
+}
+
+/// Produces protocol-valid local history for stateless replay. Context
+/// trimming or cancellation can leave one half of a tool call/output pair;
+/// Responses endpoints reject either an orphan output or an unanswered call.
+fn replay_safe_items(items: &[ConversationItem]) -> Vec<ConversationItem> {
+    let output_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut known_calls = HashSet::<String>::new();
+    let mut replay = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            ConversationItem::AssistantToolCalls { calls } => {
+                let calls = calls
+                    .iter()
+                    .filter(|call| output_ids.contains(call.id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !calls.is_empty() {
+                    known_calls.extend(calls.iter().map(|call| call.id.clone()));
+                    replay.push(ConversationItem::AssistantToolCalls { calls });
+                }
+            }
+            ConversationItem::ToolOutput { call_id, .. } if !known_calls.contains(call_id) => {}
+            _ => replay.push(item.clone()),
+        }
+    }
+    replay
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildSessionStatus {
-    Running,
+    Queued,
+    WaitingModel,
+    Streaming,
+    RunningTool,
+    WaitingApprovalSlot,
     WaitingApproval,
     Completed,
     Failed,
     TurnLimit,
+    TimedOut,
+    Cancelled,
 }
 
 impl ChildSessionStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::TurnLimit | Self::TimedOut | Self::Cancelled
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::Running => "运行中",
+            Self::Queued => "排队中",
+            Self::WaitingModel => "等待模型",
+            Self::Streaming => "模型响应中",
+            Self::RunningTool => "执行工具",
+            Self::WaitingApprovalSlot => "等待审批槽",
             Self::WaitingApproval => "等待审批",
             Self::Completed => "完成",
             Self::Failed => "失败",
             Self::TurnLimit => "达到轮次上限",
+            Self::TimedOut => "执行超时",
+            Self::Cancelled => "已取消",
+        }
+    }
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::TurnLimit => "turn_limit",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::Queued
+            | Self::WaitingModel
+            | Self::Streaming
+            | Self::RunningTool
+            | Self::WaitingApprovalSlot
+            | Self::WaitingApproval => "running",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildSessionProgress {
+    pub status: ChildSessionStatus,
+    pub turn: usize,
+    pub max_turns: usize,
+    pub tool: Option<String>,
+    pub updated_at: Instant,
+}
+
+impl ChildSessionProgress {
+    pub fn label(&self) -> String {
+        let turn = (self.turn > 0).then(|| {
+            if self.max_turns == 0 {
+                format!(" 第{}轮", self.turn)
+            } else {
+                format!(" {}/{}", self.turn, self.max_turns)
+            }
+        });
+        let tool = self.tool.as_deref().map(|name| format!(" ·{name}"));
+        format!(
+            "{}{}{}",
+            self.status.label(),
+            turn.unwrap_or_default(),
+            tool.unwrap_or_default()
+        )
+    }
+}
+
+fn child_progress(
+    status: ChildSessionStatus,
+    turn: usize,
+    max_turns: usize,
+    tool: Option<String>,
+) -> ChildSessionProgress {
+    ChildSessionProgress {
+        status,
+        turn,
+        max_turns,
+        tool,
+        updated_at: Instant::now(),
+    }
+}
+
+async fn emit_child_progress(
+    ui_events: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    progress: ChildSessionProgress,
+) {
+    let _ = ui_events
+        .send(AgentEvent::ChildSessionProgress {
+            session_id: session_id.to_owned(),
+            progress,
+        })
+        .await;
+}
+
+struct ChildCancellationGuard {
+    ui_events: mpsc::Sender<AgentEvent>,
+    session_id: String,
+    max_turns: usize,
+    finished: bool,
+}
+
+struct ChildToolContext<'a> {
+    child_id: &'a str,
+    child_title: &'a str,
+    ui_events: &'a mpsc::Sender<AgentEvent>,
+    turn: usize,
+    max_turns: usize,
+}
+
+impl ChildCancellationGuard {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for ChildCancellationGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let event = AgentEvent::ChildSessionProgress {
+                session_id: self.session_id.clone(),
+                progress: child_progress(ChildSessionStatus::Cancelled, 0, self.max_turns, None),
+            };
+            if let Err(mpsc::error::TrySendError::Full(event)) = self.ui_events.try_send(event)
+                && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            {
+                let ui_events = self.ui_events.clone();
+                runtime.spawn(async move {
+                    let _ = ui_events.send(event).await;
+                });
+            }
         }
     }
 }
@@ -305,6 +488,8 @@ pub enum AgentEvent {
     Approval {
         call: ToolCall,
         reason: String,
+        source_session_id: Option<String>,
+        source_title: Option<String>,
         reply: oneshot::Sender<bool>,
     },
     ToolStarted(ToolCall),
@@ -318,9 +503,9 @@ pub enum AgentEvent {
     },
     Failed(String),
     SessionsChanged,
-    ChildSessionStatus {
+    ChildSessionProgress {
         session_id: String,
-        status: ChildSessionStatus,
+        progress: ChildSessionProgress,
     },
     LocalCommandFinished {
         command: String,
@@ -336,6 +521,7 @@ pub struct AgentRunner {
     storage: Storage,
     session_id: String,
     approval_lock: Arc<Mutex<()>>,
+    child_slots: Arc<Semaphore>,
     child_role: Option<String>,
     cluster: ClusterConfig,
     configured_agents: Arc<Vec<AgentConfig>>,
@@ -526,6 +712,7 @@ impl AgentRunner {
             storage,
             session_id,
             approval_lock: Arc::new(Mutex::new(())),
+            child_slots: Arc::new(Semaphore::new(4)),
             child_role: None,
             cluster: ClusterConfig::default(),
             configured_agents: Arc::new(Vec::new()),
@@ -534,7 +721,15 @@ impl AgentRunner {
     }
 
     pub fn with_cluster_config(mut self, cluster: ClusterConfig) -> Self {
+        self.child_slots = Arc::new(Semaphore::new(
+            cluster.max_parallel_children.unwrap_or(4).clamp(1, 32),
+        ));
         self.cluster = cluster;
+        self
+    }
+
+    pub fn with_approval_lock(mut self, approval_lock: Arc<Mutex<()>>) -> Self {
+        self.approval_lock = approval_lock;
         self
     }
 
@@ -614,7 +809,8 @@ impl AgentRunner {
                 .validate()
                 .map_err(|error| format!("invalid child provider configuration: {error}"))?;
             provider_config.normalize_thinking();
-            let api_key = secrets::api_key_cached(preset).map_err(|error| error.to_string())?;
+            let api_key =
+                secrets::api_key_cached_only(preset).map_err(|error| error.to_string())?;
             let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key)
                 .map_err(|error| error.to_string())?;
             (provider, provider_config)
@@ -662,7 +858,7 @@ impl AgentRunner {
         };
         // A persisted response already contains all but the newly appended user item.
         let mut request_cursor = if previous_response_id.is_some() {
-            items.len().saturating_sub(1)
+            incremental_request_cursor(items)
         } else {
             0
         };
@@ -674,7 +870,7 @@ impl AgentRunner {
             let request_items = if previous_response_id.is_some() {
                 items[request_cursor..].to_vec()
             } else {
-                items.clone()
+                replay_safe_items(items)
             };
             let mut request_items = request_items;
             if previous_response_id.is_none() {
@@ -806,6 +1002,9 @@ impl AgentRunner {
                     {
                         // Compatible endpoints can expire or reject server-side state.
                         // Replay the canonical local history once instead.
+                        self.storage
+                            .clear_response_id(&self.session_id)
+                            .map_err(|error| error.to_string())?;
                         previous_response_id = None;
                         request_cursor = 0;
                         continue;
@@ -914,6 +1113,8 @@ impl AgentRunner {
                             .send(AgentEvent::Approval {
                                 call: call.clone(),
                                 reason,
+                                source_session_id: None,
+                                source_title: None,
                                 reply,
                             })
                             .await
@@ -968,26 +1169,18 @@ impl AgentRunner {
 
             if !spawn_tasks.is_empty() {
                 let mut futures = FuturesUnordered::new();
-                for call in &spawn_tasks {
+                for call in spawn_tasks {
                     let runner = self.clone();
-                    let call = call.clone();
                     let ui_events = ui_events.clone();
                     futures.push(async move {
                         let result = runner
                             .run_child(&call, &ui_events)
                             .await
                             .unwrap_or_else(|error| error);
-                        (call.id, result)
+                        (call, result)
                     });
                 }
-                let mut results: HashMap<String, String> = HashMap::new();
-                while let Some((call_id, result)) = futures.next().await {
-                    results.insert(call_id, result);
-                }
-                for call in spawn_tasks {
-                    let result = results
-                        .remove(&call.id)
-                        .unwrap_or_else(|| "child agent did not produce a result".into());
+                while let Some((call, result)) = futures.next().await {
                     self.complete_tool(&call, &result, ui_events, items, &mut executed_tool_calls)
                         .await?;
                 }
@@ -1031,73 +1224,121 @@ impl AgentRunner {
     /// children cannot interleave approval prompts).
     async fn execute_child_tool(
         &self,
-        child_id: &str,
+        context: &ChildToolContext<'_>,
         call: &ToolCall,
-        ui_events: &mpsc::Sender<AgentEvent>,
-    ) -> String {
+        active_budget: &mut Duration,
+    ) -> Option<String> {
         match self.tools.policy(call) {
             PolicyDecision::Allow => {
-                let _ = self.storage.begin_tool(child_id, call, "allowed");
+                let _ = self.storage.begin_tool(context.child_id, call, "allowed");
+                emit_child_progress(
+                    context.ui_events,
+                    context.child_id,
+                    child_progress(
+                        ChildSessionStatus::RunningTool,
+                        context.turn,
+                        context.max_turns,
+                        Some(call.name.clone()),
+                    ),
+                )
+                .await;
                 let result = self
-                    .tools
-                    .execute(call)
-                    .await
-                    .unwrap_or_else(|error| error.to_string());
+                    .execute_child_tool_with_budget(call, active_budget)
+                    .await?;
                 let _ = self.storage.finish_tool(&call.id, &result);
-                result
+                Some(result)
             }
             PolicyDecision::Deny(reason) => {
                 let result = format!("denied by policy: {reason}");
-                let _ = self.storage.begin_tool(child_id, call, "denied");
+                let _ = self.storage.begin_tool(context.child_id, call, "denied");
                 let _ = self.storage.finish_tool(&call.id, &result);
-                result
+                Some(result)
             }
             PolicyDecision::RequireApproval(reason) => {
+                emit_child_progress(
+                    context.ui_events,
+                    context.child_id,
+                    child_progress(
+                        ChildSessionStatus::WaitingApprovalSlot,
+                        context.turn,
+                        context.max_turns,
+                        Some(call.name.clone()),
+                    ),
+                )
+                .await;
                 let _guard = self.approval_lock.lock().await;
-                let _ = ui_events
-                    .send(AgentEvent::ChildSessionStatus {
-                        session_id: child_id.to_owned(),
-                        status: ChildSessionStatus::WaitingApproval,
-                    })
-                    .await;
+                emit_child_progress(
+                    context.ui_events,
+                    context.child_id,
+                    child_progress(
+                        ChildSessionStatus::WaitingApproval,
+                        context.turn,
+                        context.max_turns,
+                        Some(call.name.clone()),
+                    ),
+                )
+                .await;
                 let (reply, answer) = oneshot::channel();
-                if ui_events
+                if context
+                    .ui_events
                     .send(AgentEvent::Approval {
                         call: call.clone(),
                         reason,
+                        source_session_id: Some(context.child_id.to_owned()),
+                        source_title: Some(context.child_title.to_owned()),
                         reply,
                     })
                     .await
                     .is_err()
                 {
-                    return "approval channel closed".into();
+                    return Some("approval channel closed".into());
                 }
                 let approved = match answer.await {
                     Ok(approved) => approved,
-                    Err(_) => return "approval cancelled".into(),
+                    Err(_) => return Some("approval cancelled".into()),
                 };
                 let _ = self.storage.begin_tool(
-                    child_id,
+                    context.child_id,
                     call,
                     if approved { "approved" } else { "rejected" },
                 );
                 let result = if approved {
-                    self.tools
-                        .execute(call)
-                        .await
-                        .unwrap_or_else(|error| error.to_string())
+                    emit_child_progress(
+                        context.ui_events,
+                        context.child_id,
+                        child_progress(
+                            ChildSessionStatus::RunningTool,
+                            context.turn,
+                            context.max_turns,
+                            Some(call.name.clone()),
+                        ),
+                    )
+                    .await;
+                    self.execute_child_tool_with_budget(call, active_budget)
+                        .await?
                 } else {
                     "rejected by user".to_owned()
                 };
                 let _ = self.storage.finish_tool(&call.id, &result);
-                let _ = ui_events
-                    .send(AgentEvent::ChildSessionStatus {
-                        session_id: child_id.to_owned(),
-                        status: ChildSessionStatus::Running,
-                    })
-                    .await;
-                result
+                Some(result)
             }
+        }
+    }
+
+    async fn execute_child_tool_with_budget(
+        &self,
+        call: &ToolCall,
+        active_budget: &mut Duration,
+    ) -> Option<String> {
+        if active_budget.is_zero() {
+            return None;
+        }
+        let started = Instant::now();
+        let result = timeout(*active_budget, self.tools.execute(call)).await;
+        *active_budget = active_budget.saturating_sub(started.elapsed());
+        match result {
+            Ok(result) => Some(result.unwrap_or_else(|error| error.to_string())),
+            Err(_) => None,
         }
     }
 
@@ -1142,8 +1383,7 @@ impl AgentRunner {
         let max_turns = arguments
             .max_turns
             .or_else(|| configured_agent.as_ref().map(|agent| agent.max_turns))
-            .unwrap_or(3)
-            .clamp(1, 8);
+            .unwrap_or(0);
 
         let requested_preset = match arguments.provider.as_deref().map(str::trim) {
             Some("") | None => None,
@@ -1183,15 +1423,26 @@ impl AgentRunner {
         self.storage
             .append_message(&child_id, Role::User, &arguments.prompt)
             .map_err(|error| error.to_string())?;
+        let mut cancellation_guard = ChildCancellationGuard {
+            ui_events: ui_events.clone(),
+            session_id: child_id.clone(),
+            max_turns,
+            finished: false,
+        };
         // Let the UI refresh the session tree as soon as the child exists,
         // rather than waiting for the whole turn to complete.
         let _ = ui_events.send(AgentEvent::SessionsChanged).await;
-        let _ = ui_events
-            .send(AgentEvent::ChildSessionStatus {
-                session_id: child_id.clone(),
-                status: ChildSessionStatus::Running,
-            })
-            .await;
+        emit_child_progress(
+            ui_events,
+            &child_id,
+            child_progress(ChildSessionStatus::Queued, 0, max_turns, None),
+        )
+        .await;
+        let _child_slot = self
+            .child_slots
+            .acquire()
+            .await
+            .map_err(|_| "child concurrency limiter closed".to_owned())?;
 
         let tools = self.child_tool_definitions(role.as_deref(), &allowed_tools);
         let mut child_system = prompt::child_system_prompt(role.as_deref(), &allowed_tools);
@@ -1218,10 +1469,13 @@ impl AgentRunner {
         let mut final_answer = String::new();
         let mut tool_call_count = 0usize;
         let mut remaining_turns = max_turns;
+        let mut completed_turns = 0usize;
+        let mut active_budget =
+            Duration::from_secs(self.cluster.child_active_timeout_seconds.max(1));
         let mut failure: Option<String> = None;
         let mut status = ChildSessionStatus::Completed;
-        loop {
-            if remaining_turns == 0 {
+        'turns: loop {
+            if max_turns > 0 && remaining_turns == 0 {
                 status = ChildSessionStatus::TurnLimit;
                 let trail = summarize_child_trail(&items, 3, 512);
                 append_text_bounded(
@@ -1231,7 +1485,11 @@ impl AgentRunner {
                 );
                 break;
             }
-            remaining_turns -= 1;
+            if max_turns > 0 {
+                remaining_turns -= 1;
+            }
+            completed_turns = completed_turns.saturating_add(1);
+            let turn = completed_turns;
 
             let mut request_items = vec![ConversationItem::Message {
                 role: Role::System,
@@ -1251,11 +1509,54 @@ impl AgentRunner {
                 thinking_profile_kind,
             };
             let mut collector = StreamCollector::new(Some(child_max_output_bytes));
-            match stream_once(&provider, request, &mut collector, 512, ui_events, |_| {
-                Ok(Forwarded::Ignore)
-            })
-            .await
-            {
+            emit_child_progress(
+                ui_events,
+                &child_id,
+                child_progress(ChildSessionStatus::WaitingModel, turn, max_turns, None),
+            )
+            .await;
+            if active_budget.is_zero() {
+                status = ChildSessionStatus::TimedOut;
+                break;
+            }
+            let stream_started = Instant::now();
+            let mut streaming_reported = false;
+            let stream_result = timeout(
+                active_budget,
+                stream_once(&provider, request, &mut collector, 512, ui_events, |_| {
+                    if streaming_reported {
+                        Ok(Forwarded::Ignore)
+                    } else {
+                        streaming_reported = true;
+                        Ok(Forwarded::SendIgnore(AgentEvent::ChildSessionProgress {
+                            session_id: child_id.clone(),
+                            progress: child_progress(
+                                ChildSessionStatus::Streaming,
+                                turn,
+                                max_turns,
+                                None,
+                            ),
+                        }))
+                    }
+                }),
+            )
+            .await;
+            active_budget = active_budget.saturating_sub(stream_started.elapsed());
+            let stream_result = match stream_result {
+                Ok(result) => result,
+                Err(_) => {
+                    status = ChildSessionStatus::TimedOut;
+                    if !collector.assistant_text.is_empty() {
+                        append_text_bounded(
+                            &mut final_answer,
+                            &collector.assistant_text,
+                            child_max_output_bytes,
+                        );
+                    }
+                    break;
+                }
+            };
+            match stream_result {
                 Ok(()) => {}
                 Err(StreamFailure::Provider(error)) => {
                     status = ChildSessionStatus::Failed;
@@ -1291,9 +1592,29 @@ impl AgentRunner {
                 .map_err(|error| error.to_string())?;
             for tool_call in std::mem::take(&mut collector.completed_calls) {
                 tool_call_count += 1;
-                let result = self
-                    .execute_child_tool(&child_id, &tool_call, ui_events)
-                    .await;
+                let context = ChildToolContext {
+                    child_id: &child_id,
+                    child_title: &title,
+                    ui_events,
+                    turn,
+                    max_turns,
+                };
+                let Some(result) = self
+                    .execute_child_tool(&context, &tool_call, &mut active_budget)
+                    .await
+                else {
+                    let result = "child active execution budget exceeded".to_owned();
+                    let _ = self.storage.finish_tool(&tool_call.id, &result);
+                    let _ = self
+                        .storage
+                        .append_tool_output(&child_id, &tool_call.id, &result);
+                    items.push(ConversationItem::ToolOutput {
+                        call_id: tool_call.id,
+                        output: result,
+                    });
+                    status = ChildSessionStatus::TimedOut;
+                    break 'turns;
+                };
                 let result =
                     truncate_utf8_bounded(&result, self.cluster.child_max_tool_output_bytes);
                 self.storage
@@ -1318,6 +1639,14 @@ impl AgentRunner {
                 child_max_output_bytes,
             );
         }
+        if status == ChildSessionStatus::TimedOut {
+            let trail = summarize_child_trail(&items, 3, 512);
+            append_text_bounded(
+                &mut final_answer,
+                &format!("\n[child agent exceeded its active execution budget]{trail}"),
+                child_max_output_bytes,
+            );
+        }
         if final_answer.trim().is_empty() {
             if tool_call_count > 0 {
                 final_answer.push_str(&format!(
@@ -1331,16 +1660,17 @@ impl AgentRunner {
         self.storage
             .append_message(&child_id, Role::Assistant, &final_answer)
             .map_err(|error| error.to_string())?;
-        let _ = ui_events
-            .send(AgentEvent::ChildSessionStatus {
-                session_id: child_id.clone(),
-                status,
-            })
-            .await;
+        emit_child_progress(
+            ui_events,
+            &child_id,
+            child_progress(status, completed_turns, max_turns, None),
+        )
+        .await;
+        cancellation_guard.finish();
         Ok(serde_json::to_string(&json!({
             "session_id": child_id,
             "title": title,
-            "status": status.label(),
+            "status": status.wire_name(),
             "output": final_answer,
         }))
         .unwrap_or_else(|_| final_answer.clone()))
@@ -1465,6 +1795,24 @@ mod tests {
     use crate::{config::RuntimeConfig, security::Workspace, tools::ToolRegistry};
 
     #[test]
+    fn child_status_has_stable_wire_names_and_localized_labels() {
+        let terminal = [
+            (ChildSessionStatus::Completed, "completed", "完成"),
+            (ChildSessionStatus::Failed, "failed", "失败"),
+            (ChildSessionStatus::TurnLimit, "turn_limit", "达到轮次上限"),
+            (ChildSessionStatus::TimedOut, "timed_out", "执行超时"),
+            (ChildSessionStatus::Cancelled, "cancelled", "已取消"),
+        ];
+        for (status, wire_name, label) in terminal {
+            assert!(status.is_terminal());
+            assert_eq!(status.wire_name(), wire_name);
+            assert_eq!(status.label(), label);
+        }
+        assert_eq!(ChildSessionStatus::Queued.wire_name(), "running");
+        assert_eq!(ChildSessionStatus::WaitingApproval.label(), "等待审批");
+    }
+
+    #[test]
     fn enables_thinking_only_for_known_qwen_thinking_families() {
         assert!(qwen_thinking_model("qwen3.8-max"));
         assert!(qwen_thinking_model("QWQ-32B"));
@@ -1539,6 +1887,73 @@ mod tests {
 
         assert_eq!(tool_call_signature(&first), tool_call_signature(&reordered));
         assert_ne!(tool_call_signature(&first), tool_call_signature(&different));
+    }
+
+    #[test]
+    fn incremental_cursor_keeps_latest_user_message_and_following_context() {
+        let items = vec![
+            ConversationItem::Message {
+                role: Role::User,
+                content: "old".into(),
+            },
+            ConversationItem::Message {
+                role: Role::Assistant,
+                content: "answer".into(),
+            },
+            ConversationItem::Message {
+                role: Role::User,
+                content: "new".into(),
+            },
+            ConversationItem::Context {
+                label: "file".into(),
+                content: "contents".into(),
+            },
+        ];
+        assert_eq!(incremental_request_cursor(&items), 2);
+        assert_eq!(items[incremental_request_cursor(&items)..].len(), 2);
+    }
+
+    #[test]
+    fn stateless_replay_keeps_only_complete_ordered_tool_pairs() {
+        let complete = ToolCall {
+            id: "complete".into(),
+            name: "agent_spawn".into(),
+            arguments: json!({}),
+        };
+        let unanswered = ToolCall {
+            id: "unanswered".into(),
+            name: "agent_spawn".into(),
+            arguments: json!({}),
+        };
+        let items = vec![
+            ConversationItem::ToolOutput {
+                call_id: "orphan".into(),
+                output: "bad".into(),
+            },
+            ConversationItem::AssistantToolCalls {
+                calls: vec![complete.clone(), unanswered],
+            },
+            ConversationItem::ToolOutput {
+                call_id: complete.id.clone(),
+                output: "ok".into(),
+            },
+            ConversationItem::Message {
+                role: Role::User,
+                content: "continue".into(),
+            },
+        ];
+
+        let replay = replay_safe_items(&items);
+        assert!(matches!(
+            &replay[0],
+            ConversationItem::AssistantToolCalls { calls }
+                if calls.len() == 1 && calls[0].id == "complete"
+        ));
+        assert!(matches!(
+            &replay[1],
+            ConversationItem::ToolOutput { call_id, .. } if call_id == "complete"
+        ));
+        assert_eq!(replay.len(), 3);
     }
 
     #[tokio::test]
@@ -1707,10 +2122,10 @@ mod tests {
             name: "agent_spawn".into(),
             arguments: serde_json::json!({"prompt":"do the plan","role":"plan","model":"gpt-5"}),
         };
-        let (ui_events, _receiver) = mpsc::channel(16);
+        let (ui_events, mut receiver) = mpsc::channel(16);
         let result = runner.run_child(&call, &ui_events).await.unwrap();
         let payload: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(payload["status"], "完成");
+        assert_eq!(payload["status"], "completed");
         assert_eq!(payload["output"], "child result");
         assert_eq!(payload["title"], "plan·do the plan");
 
@@ -1724,6 +2139,114 @@ mod tests {
             "gpt-5"
         );
         assert_eq!(storage.load_messages(&child.id).unwrap().len(), 2);
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let AgentEvent::ChildSessionProgress { progress, .. } = event {
+                statuses.push(progress.status);
+            }
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                ChildSessionStatus::Queued,
+                ChildSessionStatus::WaitingModel,
+                ChildSessionStatus::Streaming,
+                ChildSessionStatus::Completed,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn child_concurrency_slots_enforce_the_configured_limit() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let runner = AgentRunner::new(
+            OpenAiClient::scripted(Vec::new()).unwrap(),
+            ProviderPreset::OpenAi.defaults(),
+            tools,
+            storage,
+            session_id,
+        )
+        .with_cluster_config(ClusterConfig {
+            max_parallel_children: Some(2),
+            ..ClusterConfig::default()
+        });
+
+        let first = runner.child_slots.try_acquire().unwrap();
+        let _second = runner.child_slots.try_acquire().unwrap();
+        assert!(runner.child_slots.try_acquire().is_err());
+        drop(first);
+        assert!(runner.child_slots.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_child_tool_budget_does_not_execute_the_tool() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let runner = AgentRunner::new(
+            OpenAiClient::scripted(Vec::new()).unwrap(),
+            ProviderPreset::OpenAi.defaults(),
+            tools,
+            storage,
+            session_id,
+        );
+        let call = ToolCall {
+            id: "must-not-run".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path":"missing"}),
+        };
+        let mut budget = Duration::ZERO;
+        assert!(
+            runner
+                .execute_child_tool_with_budget(&call, &mut budget)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_progress_survives_a_temporarily_full_channel() {
+        let (events, mut receiver) = mpsc::channel(1);
+        events.send(AgentEvent::SessionsChanged).await.unwrap();
+        let guard = ChildCancellationGuard {
+            ui_events: events,
+            session_id: "cancelled-child".into(),
+            max_turns: 3,
+            finished: false,
+        };
+        drop(guard);
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AgentEvent::SessionsChanged)
+        ));
+        let cancelled = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cancelled,
+            AgentEvent::ChildSessionProgress {
+                session_id,
+                progress: ChildSessionProgress {
+                    status: ChildSessionStatus::Cancelled,
+                    ..
+                },
+            } if session_id == "cancelled-child"
+        ));
     }
 
     #[test]
@@ -1866,7 +2389,7 @@ mod tests {
         let (ui_events, mut receiver) = mpsc::channel(16);
         let result = runner.run_child(&call, &ui_events).await.unwrap();
         let payload: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(payload["status"], "完成");
+        assert_eq!(payload["status"], "completed");
         assert_eq!(payload["output"], "review done");
         assert_eq!(payload["title"], "reviewer");
 
@@ -2008,11 +2531,19 @@ mod tests {
 
         let (ui_events, mut receiver) = mpsc::channel(16);
         let approver = tokio::spawn(async move {
+            let mut statuses = Vec::new();
             while let Some(event) = receiver.recv().await {
-                if let AgentEvent::Approval { reply, .. } = event {
-                    let _ = reply.send(true);
+                match event {
+                    AgentEvent::Approval { reply, .. } => {
+                        let _ = reply.send(true);
+                    }
+                    AgentEvent::ChildSessionProgress { progress, .. } => {
+                        statuses.push(progress.status);
+                    }
+                    _ => {}
                 }
             }
+            statuses
         });
 
         let call = ToolCall {
@@ -2023,7 +2554,18 @@ mod tests {
         let result = runner.run_child(&call, &ui_events).await.unwrap();
         assert!(result.contains("done"));
         assert!(temp.path().join("out.txt").exists());
-        approver.abort();
+        drop(ui_events);
+        drop(runner);
+        let statuses = approver.await.unwrap();
+        let approval_slot = statuses
+            .iter()
+            .position(|status| *status == ChildSessionStatus::WaitingApprovalSlot)
+            .unwrap();
+        let user_approval = statuses
+            .iter()
+            .position(|status| *status == ChildSessionStatus::WaitingApproval)
+            .unwrap();
+        assert!(approval_slot < user_approval);
     }
 
     #[tokio::test]
