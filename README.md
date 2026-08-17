@@ -39,7 +39,7 @@ cargo build --release
 
 ## 配置 Provider
 
-按 `Ctrl+S` 打开 Provider 设置，使用方向键选择 Provider，`Tab` 切换字段，`Enter` 应用，`Esc` 取消。非密钥配置保存到 TOML；API Key 保存到系统钥匙串，钥匙串不可用时仅保留到当前进程结束。
+按 `Ctrl+S` 打开 Provider 设置。首页列出已保存的供应商连接和当前连接；选择“添加供应商”后，可从尚未添加的 OpenAI、DeepSeek、Qwen/Bailian、火山方舟和自定义兼容模板中创建连接。每种模板只能添加一次，选择已有连接可编辑并切换，`Ctrl+D` 可移除连接。非密钥配置保存到 TOML；API Key 仍保存到系统钥匙串，移除连接不会删除密钥，钥匙串不可用时密钥仅保留到当前进程结束。
 
 | Provider | API Key 环境变量 | 默认模型 |
 | --- | --- | --- |
@@ -79,7 +79,7 @@ native_web_search = "disabled"
 
 ## AI 集群模式
 
-切换到 `cluster` 模式（`/cluster` 或输入框模式标签）后，可在对话里用自然语言给不同角色指派不同模型，例如「用 deepseek-v4-pro 做计划与审批，用 deepseek-v4-flash 做实施」。主 Agent 会通过 `agent_spawn` 调度子 Agent 串行/并行执行，每个子 Agent 生成一个**树形子会话**（默认折叠，点击展开），父会话与当前会话在左侧面板高亮显示。子 Agent 的写文件操作仍需用户审批；子 Agent 无终端权限，验证由主 Agent 完成。
+切换到 `cluster` 模式（`/cluster` 或输入框模式标签）后，可在对话里用自然语言给不同角色指派不同模型，例如「用 deepseek-v4-pro 做计划与审批，用 deepseek-v4-flash 做实施」。主 Agent 会通过 `agent_spawn` 调度子 Agent 串行/并行执行，每个子 Agent 生成一个**树形子会话**（默认折叠，点击展开），父会话与当前会话在左侧面板高亮显示，子会话会显示运行中/等待审批等状态。子 Agent 返回 JSON 结果（`session_id`、`status`、`output`），写文件操作仍需用户审批；子 Agent 无终端权限，验证由主 Agent 完成。`agent_spawn` 还可通过 `provider` 指定其他 Provider、通过 `agent` 引用 `[[agents]]` 配置模板。
 
 ## AI 维护文档
 

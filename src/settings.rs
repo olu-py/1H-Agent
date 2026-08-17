@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashSet};
 
 use anyhow::Result;
 
@@ -6,6 +6,113 @@ use crate::{
     config::{ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability},
     secrets,
 };
+
+/// The provider popup is a small state machine: connected-profile list,
+/// template picker, then the existing field editor.
+pub enum SettingsState {
+    List(ProviderList),
+    Templates(TemplateList),
+    Form(SettingsForm),
+}
+
+pub struct ProviderList {
+    pub providers: Vec<ProviderConfig>,
+    pub active: ProviderPreset,
+    pub connected: HashSet<ProviderPreset>,
+    /// Rows are profiles followed by the stable "add provider" command.
+    pub selected: usize,
+}
+
+pub struct TemplateList {
+    pub presets: Vec<ProviderPreset>,
+    pub selected: usize,
+}
+
+impl SettingsState {
+    pub fn list(providers: Vec<ProviderConfig>, active: ProviderPreset) -> Self {
+        let connected = providers
+            .iter()
+            .filter_map(|provider| {
+                secrets::api_key_cached(provider.preset)
+                    .ok()
+                    .map(|_| provider.preset)
+            })
+            .collect();
+        Self::List(ProviderList {
+            providers,
+            active,
+            connected,
+            selected: 0,
+        })
+    }
+
+    pub fn form(&self) -> Option<&SettingsForm> {
+        match self {
+            Self::Form(form) => Some(form),
+            Self::List(_) | Self::Templates(_) => None,
+        }
+    }
+
+    pub fn form_mut(&mut self) -> Option<&mut SettingsForm> {
+        match self {
+            Self::Form(form) => Some(form),
+            Self::List(_) | Self::Templates(_) => None,
+        }
+    }
+
+    pub fn move_selection(&mut self, direction: i32) {
+        match self {
+            Self::List(list) => {
+                let len = list.providers.len().saturating_add(1) as i32;
+                list.selected = (list.selected as i32 + direction).rem_euclid(len) as usize;
+            }
+            Self::Templates(templates) if !templates.presets.is_empty() => {
+                let len = templates.presets.len() as i32;
+                templates.selected =
+                    (templates.selected as i32 + direction).rem_euclid(len) as usize;
+            }
+            Self::Form(form) => form.move_selection(direction),
+            Self::Templates(_) => {}
+        }
+    }
+
+    pub fn open_templates(&mut self) {
+        let Self::List(list) = self else {
+            return;
+        };
+        let presets = ProviderPreset::ALL
+            .into_iter()
+            .filter(|preset| {
+                !list
+                    .providers
+                    .iter()
+                    .any(|provider| provider.preset == *preset)
+            })
+            .collect();
+        *self = Self::Templates(TemplateList {
+            presets,
+            selected: 0,
+        });
+    }
+
+    pub fn selected_profile(&self) -> Option<ProviderConfig> {
+        let Self::List(list) = self else {
+            return None;
+        };
+        list.providers.get(list.selected).cloned()
+    }
+
+    pub fn on_add_row(&self) -> bool {
+        matches!(self, Self::List(list) if list.selected == list.providers.len())
+    }
+
+    pub fn selected_template(&self) -> Option<ProviderPreset> {
+        let Self::Templates(templates) = self else {
+            return None;
+        };
+        templates.presets.get(templates.selected).copied()
+    }
+}
 
 /// Stable identifier for each editable provider setting. Rendering, value
 /// lookup, cycling, and text editing are all keyed off this enum, so adding a
@@ -69,6 +176,7 @@ pub struct SettingsForm {
     pub provider: ProviderConfig,
     pub api_key: String,
     existing_key_preset: Option<ProviderPreset>,
+    available_key_presets: HashSet<ProviderPreset>,
     pub selected: usize,
 }
 
@@ -78,8 +186,13 @@ impl SettingsForm {
             provider,
             api_key: String::new(),
             existing_key_preset,
+            available_key_presets: HashSet::new(),
             selected: 0,
         }
+    }
+
+    pub fn set_available_key_presets(&mut self, presets: HashSet<ProviderPreset>) {
+        self.available_key_presets = presets;
     }
 
     pub fn field(&self) -> SettingsField {
@@ -90,6 +203,7 @@ impl SettingsForm {
     /// running process, not the keyring). Drives the "********" placeholder.
     pub fn has_existing_key(&self) -> bool {
         self.existing_key_preset == Some(self.provider.preset)
+            || self.available_key_presets.contains(&self.provider.preset)
     }
 
     pub fn move_selection(&mut self, direction: i32) {
@@ -123,16 +237,9 @@ impl SettingsForm {
     /// handled by `edit` and are therefore untouched here.
     pub fn cycle(&mut self, field: SettingsField, direction: i32) {
         match field {
-            SettingsField::Preset => {
-                let current = ProviderPreset::ALL
-                    .iter()
-                    .position(|preset| *preset == self.provider.preset)
-                    .unwrap_or(0) as i32;
-                let next =
-                    (current + direction).rem_euclid(ProviderPreset::ALL.len() as i32) as usize;
-                self.provider = ProviderPreset::ALL[next].defaults();
-                self.api_key.clear();
-            }
+            // A profile's preset is its stable identity. Changing it would
+            // bypass the one-profile-per-template rule, so it is read-only.
+            SettingsField::Preset => {}
             SettingsField::Protocol => {
                 if self.provider.preset.supports_responses() {
                     self.provider.kind = match self.provider.kind {
@@ -184,6 +291,18 @@ impl SettingsForm {
         }
     }
 
+    /// Replaces the full value of a text field, used for paste operations
+    /// where appending to the existing default (for example Base URL or model)
+    /// would produce an invalid value.
+    pub fn paste(&mut self, field: SettingsField, text: &str) {
+        match field {
+            SettingsField::Model => self.provider.model = text.to_owned(),
+            SettingsField::BaseUrl => self.provider.base_url = text.to_owned(),
+            SettingsField::ApiKey => self.api_key = text.to_owned(),
+            _ => {}
+        }
+    }
+
     /// Returns a validated, normalized copy ready to commit. Unedited fields
     /// (native_web_search, context_window_tokens, …) pass through untouched
     /// because they live on the same `ProviderConfig` copy.
@@ -201,7 +320,7 @@ impl SettingsForm {
         }
         match active {
             Some((preset, key)) if *preset == self.provider.preset => Ok(key.clone()),
-            _ => Ok(secrets::api_key(self.provider.preset)?),
+            _ => Ok(secrets::api_key_cached(self.provider.preset)?),
         }
     }
 }
@@ -222,13 +341,31 @@ mod tests {
     }
 
     #[test]
-    fn preset_cycle_resets_provider_and_key() {
+    fn preset_is_read_only_inside_a_connection_profile() {
         let mut form = SettingsForm::new(ProviderPreset::OpenAi.defaults(), None);
         form.api_key = "typed".into();
         form.cycle(SettingsField::Preset, 1);
-        assert_eq!(form.provider.preset, ProviderPreset::DeepSeek);
-        assert_eq!(form.provider.model, "deepseek-v4-flash");
-        assert!(form.api_key.is_empty());
+        assert_eq!(form.provider.preset, ProviderPreset::OpenAi);
+        assert_eq!(form.provider.model, "gpt-5-mini");
+        assert_eq!(form.api_key, "typed");
+    }
+
+    #[test]
+    fn template_picker_excludes_connected_presets() {
+        let mut state = SettingsState::list(
+            vec![
+                ProviderPreset::OpenAi.defaults(),
+                ProviderPreset::DeepSeek.defaults(),
+            ],
+            ProviderPreset::OpenAi,
+        );
+        state.open_templates();
+        let SettingsState::Templates(templates) = state else {
+            panic!("expected template picker");
+        };
+        assert!(!templates.presets.contains(&ProviderPreset::OpenAi));
+        assert!(!templates.presets.contains(&ProviderPreset::DeepSeek));
+        assert!(templates.presets.contains(&ProviderPreset::Qwen));
     }
 
     #[test]
@@ -260,6 +397,19 @@ mod tests {
         form.api_key = "sk-secret".into();
         assert_eq!(form.value(SettingsField::ApiKey), "*********");
         assert_eq!(form.value(SettingsField::Model), "gpt-5-mini");
+    }
+
+    #[test]
+    fn has_existing_key_respects_available_provider_set() {
+        let mut form = SettingsForm::new(ProviderPreset::DeepSeek.defaults(), None);
+        assert!(!form.has_existing_key());
+
+        form.set_available_key_presets(HashSet::from([ProviderPreset::DeepSeek]));
+        assert!(form.has_existing_key());
+        assert_eq!(form.value(SettingsField::ApiKey), "********");
+
+        form.provider = ProviderPreset::Qwen.defaults();
+        assert!(!form.has_existing_key());
     }
 
     #[test]

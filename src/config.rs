@@ -13,11 +13,18 @@ use crate::commands::AgentMode;
 #[serde(default)]
 pub struct Config {
     pub provider: ProviderConfig,
+    /// Saved connection profiles. Each preset has at most one profile; API
+    /// keys deliberately remain in the system keyring rather than TOML.
+    pub providers: Vec<ProviderConfig>,
+    /// Distinguishes an old config with no `providers` field from a user who
+    /// intentionally removed every saved connection in the new UI.
+    pub provider_profiles_initialized: bool,
     pub ui: UiConfig,
     pub runtime: RuntimeConfig,
     pub security: SecurityConfig,
     pub permissions: PermissionConfig,
     pub browser: BrowserConfig,
+    pub cluster: ClusterConfig,
     pub commands: Vec<CustomCommandConfig>,
     pub agents: Vec<AgentConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -255,7 +262,7 @@ impl Default for UiConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderPreset {
     #[default]
@@ -280,6 +287,38 @@ pub struct RuntimeConfig {
     pub command_timeout_seconds: u64,
     pub max_tool_output_bytes: usize,
     pub max_fetch_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClusterConfig {
+    /// Upper bounds for child-agent fan-out. `None` means unlimited. These
+    /// fields are intentionally not enforced yet; they reserve the
+    /// configuration surface so existing TOML files stay valid when limits
+    /// are implemented.
+    pub max_parallel_children: Option<usize>,
+    pub max_children_per_turn: Option<usize>,
+    pub max_children_per_session: Option<usize>,
+    /// Bounds applied to each child agent's working context and tool output.
+    /// These are enforced in `agent::run_child`.
+    pub child_max_output_bytes: usize,
+    pub child_max_tool_output_bytes: usize,
+    pub child_max_context_items: usize,
+    pub child_max_context_bytes: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel_children: None,
+            max_children_per_turn: None,
+            max_children_per_session: None,
+            child_max_output_bytes: 256 * 1024,
+            child_max_tool_output_bytes: 128 * 1024,
+            child_max_context_items: 48,
+            child_max_context_bytes: 512 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -363,11 +402,14 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             provider: ProviderConfig::default(),
+            providers: Vec::new(),
+            provider_profiles_initialized: false,
             ui: UiConfig::default(),
             runtime: RuntimeConfig::default(),
             security: SecurityConfig::default(),
             permissions: PermissionConfig::default(),
             browser: BrowserConfig::default(),
+            cluster: ClusterConfig::default(),
             commands: Vec::new(),
             agents: Vec::new(),
             mcp_servers: Vec::new(),
@@ -417,6 +459,11 @@ impl Config {
             Self::default()
         };
 
+        // A config written by older versions has only `[provider]`. Preserve
+        // that complete profile before applying process-only environment
+        // overrides, so migration never loses the user's connection details.
+        config.ensure_provider_profiles();
+
         if let Ok(value) = env::var("AGENT_API_BASE") {
             if !value.trim().is_empty() {
                 config.provider.base_url = value;
@@ -448,6 +495,20 @@ impl Config {
         }
         config.browser.max_output_bytes = config.browser.max_output_bytes.min(8 * 1024 * 1024);
         config.browser.keep_alive_seconds = config.browser.keep_alive_seconds.min(300);
+        config.cluster.child_max_output_bytes = config
+            .cluster
+            .child_max_output_bytes
+            .clamp(16 * 1024, 1024 * 1024);
+        config.cluster.child_max_tool_output_bytes = config
+            .cluster
+            .child_max_tool_output_bytes
+            .clamp(4 * 1024, 1024 * 1024);
+        config.cluster.child_max_context_items =
+            config.cluster.child_max_context_items.clamp(4, 200);
+        config.cluster.child_max_context_bytes = config
+            .cluster
+            .child_max_context_bytes
+            .clamp(16 * 1024, 1024 * 1024);
         for agent in &mut config.agents {
             agent.max_turns = agent.max_turns.clamp(1, 8);
         }
@@ -482,6 +543,57 @@ impl Config {
         }
         let value = toml::to_string_pretty(self).context("failed to serialize configuration")?;
         fs::write(path, value).with_context(|| format!("failed to save config {}", path.display()))
+    }
+
+    /// Returns a saved connection profile, falling back to the active profile
+    /// for compatibility with callers during the old-config migration.
+    pub fn provider_for(&self, preset: ProviderPreset) -> Option<ProviderConfig> {
+        self.providers
+            .iter()
+            .find(|provider| provider.preset == preset)
+            .cloned()
+            .or_else(|| (self.provider.preset == preset).then(|| self.provider.clone()))
+    }
+
+    /// Inserts or replaces a profile by preset. Keeping this centralized also
+    /// prevents duplicate template additions from reaching the config file.
+    pub fn upsert_provider(&mut self, provider: ProviderConfig) {
+        if let Some(existing) = self
+            .providers
+            .iter_mut()
+            .find(|existing| existing.preset == provider.preset)
+        {
+            *existing = provider;
+        } else {
+            self.providers.push(provider);
+        }
+    }
+
+    pub fn remove_provider(&mut self, preset: ProviderPreset) -> Option<ProviderConfig> {
+        let index = self
+            .providers
+            .iter()
+            .position(|provider| provider.preset == preset)?;
+        Some(self.providers.remove(index))
+    }
+
+    fn ensure_provider_profiles(&mut self) {
+        let mut unique = Vec::with_capacity(self.providers.len() + 1);
+        for provider in std::mem::take(&mut self.providers) {
+            if let Some(existing) = unique
+                .iter_mut()
+                .find(|existing: &&mut ProviderConfig| existing.preset == provider.preset)
+            {
+                *existing = provider;
+            } else {
+                unique.push(provider);
+            }
+        }
+        self.providers = unique;
+        if !self.provider_profiles_initialized {
+            self.upsert_provider(self.provider.clone());
+            self.provider_profiles_initialized = true;
+        }
     }
 }
 
@@ -1077,6 +1189,56 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.provider.kind, ProviderKind::Responses);
         assert!(config.runtime.max_fetch_bytes >= config.runtime.max_tool_output_bytes);
+    }
+
+    #[test]
+    fn legacy_active_provider_is_migrated_without_losing_fields() {
+        let mut config = Config {
+            provider: ProviderPreset::DeepSeek.defaults(),
+            ..Config::default()
+        };
+        config.provider.base_url = "https://gateway.example/deepseek".into();
+        config.provider.model = "deepseek-private".into();
+        config.ensure_provider_profiles();
+
+        let saved = config.provider_for(ProviderPreset::DeepSeek).unwrap();
+        assert_eq!(saved.base_url, "https://gateway.example/deepseek");
+        assert_eq!(saved.model, "deepseek-private");
+    }
+
+    #[test]
+    fn provider_profiles_are_unique_and_serialized_without_secrets() {
+        let mut config = Config::default();
+        config.upsert_provider(ProviderPreset::Qwen.defaults());
+        let mut replacement = ProviderPreset::Qwen.defaults();
+        replacement.model = "qwen-custom-deployment".into();
+        config.upsert_provider(replacement);
+
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .filter(|provider| provider.preset == ProviderPreset::Qwen)
+                .count(),
+            1
+        );
+        assert_eq!(
+            config.provider_for(ProviderPreset::Qwen).unwrap().model,
+            "qwen-custom-deployment"
+        );
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("providers"));
+        assert!(!encoded.to_ascii_lowercase().contains("api_key"));
+    }
+
+    #[test]
+    fn initialized_empty_profile_list_is_not_repopulated() {
+        let mut config = Config {
+            provider_profiles_initialized: true,
+            ..Config::default()
+        };
+        config.ensure_provider_profiles();
+        assert!(config.providers.is_empty());
     }
 
     #[test]

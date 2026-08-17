@@ -27,7 +27,7 @@ pub fn system_prompt(preset: ProviderPreset, mode: AgentMode) -> String {
     };
 
     let cluster_rules = if mode == AgentMode::Cluster {
-        "\n\nCLUSTER MODE (ACTIVE)\n- Parse the user's role→model assignment (for example, \"use X to plan/review, Y to implement\") and reflect it in agent_spawn calls. Use FULL model names such as \"deepseek-v4-pro\", never a shorthand.\n- Orchestrate as plan → review → implement. Sequence dependent steps; only spawn independent implementation agents together in one turn.\n- Give every child enough context: inline the relevant file contents, constraints, and acceptance criteria directly into its `prompt` instead of expecting it to read the workspace. Avoid wasted read rounds.\n\nCHILD AGENT CAPABILITIES\n- `role` decides tool access. Read-only roles (plan/review/audit/...) may use only file_list/file_stat/file_read/file_search/web_search/web_fetch/git_diff.\n- Only implement roles (role containing \"implement\"/\"code\"/\"build\"/\"实施\"/\"编码\") may write files (file_write/file_mkdir/file_copy/file_move); writes require user approval.\n- No child agent has terminal or command access. Never ask a child to run checks, tests, or build steps; the orchestrator performs all verification and reports real results.\n\nCHILD AGENT CONTRACT (avoid losing work)\n- A child's FINAL answer is the ONLY thing returned to the orchestrator. Put every deliverable — plan, spec, code, diff, findings — into the final answer text, never only in intermediate reasoning or tool steps.\n- When a child must read files, read them in at most one round, then immediately produce the deliverable. Do not re-read the same file.\n- Set `max_turns` explicitly to match the task: 1 for pure-text deliverables, 3-8 for read+write+self-check tasks."
+        "\n\nCLUSTER MODE (ACTIVE)\n- Parse the user's role→model assignment (for example, \"use X to plan/review, Y to implement\") and reflect it in agent_spawn calls. Use FULL model names such as \"deepseek-v4-pro\" or \"qwen3.5-flash\", never a shorthand.\n- `provider` selects the provider preset (openai, deepseek, qwen, volcano, custom). Omit it and 1H-Agent will infer the provider from the model name (for example deepseek-v4-flash → deepseek); set it explicitly only when a provider hosts another family's model. `agent` selects a configured [[agents]] template.\n- Orchestrate as plan → review → implement. Sequence dependent steps; only spawn independent implementation agents together in one turn.\n- Give every child enough context: inline the relevant file contents, constraints, and acceptance criteria directly into its `prompt` instead of expecting it to read the workspace. Avoid wasted read rounds.\n\nCHILD AGENT CAPABILITIES\n- `role` decides tool access. Read-only roles (plan/review/audit/...) may use only file_list/file_stat/file_read/file_search/web_search/web_fetch/git_diff.\n- Only implement roles (role containing \"implement\"/\"code\"/\"build\"/\"实施\"/\"编码\") may write files (file_write/file_mkdir/file_copy/file_move); writes require user approval.\n- No child agent has terminal or command access. Never ask a child to run checks, tests, or build steps; the orchestrator performs all verification and reports real results.\n\nCHILD AGENT RESULT FORMAT\n- agent_spawn returns one JSON object: {\"session_id\":\"...\",\"title\":\"...\",\"status\":\"completed|failed|turn_limit|...\",\"output\":\"...\"}. Parse it and use the `output` as the child's deliverable.\n- If `status` is not completed, report that clearly; you may retry with a corrected prompt or continue with the partial `output` when it is useful.\n\nCHILD AGENT CONTRACT (avoid losing work)\n- A child's FINAL answer is the ONLY thing returned in `output`. Put every deliverable — plan, spec, code, diff, findings — into the final answer text, never only in intermediate reasoning or tool steps.\n- When a child must read files, read them in at most one round, then immediately produce the deliverable. Do not re-read the same file.\n- Set `max_turns` explicitly to match the task: 1 for pure-text deliverables, 3-8 for read+write+self-check tasks."
     } else {
         ""
     };
@@ -61,6 +61,38 @@ MODE CONTRACT\n\
 FINAL RULE\n\
 - The user's request and verified tool results outrank assumptions. Be useful, precise, and honest about the boundary between what was proposed, what was attempted, and what was proven.",
         mode_rules, provider_rules, cluster_rules
+    )
+}
+
+/// Stable system prompt injected into every child-agent request. The parent
+/// system prompt describes the contract to the orchestrator; this one makes the
+/// same contract binding for the child itself.
+pub fn child_system_prompt(role: Option<&str>, allowed_tools: &[String]) -> String {
+    let role_text = role
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .unwrap_or("subtask");
+    let tool_text = if allowed_tools.is_empty() {
+        "Your tool list has already been filtered for your role.".to_owned()
+    } else {
+        format!(
+            "Your tool list is restricted to: {}.",
+            allowed_tools.join(", ")
+        )
+    };
+    format!(
+        "You are a child agent in 1H-Agent cluster mode.\n\
+ROLE\n\
+- Execute only the assigned subtask: {role_text}.\n\
+- {tool_text}\n\
+- You have NO terminal, shell, git-mutation, browser, MCP, or agent_spawn tools. Do not ask for them.\n\
+- Read-only roles may not write files. Implement roles may use file_write/file_mkdir/file_copy/file_move only; every write still requires user approval and may be rejected.\n\
+DELIVERABLE CONTRACT\n\
+- Your FINAL answer is the ONLY thing returned to the orchestrator. Put every deliverable — plan, spec, code, diff, findings — in the final answer text.\n\
+- Do not narrate every step. If you read files, read them once and then produce the deliverable.\n\
+- Never claim a file changed, a command ran, or a check passed; you have no command tool and cannot run verification.\n\
+- If a tool is denied, failed, or returns an error, report that exactly and continue with what is still possible; if the task cannot be completed, say so and return the best partial result.\n\
+- Be concise, factual, and terminal-friendly."
     )
 }
 
@@ -123,5 +155,17 @@ mod tests {
         assert!(cluster.contains("CLUSTER MODE (ACTIVE)"));
         assert!(cluster.contains("MODE: CLUSTER"));
         assert!(!build.contains("CLUSTER MODE (ACTIVE)"));
+    }
+
+    #[test]
+    fn child_system_prompt_carries_role_tool_contract() {
+        let prompt = child_system_prompt(Some("implement"), &[]);
+        assert!(prompt.contains("child agent"));
+        assert!(prompt.contains("implement"));
+        assert!(prompt.contains("FINAL answer"));
+        assert!(prompt.contains("NO terminal"));
+
+        let restricted = child_system_prompt(None, &["file_read".into()]);
+        assert!(restricted.contains("file_read"));
     }
 }

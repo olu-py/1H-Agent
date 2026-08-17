@@ -123,6 +123,7 @@ impl Storage {
         ensure_column(&connection, "sessions", "parent_id", "TEXT")?;
         ensure_column(&connection, "sessions", "deleted_at", "TEXT")?;
         ensure_column(&connection, "sessions", "head_turn_id", "TEXT")?;
+        ensure_column(&connection, "sessions", "child_role", "TEXT")?;
         ensure_column(&connection, "messages", "turn_id", "TEXT")?;
         ensure_column(
             &connection,
@@ -165,6 +166,11 @@ impl Storage {
 
     /// Creates a child session nested under `parent_id`. The child owns its own
     /// provider/model so a cluster can run different roles on different models.
+    /// `mode` is the session mode used when the child is opened later, and
+    /// `child_role` preserves the role-based tool restrictions for that later
+    /// interaction (implement roles may write files but still never receive
+    /// terminal or spawn tools).
+    #[allow(clippy::too_many_arguments)]
     pub fn create_child_session(
         &self,
         workspace: &Path,
@@ -172,14 +178,16 @@ impl Storage {
         provider: &str,
         model: &str,
         title: &str,
+        mode: &str,
+        child_role: &str,
     ) -> Result<String, StorageError> {
         let id = Uuid::new_v4().to_string();
         let turn_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
         connection.execute(
-            "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id) VALUES (?1, ?2, ?3, ?4, ?4, 'explore', ?5, ?6, ?7, ?8)",
-            params![id, workspace.display().to_string(), title, now, provider, model, parent_id, turn_id],
+            "INSERT INTO sessions(id, workspace, title, created_at, updated_at, mode, provider, model, parent_id, head_turn_id, child_role) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, workspace.display().to_string(), title, now, mode, provider, model, parent_id, turn_id, child_role],
         )?;
         connection.execute(
             "INSERT INTO turns(id, session_id, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
@@ -199,6 +207,18 @@ impl Storage {
                 [session_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .map_err(StorageError::from)
+    }
+
+    /// Returns the child role captured at spawn time, if this is a child session.
+    pub fn session_child_role(&self, session_id: &str) -> Result<Option<String>, StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT child_role FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(StorageError::from)
     }
 
@@ -401,9 +421,16 @@ impl Storage {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<(), StorageError> {
-        self.lock()?.execute(
-            "UPDATE sessions SET deleted_at = ?2 WHERE id = ?1",
-            params![session_id, Utc::now().to_rfc3339()],
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        connection.execute(
+            "WITH RECURSIVE descendants(id) AS (
+                 SELECT id FROM sessions WHERE id = ?1
+                 UNION ALL
+                 SELECT s.id FROM sessions s JOIN descendants d ON s.parent_id = d.id
+             )
+             UPDATE sessions SET deleted_at = ?2 WHERE id IN (SELECT id FROM descendants)",
+            params![session_id, now],
         )?;
         Ok(())
     }
@@ -756,7 +783,15 @@ mod tests {
         let root = tempdir().unwrap();
         let parent = storage.create_session(root.path()).unwrap();
         let child = storage
-            .create_child_session(root.path(), &parent, "deepseek", "deepseek-v4-pro", "计划")
+            .create_child_session(
+                root.path(),
+                &parent,
+                "deepseek",
+                "deepseek-v4-pro",
+                "计划",
+                "explore",
+                "planner",
+            )
             .unwrap();
 
         let sessions = storage.list_sessions(root.path()).unwrap();
@@ -768,6 +803,62 @@ mod tests {
         assert_eq!(provider, "deepseek");
         assert_eq!(model, "deepseek-v4-pro");
         assert_eq!(storage.session_mode(&child).unwrap(), "explore");
+        assert_eq!(
+            storage.session_child_role(&child).unwrap().as_deref(),
+            Some("planner")
+        );
+    }
+
+    #[test]
+    fn delete_session_soft_deletes_descendants() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let parent = storage.create_session(root.path()).unwrap();
+        let child = storage
+            .create_child_session(
+                root.path(),
+                &parent,
+                "openai",
+                "gpt-5-mini",
+                "child",
+                "explore",
+                "reviewer",
+            )
+            .unwrap();
+        let grandchild = storage
+            .create_child_session(
+                root.path(),
+                &child,
+                "openai",
+                "gpt-5-mini",
+                "grandchild",
+                "explore",
+                "reviewer",
+            )
+            .unwrap();
+
+        storage.delete_session(&parent).unwrap();
+        let sessions = storage.list_sessions(root.path()).unwrap();
+        assert!(sessions.is_empty());
+
+        // Directly deleting a child leaves other branches alone.
+        let parent2 = storage.create_session(root.path()).unwrap();
+        let child2 = storage
+            .create_child_session(
+                root.path(),
+                &parent2,
+                "openai",
+                "gpt-5-mini",
+                "child2",
+                "explore",
+                "reviewer",
+            )
+            .unwrap();
+        storage.delete_session(&child2).unwrap();
+        let sessions = storage.list_sessions(root.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, parent2);
+        let _ = grandchild;
     }
 
     #[test]

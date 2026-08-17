@@ -17,6 +17,11 @@ pub fn copy_text(text: &str) -> CopyResult {
     })
 }
 
+pub fn read_text() -> Result<String, String> {
+    let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard.get_text().map_err(|error| error.to_string())
+}
+
 pub fn copy_text_with<F>(text: &str, set_native: F) -> CopyResult
 where
     F: FnOnce(&str) -> Result<(), String>,

@@ -59,6 +59,7 @@ pub struct SessionRuntime {
     pub context_limit_tokens: Option<u64>,
     pub pending_approval: Option<PendingApproval>,
     pub mode: AgentMode,
+    pub child_role: Option<String>,
     pub expanded_tools: HashSet<String>,
     pub expanded_thinking: HashSet<String>,
     pub thinking_expanded: bool,
@@ -293,6 +294,7 @@ impl SessionRuntime {
                 }
                 outcome.sessions_dirty = true;
             }
+            AgentEvent::ChildSessionStatus { .. } => {}
             AgentEvent::Failed(error) => {
                 self.finish_thinking("思考失败");
                 self.push_entry(DisplayEntry {
@@ -558,10 +560,16 @@ pub(crate) fn trim_entries(entries: &mut Vec<DisplayEntry>) -> usize {
 }
 
 pub(crate) fn trim_conversation(items: &mut Vec<ConversationItem>) {
-    const MAX_ITEMS: usize = 200;
-    const MAX_BYTES: usize = 1024 * 1024;
+    trim_conversation_bounded(items, 200, 1024 * 1024);
+}
+
+pub(crate) fn trim_conversation_bounded(
+    items: &mut Vec<ConversationItem>,
+    max_items: usize,
+    max_bytes: usize,
+) {
     let mut removed = 0usize;
-    while items.len() > MAX_ITEMS || conversation_bytes(items) > MAX_BYTES {
+    while items.len() > max_items || conversation_bytes(items) > max_bytes {
         if items.is_empty() {
             break;
         }

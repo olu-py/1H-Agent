@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{AgentEvent, AgentRunner},
+    agent::{AgentEvent, AgentRunner, ChildSessionStatus},
     commands::{self, AgentMode, Command},
     config::{Config, ProviderPreset, ThinkingLevel, ThinkingProfile, thinking_profile},
     input::InputBuffer,
@@ -38,7 +38,7 @@ use crate::{
     session::{
         EventCtx, SessionRuntime, display_entries, estimate_context_tokens, trim_conversation,
     },
-    settings::SettingsForm,
+    settings::{SettingsField, SettingsForm, SettingsState},
     storage::{SessionSummary, Storage},
     tools::ToolRegistry,
     ui,
@@ -62,7 +62,8 @@ pub struct App {
     pub workspace: PathBuf,
     pub input: InputBuffer,
     pub context_meter_enabled: bool,
-    pub settings: Option<SettingsForm>,
+    pub settings: Option<SettingsState>,
+    pub settings_rect: Option<Rect>,
     pub palette: Option<CommandPaletteState>,
     pub leader_pending: bool,
     pub thinking_menu_open: bool,
@@ -80,6 +81,7 @@ pub struct App {
     pub file_selected: usize,
     pub sessions: Vec<SessionSummary>,
     pub expanded_sessions: HashSet<String>,
+    pub child_status: HashMap<String, ChildSessionStatus>,
     storage: Storage,
     config: Config,
     registry: Arc<ToolRegistry>,
@@ -118,7 +120,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
     registry.set_external_config(config.browser.clone(), config.mcp_servers.clone());
     let _ = registry.initialize_mcp().await;
     let (router_tx, router_rx) = mpsc::channel(256);
-    let (active_secret, initial_status) = match secrets::api_key(config.provider.preset) {
+    let (active_secret, initial_status) = match secrets::api_key_cached(config.provider.preset) {
         Ok(api_key) => (
             Some((config.provider.preset, api_key)),
             format!(
@@ -156,6 +158,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         input: InputBuffer::new(),
         context_meter_enabled: config.ui.context_meter,
         settings: None,
+        settings_rect: None,
         palette: None,
         leader_pending: false,
         thinking_menu_open: false,
@@ -173,6 +176,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         file_selected: 0,
         sessions,
         expanded_sessions: HashSet::new(),
+        child_status: HashMap::new(),
         storage,
         config,
         registry,
@@ -362,7 +366,14 @@ impl EventOutcome {
 
 async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutcome> {
     if let Event::Paste(text) = &event {
-        if !app.current.busy && app.settings.is_none() && app.palette.is_none() {
+        if app.settings.is_some() {
+            return Ok(if paste_text_into_settings(app, text) {
+                EventOutcome::redraw()
+            } else {
+                EventOutcome::default()
+            });
+        }
+        if !app.current.busy && app.palette.is_none() {
             app.input.insert_str(text);
             update_file_suggestions(app);
             return Ok(EventOutcome::redraw());
@@ -370,6 +381,9 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         return Ok(EventOutcome::default());
     }
     if let Event::Mouse(mouse) = event {
+        if let Some(outcome) = handle_settings_mouse(app, mouse)? {
+            return Ok(outcome);
+        }
         if let Some(outcome) = handle_leader_mouse(app, mouse)? {
             return Ok(outcome);
         }
@@ -676,6 +690,48 @@ fn handle_leader_mouse(
     match action {
         Some(action) => execute_leader_action(app, action)?,
         None => app.current.status = "已取消".into(),
+    }
+    Ok(Some(EventOutcome::redraw()))
+}
+
+fn handle_settings_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+) -> Result<Option<EventOutcome>> {
+    let Some(settings) = app.settings.as_mut() else {
+        return Ok(None);
+    };
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return Ok(Some(EventOutcome::default()));
+    }
+    let Some(rect) = app.settings_rect else {
+        return Ok(Some(EventOutcome::default()));
+    };
+    let inner = ratatui::widgets::Block::bordered().inner(rect);
+    if !point_in_rect(mouse.column, mouse.row, inner) {
+        return Ok(Some(EventOutcome::default()));
+    }
+    let relative_row = mouse.row.saturating_sub(inner.y) as usize;
+    match settings {
+        SettingsState::List(list) => {
+            let profile_start = 2usize;
+            if relative_row >= profile_start && relative_row < profile_start + list.providers.len()
+            {
+                list.selected = relative_row - profile_start;
+                open_selected_profile(app);
+            } else if relative_row == profile_start + list.providers.len() + 1 {
+                list.selected = list.providers.len();
+                open_template_picker(app);
+            }
+        }
+        SettingsState::Templates(templates) => {
+            let start = 2usize;
+            if relative_row >= start && relative_row < start + templates.presets.len() {
+                templates.selected = relative_row - start;
+                open_selected_template(app);
+            }
+        }
+        SettingsState::Form(_) => {}
     }
     Ok(Some(EventOutcome::redraw()))
 }
@@ -995,18 +1051,24 @@ fn palette_key_handled(code: KeyCode, modifiers: KeyModifiers) -> bool {
 }
 
 fn settings_key_handled(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    matches!(
-        code,
-        KeyCode::Esc
-            | KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Backspace
-            | KeyCode::Enter
-    ) || matches!(code, KeyCode::Char(_) if !modifiers.contains(KeyModifiers::CONTROL))
+    let paste_shortcut = code == KeyCode::Char('v')
+        && modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL | KeyModifiers::META);
+    paste_shortcut
+        || matches!(
+            code,
+            KeyCode::Esc
+                | KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Enter
+        )
+        || (code == KeyCode::Char('d') && modifiers.contains(KeyModifiers::CONTROL))
+        || matches!(code, KeyCode::Char(_) if !modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn update_drag_position(app: &mut App, column: u16, row: u16) {
@@ -1344,12 +1406,91 @@ fn apply_file_completion(app: &mut App) {
 }
 
 fn open_settings(app: &mut App) {
-    let existing_key_preset = app.active_secret.as_ref().map(|(preset, _)| *preset);
-    app.settings = Some(SettingsForm::new(
-        app.config.provider.clone(),
-        existing_key_preset,
+    app.settings = Some(SettingsState::list(
+        app.config.providers.clone(),
+        app.config.provider.preset,
     ));
-    app.current.status = "提供商设置".into();
+    app.current.status = "已连接的供应商".into();
+}
+
+fn available_key_presets() -> HashSet<ProviderPreset> {
+    ProviderPreset::ALL
+        .iter()
+        .filter_map(|preset| secrets::api_key_cached(*preset).ok().map(|_| *preset))
+        .collect()
+}
+
+fn provider_form(app: &App, provider: crate::config::ProviderConfig) -> SettingsForm {
+    let existing_key_preset = app.active_secret.as_ref().map(|(preset, _)| *preset);
+    let mut form = SettingsForm::new(provider, existing_key_preset);
+    form.set_available_key_presets(available_key_presets());
+    form
+}
+
+fn reopen_provider_list(app: &mut App) {
+    app.settings = Some(SettingsState::list(
+        app.config.providers.clone(),
+        app.config.provider.preset,
+    ));
+}
+
+fn open_provider_form(app: &mut App, provider: crate::config::ProviderConfig) {
+    app.settings = Some(SettingsState::Form(provider_form(app, provider)));
+}
+
+fn open_template_picker(app: &mut App) {
+    if let Some(settings) = &mut app.settings {
+        settings.open_templates();
+        app.current.status = "选择供应商模板".into();
+    }
+}
+
+fn open_selected_profile(app: &mut App) {
+    if let Some(provider) = app
+        .settings
+        .as_ref()
+        .and_then(SettingsState::selected_profile)
+    {
+        open_provider_form(app, provider);
+        app.current.status = "编辑供应商".into();
+    }
+}
+
+fn open_selected_template(app: &mut App) {
+    if let Some(preset) = app
+        .settings
+        .as_ref()
+        .and_then(SettingsState::selected_template)
+    {
+        open_provider_form(app, preset.defaults());
+        app.current.status = format!("添加 {}", preset.label());
+    }
+}
+
+fn remove_settings_provider(app: &mut App) -> Result<()> {
+    let preset = app
+        .settings
+        .as_ref()
+        .and_then(SettingsState::form)
+        .map(|form| form.provider.preset)
+        .context("provider editor is not open")?;
+    app.config.remove_provider(preset);
+    if app.config.provider.preset == preset {
+        app.config.provider = app
+            .config
+            .providers
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ProviderPreset::OpenAi.defaults());
+        app.active_secret = secrets::api_key_cached(app.config.provider.preset)
+            .ok()
+            .map(|key| (app.config.provider.preset, key));
+        rebuild_runner(app)?;
+    }
+    app.config.save()?;
+    reopen_provider_list(app);
+    app.current.status = "供应商已移除；API Key 已保留在系统钥匙串".into();
+    Ok(())
 }
 
 fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -1676,13 +1817,21 @@ fn rebuild_runner(app: &mut App) -> Result<()> {
         return Ok(());
     };
     let provider = OpenAiClient::new(app.config.provider.base_url.clone(), api_key.clone())?;
-    app.current.runner = Some(AgentRunner::new(
-        provider,
-        app.config.provider.clone(),
-        app.registry.clone(),
-        app.storage.clone(),
-        app.current.session_id.clone(),
-    ));
+    let child_role = app.current.child_role.clone();
+    let child_provider_resolver = provider_config_resolver(&app.config);
+    app.current.runner = Some(
+        AgentRunner::new(
+            provider,
+            app.config.provider.clone(),
+            app.registry.clone(),
+            app.storage.clone(),
+            app.current.session_id.clone(),
+        )
+        .with_cluster_config(app.config.cluster.clone())
+        .with_configured_agents(app.config.agents.clone())
+        .with_child_role(child_role)
+        .with_child_provider_resolver(child_provider_resolver),
+    );
     Ok(())
 }
 
@@ -1714,70 +1863,133 @@ fn start_diff(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn paste_text_into_settings(app: &mut App, text: &str) -> bool {
+    let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) else {
+        return false;
+    };
+    let field = form.field();
+    if !matches!(
+        field,
+        SettingsField::Model | SettingsField::BaseUrl | SettingsField::ApiKey
+    ) {
+        return false;
+    }
+    let sanitized = text.replace(['\r', '\n'], "");
+    let mut sanitized = sanitized.as_str();
+    if sanitized.len() > crate::clipboard::MAX_CLIPBOARD_BYTES {
+        let mut end = crate::clipboard::MAX_CLIPBOARD_BYTES;
+        while end > 0 && !sanitized.is_char_boundary(end) {
+            end -= 1;
+        }
+        sanitized = &sanitized[..end];
+    }
+    form.paste(field, sanitized);
+    true
+}
+
 fn handle_settings_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Esc => {
-            app.settings = None;
-            app.current.status = "设置已取消".into();
+            if matches!(app.settings, Some(SettingsState::List(_))) {
+                app.settings = None;
+                app.current.status = "设置已取消".into();
+            } else {
+                reopen_provider_list(app);
+                app.current.status = "已返回供应商列表".into();
+            }
         }
         KeyCode::Tab | KeyCode::Down => {
-            if let Some(form) = &mut app.settings {
-                form.move_selection(1);
+            if let Some(settings) = &mut app.settings {
+                settings.move_selection(1);
             }
         }
         KeyCode::BackTab | KeyCode::Up => {
-            if let Some(form) = &mut app.settings {
-                form.move_selection(-1);
+            if let Some(settings) = &mut app.settings {
+                settings.move_selection(-1);
             }
         }
         KeyCode::Left | KeyCode::Right => {
             let direction = if code == KeyCode::Right { 1 } else { -1 };
-            if let Some(form) = &mut app.settings {
+            if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
                 let field = form.field();
                 form.cycle(field, direction);
             }
         }
         KeyCode::Backspace => {
-            if let Some(form) = &mut app.settings {
+            if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
                 let field = form.field();
                 form.edit(field, None);
             }
         }
+        KeyCode::Char('v')
+            if modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL | KeyModifiers::META) =>
+        {
+            match crate::clipboard::read_text() {
+                Ok(text) => {
+                    if paste_text_into_settings(app, &text) {
+                        app.current.status = "已粘贴剪贴板内容".into();
+                    } else {
+                        app.current.status = "当前字段不支持粘贴".into();
+                    }
+                }
+                Err(error) => {
+                    app.current.status = format!("无法读取系统剪贴板：{}", secrets::redact(&error));
+                }
+            }
+        }
+        KeyCode::Delete | KeyCode::Char('d')
+            if matches!(app.settings, Some(SettingsState::Form(_)))
+                && (code == KeyCode::Delete || modifiers.contains(KeyModifiers::CONTROL)) =>
+        {
+            if let Err(error) = remove_settings_provider(app) {
+                app.current.status = format!("移除失败：{}", secrets::redact(&error.to_string()));
+            }
+        }
         KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(form) = &mut app.settings {
+            if let Some(form) = app.settings.as_mut().and_then(SettingsState::form_mut) {
                 let field = form.field();
                 form.edit(field, Some(character));
             }
         }
-        KeyCode::Enter => {
-            if let Err(error) = apply_settings(app) {
-                app.current.status = format!("设置错误：{}", secrets::redact(&error.to_string()));
+        KeyCode::Enter => match app.settings.as_ref() {
+            Some(settings) if settings.on_add_row() => open_template_picker(app),
+            Some(SettingsState::List(_)) => open_selected_profile(app),
+            Some(SettingsState::Templates(_)) => open_selected_template(app),
+            Some(SettingsState::Form(_)) => {
+                if let Err(error) = apply_settings(app) {
+                    app.current.status =
+                        format!("设置错误：{}", secrets::redact(&error.to_string()));
+                }
             }
-        }
+            None => {}
+        },
         _ => {}
     }
 }
 
 fn apply_settings(app: &mut App) -> Result<()> {
-    let form = app.settings.as_ref().context("settings are not open")?;
-    let provider_config = form.prepare()?;
-    let api_key = form.resolve_api_key(app.active_secret.as_ref())?;
-    let entered_key = form.api_key.trim();
+    let (provider_config, api_key, entered_key) = {
+        let form = app
+            .settings
+            .as_ref()
+            .and_then(SettingsState::form)
+            .context("provider editor is not open")?;
+        (
+            form.prepare()?,
+            form.resolve_api_key(app.active_secret.as_ref())?,
+            form.api_key.trim().to_owned(),
+        )
+    };
 
-    let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())?;
-    app.current.runner = Some(AgentRunner::new(
-        provider,
-        provider_config.clone(),
-        app.registry.clone(),
-        app.storage.clone(),
-        app.current.session_id.clone(),
-    ));
     app.active_secret = Some((provider_config.preset, api_key));
     app.config.provider = provider_config.clone();
+    app.config.upsert_provider(provider_config.clone());
     app.current.context_limit_tokens = provider_config.resolved_context_window_tokens();
+    rebuild_runner(app)?;
 
     let key_warning = if !entered_key.is_empty() {
-        secrets::store_api_key(provider_config.preset, entered_key)
+        secrets::store_api_key_cached(provider_config.preset, &entered_key)
             .err()
             .map(|error| {
                 format!(
@@ -1799,7 +2011,7 @@ fn apply_settings(app: &mut App) -> Result<()> {
         .flatten()
         .collect::<Vec<_>>()
         .join(", ");
-    app.settings = None;
+    reopen_provider_list(app);
     app.current.status = format!(
         "就绪 | {} | {}{}",
         provider_config.preset.label(),
@@ -1820,6 +2032,15 @@ fn apply_settings(app: &mut App) -> Result<()> {
 fn handle_routed_event(app: &mut App, routed: RoutedEvent) -> bool {
     let RoutedEvent { session_id, event } = routed;
     let is_active = session_id == app.active_session;
+    if let AgentEvent::ChildSessionStatus {
+        session_id: child_id,
+        status,
+    } = &event
+    {
+        app.child_status.insert(child_id.clone(), *status);
+        let _ = refresh_sessions(app);
+        return is_active;
+    }
     let outcome = {
         let ctx = EventCtx {
             storage: &app.storage,
@@ -1997,6 +2218,53 @@ fn switch_session(app: &mut App, direction: i32) -> Result<()> {
     activate_session(app, session_id)
 }
 
+fn provider_config_resolver(config: &Config) -> Arc<crate::agent::ChildProviderResolver> {
+    let providers = config.providers.clone();
+    let default_provider = config.provider.clone();
+    Arc::new(
+        move |preset: ProviderPreset| -> Result<crate::config::ProviderConfig, String> {
+            if let Some(provider) = providers
+                .iter()
+                .find(|provider| provider.preset == preset)
+                .cloned()
+            {
+                return Ok(provider);
+            }
+            if preset == default_provider.preset {
+                return Ok(default_provider.clone());
+            }
+            let mut provider_config = preset.defaults();
+            provider_config
+                .validate()
+                .map_err(|error| format!("invalid child provider configuration: {error}"))?;
+            Ok(provider_config)
+        },
+    )
+}
+
+/// Resolves a stored provider id/model pair for a session. Child sessions may
+/// reference a different provider than the current global setting; in that case
+/// the preset defaults are used (and must be valid, e.g. Qwen needs a real
+/// workspace URL configured via env or config).
+fn session_provider_config(
+    config: &Config,
+    provider_id: &str,
+    model: &str,
+) -> Option<crate::config::ProviderConfig> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let preset = ProviderPreset::parse(provider_id)?;
+    let mut provider_config = config
+        .provider_for(preset)
+        .unwrap_or_else(|| preset.defaults());
+    provider_config.validate().ok()?;
+    provider_config.model = model.to_owned();
+    provider_config.normalize_thinking();
+    Some(provider_config)
+}
+
 /// Builds a fresh `SessionRuntime` for the given session: loads its messages,
 /// resolves provider/model (child sessions override the global default), and
 /// spawns an event forwarder that routes its agent events to the router.
@@ -2019,35 +2287,31 @@ fn build_runtime(
     let provider_config = storage
         .session_provider_model(session_id)
         .ok()
-        .and_then(|(provider_id, model)| {
-            let model = model.trim();
-            if model.is_empty() {
-                return None;
-            }
-            ProviderPreset::parse(&provider_id).map(|preset| {
-                let mut config = config.provider.clone();
-                config.preset = preset;
-                config.model = model.to_owned();
-                config.normalize_thinking();
-                config
-            })
-        })
+        .and_then(|(provider_id, model)| session_provider_config(config, &provider_id, &model))
         .unwrap_or_else(|| config.provider.clone());
-    let runner = active_secret
+    let child_role = storage.session_child_role(session_id).ok().flatten();
+    let child_provider_resolver = provider_config_resolver(config);
+    let runtime_key = active_secret
         .filter(|(preset, _)| *preset == provider_config.preset)
-        .and_then(|(_, api_key)| {
-            OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())
-                .ok()
-                .map(|provider| {
-                    AgentRunner::new(
-                        provider,
-                        provider_config.clone(),
-                        registry.clone(),
-                        storage.clone(),
-                        session_id.to_owned(),
-                    )
-                })
-        });
+        .map(|(_, api_key)| api_key.clone())
+        .or_else(|| secrets::api_key_cached(provider_config.preset).ok());
+    let runner = runtime_key.as_ref().and_then(|api_key| {
+        OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())
+            .ok()
+            .map(|provider| {
+                AgentRunner::new(
+                    provider,
+                    provider_config.clone(),
+                    registry.clone(),
+                    storage.clone(),
+                    session_id.to_owned(),
+                )
+                .with_cluster_config(config.cluster.clone())
+                .with_configured_agents(config.agents.clone())
+                .with_child_role(child_role.clone())
+                .with_child_provider_resolver(child_provider_resolver)
+            })
+    });
     let (agent_tx, agent_rx) = mpsc::channel(128);
     let router = router_tx.clone();
     let sid = session_id.to_owned();
@@ -2085,6 +2349,7 @@ fn build_runtime(
         context_limit_tokens: provider_config.resolved_context_window_tokens(),
         pending_approval: None,
         mode,
+        child_role,
         expanded_tools: HashSet::new(),
         expanded_thinking: HashSet::new(),
         thinking_expanded: false,
@@ -2145,6 +2410,21 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
 fn refresh_sessions(app: &mut App) -> Result<()> {
     app.sessions = app.storage.list_sessions(&app.workspace)?;
     Ok(())
+}
+
+impl App {
+    /// Whether a session currently has an approval prompt waiting. This is used
+    /// by the session panel so background parent sessions are not stuck waiting
+    /// for an invisible approval.
+    pub(crate) fn session_waiting_approval(&self, session_id: &str) -> bool {
+        if session_id == self.active_session {
+            self.current.pending_approval.is_some()
+        } else {
+            self.background
+                .get(session_id)
+                .is_some_and(|runtime| runtime.pending_approval.is_some())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2308,6 +2588,80 @@ mod tests {
     }
 
     #[test]
+    fn settings_paste_inserts_into_text_fields_and_strips_newlines() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        open_settings(&mut app);
+        let provider = app.config.provider.clone();
+        open_provider_form(&mut app, provider);
+
+        let form = app.settings.as_mut().unwrap().form_mut().unwrap();
+        form.selected = 3; // BaseUrl
+        assert!(paste_text_into_settings(
+            &mut app,
+            "https://api.example.com/v1\n"
+        ));
+        assert_eq!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .form()
+                .unwrap()
+                .provider
+                .base_url,
+            "https://api.example.com/v1"
+        );
+
+        let form = app.settings.as_mut().unwrap().form_mut().unwrap();
+        form.selected = 5; // ApiKey
+        assert!(paste_text_into_settings(&mut app, "sk-test-123\r\n"));
+        assert_eq!(
+            app.settings.as_ref().unwrap().form().unwrap().api_key,
+            "sk-test-123"
+        );
+
+        let form = app.settings.as_mut().unwrap().form_mut().unwrap();
+        form.selected = 0; // Preset is not editable text
+        assert!(!paste_text_into_settings(&mut app, "deepseek"));
+    }
+
+    #[test]
+    fn settings_paste_shortcut_is_handled() {
+        assert!(settings_key_handled(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(settings_key_handled(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER
+        ));
+    }
+
+    #[test]
+    fn provider_list_mouse_opens_profile_and_add_template_picker() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.config
+            .upsert_provider(ProviderPreset::OpenAi.defaults());
+        open_settings(&mut app);
+        app.settings_rect = Some(Rect::new(10, 10, 70, 20));
+
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_settings_mouse(&mut app, click(13)).unwrap();
+        assert!(matches!(app.settings, Some(SettingsState::Form(_))));
+
+        reopen_provider_list(&mut app);
+        app.settings_rect = Some(Rect::new(10, 10, 70, 20));
+        handle_settings_mouse(&mut app, click(15)).unwrap();
+        assert!(matches!(app.settings, Some(SettingsState::Templates(_))));
+    }
+
+    #[test]
     fn execute_leader_action_mode_uses_next_mode() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
@@ -2336,6 +2690,29 @@ mod tests {
         // A regular session stores an empty model; it must fall back to the
         // global DeepSeek model (deepseek-v4-flash window) rather than "".
         assert_eq!(app.current.context_limit_tokens, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn handle_routed_event_records_child_session_status() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let child_id = "child-1".to_owned();
+        let active_session = app.active_session.clone();
+        let redraw = handle_routed_event(
+            &mut app,
+            RoutedEvent {
+                session_id: active_session,
+                event: AgentEvent::ChildSessionStatus {
+                    session_id: child_id.clone(),
+                    status: ChildSessionStatus::Running,
+                },
+            },
+        );
+        assert!(redraw);
+        assert_eq!(
+            app.child_status.get(&child_id),
+            Some(&ChildSessionStatus::Running)
+        );
     }
 
     #[tokio::test]
@@ -2443,6 +2820,7 @@ mod tests {
             context_limit_tokens: None,
             pending_approval: None,
             mode: AgentMode::default(),
+            child_role: None,
             expanded_tools: HashSet::new(),
             expanded_thinking: HashSet::new(),
             thinking_expanded: false,
@@ -2466,6 +2844,7 @@ mod tests {
             input: InputBuffer::new(),
             context_meter_enabled: false,
             settings: None,
+            settings_rect: None,
             palette: None,
             leader_pending: false,
             thinking_menu_open: false,
@@ -2483,6 +2862,7 @@ mod tests {
             file_selected: 0,
             sessions,
             expanded_sessions: HashSet::new(),
+            child_status: HashMap::new(),
             storage,
             config,
             registry,

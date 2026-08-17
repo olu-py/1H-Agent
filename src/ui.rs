@@ -22,7 +22,7 @@ use crate::{
     commands::{self, AgentMode},
     output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
     secrets,
-    settings::{FIELDS, SettingsField, SettingsForm},
+    settings::{FIELDS, SettingsField, SettingsForm, SettingsState},
     storage::SessionSummary,
     ui_layout::{Density, HeightClass, compute_layout, message_block},
     ui_theme::{UiTheme, VisualRole},
@@ -74,6 +74,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.current.pending_approval.is_some() {
         draw_approval(frame, area, app, &theme);
     }
+    app.settings_rect = app.settings.as_ref().map(|settings| match settings {
+        SettingsState::List(_) => centered_rect(78, 20, area),
+        SettingsState::Templates(_) => centered_rect(68, 18, area),
+        SettingsState::Form(_) => centered_rect(88, 22, area),
+    });
     if let Some(settings) = &app.settings {
         draw_settings(frame, area, settings, &theme);
     }
@@ -238,6 +243,14 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiThe
         };
         let indent = "  ".repeat(row.depth);
         let marker = if active { ">" } else { " " };
+        let child_status = app.child_status.get(&row.id).map(|status| status.label());
+        let waiting_approval = app.session_waiting_approval(&row.id);
+        let status_text = match (child_status, waiting_approval) {
+            (_, true) => " ⏳审批".to_owned(),
+            (Some("完成"), false) => String::new(),
+            (Some(label), false) => format!(" ·{label}"),
+            (None, false) => String::new(),
+        };
         let style = if active {
             theme.selected
         } else if row.has_children {
@@ -247,10 +260,20 @@ fn draw_sessions(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiThe
         };
         let title = fit_text(
             &row.title,
-            content_width.saturating_sub(row.depth.saturating_mul(2).saturating_add(4)),
+            content_width.saturating_sub(
+                row.depth
+                    .saturating_mul(2)
+                    .saturating_add(4)
+                    .saturating_add(
+                        status_text
+                            .chars()
+                            .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+                            .sum::<usize>(),
+                    ),
+            ),
         );
         items.push(ListItem::new(Line::from(Span::styled(
-            format!("{indent}{arrow}{marker} {title}"),
+            format!("{indent}{arrow}{marker} {title}{status_text}"),
             style,
         ))));
     }
@@ -1841,7 +1864,136 @@ fn settings_rows() -> Vec<SettingsRow> {
 
 const SETTINGS_LABEL_COLUMNS: usize = 12;
 
-fn draw_settings(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, theme: &UiTheme) {
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, settings: &SettingsState, theme: &UiTheme) {
+    match settings {
+        SettingsState::List(list) => draw_provider_list(frame, area, list, theme),
+        SettingsState::Templates(templates) => {
+            draw_provider_templates(frame, area, templates, theme)
+        }
+        SettingsState::Form(form) => draw_provider_form(frame, area, form, theme),
+    }
+}
+
+fn draw_provider_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    list: &crate::settings::ProviderList,
+    theme: &UiTheme,
+) {
+    let popup = centered_rect(78, 20, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "  已连接的供应商",
+            theme.strong(VisualRole::Accent),
+        )),
+        Line::default(),
+    ];
+    for (index, provider) in list.providers.iter().enumerate() {
+        let selected = index == list.selected;
+        let current = if provider.preset == list.active {
+            " 当前"
+        } else {
+            ""
+        };
+        let status = if list.connected.contains(&provider.preset) {
+            "已连接"
+        } else {
+            "未配置密钥"
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} {:<20} {:<26} {status}{current}",
+                if selected { "›" } else { " " },
+                provider.preset.label(),
+                provider.model
+            ),
+            if selected {
+                theme.selected
+            } else {
+                theme.style(VisualRole::Primary)
+            },
+        )));
+    }
+    let selected = list.selected == list.providers.len();
+    lines.extend([
+        Line::default(),
+        Line::from(Span::styled(
+            format!("  {} 添加供应商", if selected { "›" } else { " " }),
+            if selected {
+                theme.selected
+            } else {
+                theme.strong(VisualRole::Success)
+            },
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "  ↑/↓ 选择  Enter 编辑或添加  Esc 关闭",
+            theme.style(VisualRole::Muted),
+        )),
+    ]);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" 供应商连接 ")
+                .borders(Borders::ALL)
+                .border_style(theme.focus_border),
+        ),
+        popup,
+    );
+}
+
+fn draw_provider_templates(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    templates: &crate::settings::TemplateList,
+    theme: &UiTheme,
+) {
+    let popup = centered_rect(68, 18, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "  选择供应商模板",
+            theme.strong(VisualRole::Accent),
+        )),
+        Line::default(),
+    ];
+    if templates.presets.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  所有供应商模板均已添加",
+            theme.style(VisualRole::Muted),
+        )));
+    }
+    for (index, preset) in templates.presets.iter().enumerate() {
+        let selected = index == templates.selected;
+        lines.push(Line::from(Span::styled(
+            format!("  {} {}", if selected { "›" } else { " " }, preset.label()),
+            if selected {
+                theme.selected
+            } else {
+                theme.style(VisualRole::Primary)
+            },
+        )));
+    }
+    lines.extend([
+        Line::default(),
+        Line::from(Span::styled(
+            "  ↑/↓ 选择  Enter 继续  Esc 返回",
+            theme.style(VisualRole::Muted),
+        )),
+    ]);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" 添加供应商 ")
+                .borders(Borders::ALL)
+                .border_style(theme.focus_border),
+        ),
+        popup,
+    );
+}
+
+fn draw_provider_form(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, theme: &UiTheme) {
     let popup = centered_rect(88, 22, area);
     let inner = Block::bordered().inner(popup);
     let footer_rows = 2usize;
@@ -1911,14 +2063,15 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, theme: 
         Span::styled("  ↑/↓ 选择  ", theme.strong(VisualRole::Success)),
         Span::styled("←/→ 修改  ", theme.strong(VisualRole::Success)),
         Span::styled("Enter 保存  ", theme.strong(VisualRole::Success)),
-        Span::styled("Esc 取消", theme.strong(VisualRole::Success)),
+        Span::styled("Ctrl+D 移除  ", theme.strong(VisualRole::Success)),
+        Span::styled("Esc 返回", theme.strong(VisualRole::Success)),
     ]));
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" 提供商设置 ")
+                    .title(format!(" 编辑 {} ", form.provider.preset.label()))
                     .borders(Borders::ALL)
                     .border_style(theme.focus_border),
             )

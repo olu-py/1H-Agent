@@ -6,23 +6,28 @@ use std::{
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{
     config::{
-        NativeWebSearch, ProviderConfig, ProviderKind, ProviderPreset, ThinkingCapability,
-        thinking_profile,
+        AgentConfig, ClusterConfig, NativeWebSearch, ProviderConfig, ProviderKind, ProviderPreset,
+        ThinkingCapability, thinking_profile,
     },
     prompt,
     provider::{
         ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ThinkingMode, ToolCall,
         ToolDefinition, Usage,
     },
+    secrets,
     security::PolicyDecision,
+    session::trim_conversation_bounded,
     storage::Storage,
     tools::SharedToolRegistry,
 };
+
+pub(crate) type ChildProviderResolver =
+    dyn Fn(ProviderPreset) -> Result<ProviderConfig, String> + Send + Sync;
 
 /// Upper bound for a single persisted thinking summary. Matches the UI's live
 /// thinking buffer limit so the stored summary and the displayed summary stay
@@ -58,6 +63,156 @@ fn append_text_bounded(buffer: &mut String, delta: &str, max_bytes: usize) {
         end -= 1;
     }
     buffer.push_str(&delta[..end]);
+}
+
+/// Tools a child agent may ever receive. This is intentionally smaller than the
+/// role-based filter: no terminal, shell, git mutation, browser, MCP, spawn, or
+/// delete tools are ever delegated to a child.
+fn child_tool_name_allowed(tool: &str, role: Option<&str>, allowed_tools: &[String]) -> bool {
+    const READ_TOOLS: &[&str] = &[
+        "file_list",
+        "file_stat",
+        "file_read",
+        "file_search",
+        "web_search",
+        "web_fetch",
+        "git_diff",
+    ];
+    const WRITE_TOOLS: &[&str] = &["file_write", "file_mkdir", "file_copy", "file_move"];
+
+    if READ_TOOLS.contains(&tool) {
+        return true;
+    }
+    if !allowed_tools.is_empty() {
+        return WRITE_TOOLS.contains(&tool) && allowed_tools.iter().any(|name| name == tool);
+    }
+    WRITE_TOOLS.contains(&tool) && is_implement_role(role)
+}
+
+/// Truncates `value` to at most `max_bytes` at a UTF-8 character boundary,
+/// appending a marker when bytes were dropped.
+fn truncate_utf8_bounded(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[child output truncated]", &value[..end])
+}
+
+/// Maps a model id prefix to its canonical provider preset. Used both to infer
+/// an omitted `provider` in `agent_spawn` and to catch an explicit provider
+/// that contradicts the requested model (for example `provider=qwen` with
+/// `model=deepseek-v4-flash`).
+fn model_prefix_preset(model: &str) -> Option<ProviderPreset> {
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("deepseek") {
+        Some(ProviderPreset::DeepSeek)
+    } else if model.starts_with("qwen") {
+        Some(ProviderPreset::Qwen)
+    } else if model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+    {
+        Some(ProviderPreset::OpenAi)
+    } else if model.starts_with("doubao") || model.starts_with("glm") {
+        Some(ProviderPreset::Volcano)
+    } else {
+        None
+    }
+}
+
+/// Chooses the child provider when `agent_spawn` omits the `provider`
+/// argument. Current provider wins when it already lists the model; otherwise
+/// an explicit family prefix (deepseek/qwen/gpt/o*/doubao/glm) infers the
+/// matching provider, and finally any preset whose selectable list contains
+/// the model is tried.
+fn infer_child_provider(model: &str, current: ProviderPreset) -> ProviderPreset {
+    if current == ProviderPreset::Custom {
+        return current;
+    }
+    let model = model.trim().to_ascii_lowercase();
+    if current.selectable_models().contains(&model.as_str()) {
+        return current;
+    }
+    if let Some(preset) = model_prefix_preset(&model) {
+        return preset;
+    }
+    for preset in ProviderPreset::ALL {
+        if preset != current && preset.selectable_models().contains(&model.as_str()) {
+            return preset;
+        }
+    }
+    current
+}
+
+/// Validates a child model id without rejecting new provider models that are
+/// absent from the built-in picker list (for example `qwen3.5-flash`). It only
+/// rejects empty ids, obvious shorthands such as `v4pro`, and explicit
+/// provider/model prefix contradictions.
+fn validate_child_model(provider_config: &ProviderConfig) -> Result<(), String> {
+    let model = provider_config.model.trim();
+    if model.is_empty() {
+        return Err("child agent model must not be empty".into());
+    }
+    if provider_config.preset == ProviderPreset::Custom {
+        return Ok(());
+    }
+    let normalized = model.to_ascii_lowercase();
+    let selectable = provider_config.preset.selectable_models();
+    if selectable.contains(&normalized.as_str()) {
+        return Ok(());
+    }
+    if let Some(prefix_preset) = model_prefix_preset(&normalized)
+        && prefix_preset != provider_config.preset
+    {
+        return Err(format!(
+            "model \"{model}\" belongs to {}; set provider={} or omit provider to infer it",
+            prefix_preset.label(),
+            prefix_preset.key_id()
+        ));
+    }
+    let looks_like_full_id =
+        normalized.contains('-') || normalized.contains('.') || normalized.contains(':');
+    if !looks_like_full_id {
+        return Err(format!(
+            "unknown model \"{model}\" for {}; use a full model name such as {}",
+            provider_config.preset.label(),
+            selectable.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn child_title(
+    arguments: &ChildArgs,
+    configured_agent: Option<&AgentConfig>,
+    role: Option<&str>,
+) -> String {
+    if let Some(title) = arguments
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        return title.chars().take(80).collect();
+    }
+    if let Some(agent) = configured_agent {
+        return agent.name.clone();
+    }
+    if let Some(role) = role.map(str::trim).filter(|r| !r.is_empty()) {
+        let prompt = arguments.prompt.trim();
+        let suffix = if prompt.chars().count() > 18 {
+            prompt.chars().take(18).collect::<String>() + "…"
+        } else {
+            prompt.to_owned()
+        };
+        return format!("{role}·{suffix}");
+    }
+    "子 Agent".into()
 }
 
 /// Whether a child role implies write access. Planning/review roles stay
@@ -109,6 +264,27 @@ fn summarize_child_trail(items: &[ConversationItem], max_items: usize, max_bytes
     summary
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildSessionStatus {
+    Running,
+    WaitingApproval,
+    Completed,
+    Failed,
+    TurnLimit,
+}
+
+impl ChildSessionStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "运行中",
+            Self::WaitingApproval => "等待审批",
+            Self::Completed => "完成",
+            Self::Failed => "失败",
+            Self::TurnLimit => "达到轮次上限",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AgentEvent {
     ReasoningDelta(String),
@@ -142,6 +318,10 @@ pub enum AgentEvent {
     },
     Failed(String),
     SessionsChanged,
+    ChildSessionStatus {
+        session_id: String,
+        status: ChildSessionStatus,
+    },
     LocalCommandFinished {
         command: String,
         result: String,
@@ -156,6 +336,10 @@ pub struct AgentRunner {
     storage: Storage,
     session_id: String,
     approval_lock: Arc<Mutex<()>>,
+    child_role: Option<String>,
+    cluster: ClusterConfig,
+    configured_agents: Arc<Vec<AgentConfig>>,
+    child_provider_resolver: Option<Arc<ChildProviderResolver>>,
 }
 
 #[derive(Default)]
@@ -342,7 +526,106 @@ impl AgentRunner {
             storage,
             session_id,
             approval_lock: Arc::new(Mutex::new(())),
+            child_role: None,
+            cluster: ClusterConfig::default(),
+            configured_agents: Arc::new(Vec::new()),
+            child_provider_resolver: None,
         }
+    }
+
+    pub fn with_cluster_config(mut self, cluster: ClusterConfig) -> Self {
+        self.cluster = cluster;
+        self
+    }
+
+    pub fn with_configured_agents(mut self, agents: Vec<AgentConfig>) -> Self {
+        self.configured_agents = Arc::new(agents);
+        self
+    }
+
+    pub fn with_child_role(mut self, child_role: Option<String>) -> Self {
+        self.child_role = child_role;
+        self
+    }
+
+    pub fn with_child_provider_resolver(mut self, resolver: Arc<ChildProviderResolver>) -> Self {
+        self.child_provider_resolver = Some(resolver);
+        self
+    }
+
+    fn tools_for_request(&self) -> Vec<ToolDefinition> {
+        match &self.child_role {
+            Some(role) => self
+                .tools
+                .definitions()
+                .into_iter()
+                .filter(|tool| child_tool_name_allowed(&tool.name, Some(role), &[]))
+                .collect(),
+            None => self.tools.definitions(),
+        }
+    }
+
+    fn child_tool_definitions(
+        &self,
+        role: Option<&str>,
+        allowed_tools: &[String],
+    ) -> Vec<ToolDefinition> {
+        self.tools
+            .definitions()
+            .into_iter()
+            .filter(|tool| child_tool_name_allowed(&tool.name, role, allowed_tools))
+            .collect()
+    }
+
+    fn configured_agent(&self, name: &str) -> Option<AgentConfig> {
+        self.configured_agents
+            .iter()
+            .find(|agent| agent.name == name)
+            .cloned()
+    }
+
+    fn resolve_child_provider(
+        &self,
+        requested_preset: Option<ProviderPreset>,
+        requested_model: Option<&str>,
+    ) -> Result<(OpenAiClient, ProviderConfig), String> {
+        let model = requested_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        let preset = match requested_preset {
+            Some(preset) => preset,
+            None => match &model {
+                Some(model) => infer_child_provider(model, self.provider_config.preset),
+                None => self.provider_config.preset,
+            },
+        };
+        let (provider, mut provider_config) = if preset == self.provider_config.preset {
+            (self.provider.clone(), self.provider_config.clone())
+        } else {
+            let resolver = self.child_provider_resolver.as_ref().ok_or_else(|| {
+                format!(
+                    "cross-provider child agents are not configured; use {} models only",
+                    self.provider_config.preset.label()
+                )
+            })?;
+            let mut provider_config = resolver(preset)?;
+            provider_config
+                .validate()
+                .map_err(|error| format!("invalid child provider configuration: {error}"))?;
+            provider_config.normalize_thinking();
+            let api_key = secrets::api_key_cached(preset).map_err(|error| error.to_string())?;
+            let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key)
+                .map_err(|error| error.to_string())?;
+            (provider, provider_config)
+        };
+        if let Some(model) = model {
+            provider_config.model = model;
+        }
+        validate_child_model(&provider_config)?;
+        provider_config.normalize_thinking();
+        provider_config.use_previous_response_id = false;
+        Ok((provider, provider_config))
     }
 
     pub async fn run(&self, mut items: Vec<ConversationItem>, ui_events: mpsc::Sender<AgentEvent>) {
@@ -399,10 +682,13 @@ impl AgentRunner {
                     0,
                     ConversationItem::Message {
                         role: Role::System,
-                        content: prompt::system_prompt(
-                            self.provider_config.preset,
-                            self.tools.mode(),
-                        ),
+                        content: match &self.child_role {
+                            Some(role) => prompt::child_system_prompt(Some(role), &[]),
+                            None => prompt::system_prompt(
+                                self.provider_config.preset,
+                                self.tools.mode(),
+                            ),
+                        },
                     },
                 );
             }
@@ -410,7 +696,7 @@ impl AgentRunner {
                 kind: self.provider_config.kind,
                 model: self.provider_config.model.clone(),
                 items: request_items,
-                tools: self.tools.definitions(),
+                tools: self.tools_for_request(),
                 previous_response_id: previous_response_id.clone(),
                 native_web_search,
                 thinking_mode: thinking_mode_for(&self.provider_config),
@@ -592,6 +878,18 @@ impl AgentRunner {
                         .map_err(|error| error.to_string())?;
                     continue;
                 }
+                if let Some(role) = &self.child_role
+                    && !child_tool_name_allowed(&call.name, Some(role), &[])
+                {
+                    let result =
+                        format!("denied by policy: child role does not allow {}", call.name);
+                    self.storage
+                        .begin_tool(&self.session_id, &call, "denied")
+                        .map_err(|error| error.to_string())?;
+                    self.complete_tool(&call, &result, ui_events, items, &mut executed_tool_calls)
+                        .await?;
+                    continue;
+                }
                 let decision = self.tools.policy(&call);
                 let approved = match decision {
                     PolicyDecision::Allow => true,
@@ -733,18 +1031,35 @@ impl AgentRunner {
     /// children cannot interleave approval prompts).
     async fn execute_child_tool(
         &self,
+        child_id: &str,
         call: &ToolCall,
         ui_events: &mpsc::Sender<AgentEvent>,
     ) -> String {
         match self.tools.policy(call) {
-            PolicyDecision::Allow => self
-                .tools
-                .execute(call)
-                .await
-                .unwrap_or_else(|error| error.to_string()),
-            PolicyDecision::Deny(reason) => format!("denied by policy: {reason}"),
+            PolicyDecision::Allow => {
+                let _ = self.storage.begin_tool(child_id, call, "allowed");
+                let result = self
+                    .tools
+                    .execute(call)
+                    .await
+                    .unwrap_or_else(|error| error.to_string());
+                let _ = self.storage.finish_tool(&call.id, &result);
+                result
+            }
+            PolicyDecision::Deny(reason) => {
+                let result = format!("denied by policy: {reason}");
+                let _ = self.storage.begin_tool(child_id, call, "denied");
+                let _ = self.storage.finish_tool(&call.id, &result);
+                result
+            }
             PolicyDecision::RequireApproval(reason) => {
                 let _guard = self.approval_lock.lock().await;
+                let _ = ui_events
+                    .send(AgentEvent::ChildSessionStatus {
+                        session_id: child_id.to_owned(),
+                        status: ChildSessionStatus::WaitingApproval,
+                    })
+                    .await;
                 let (reply, answer) = oneshot::channel();
                 if ui_events
                     .send(AgentEvent::Approval {
@@ -757,15 +1072,31 @@ impl AgentRunner {
                 {
                     return "approval channel closed".into();
                 }
-                match answer.await {
-                    Ok(true) => self
-                        .tools
+                let approved = match answer.await {
+                    Ok(approved) => approved,
+                    Err(_) => return "approval cancelled".into(),
+                };
+                let _ = self.storage.begin_tool(
+                    child_id,
+                    call,
+                    if approved { "approved" } else { "rejected" },
+                );
+                let result = if approved {
+                    self.tools
                         .execute(call)
                         .await
-                        .unwrap_or_else(|error| error.to_string()),
-                    Ok(false) => "rejected by user".into(),
-                    Err(_) => "approval cancelled".into(),
-                }
+                        .unwrap_or_else(|error| error.to_string())
+                } else {
+                    "rejected by user".to_owned()
+                };
+                let _ = self.storage.finish_tool(&call.id, &result);
+                let _ = ui_events
+                    .send(AgentEvent::ChildSessionStatus {
+                        session_id: child_id.to_owned(),
+                        status: ChildSessionStatus::Running,
+                    })
+                    .await;
+                result
             }
         }
     }
@@ -780,49 +1111,73 @@ impl AgentRunner {
         if arguments.prompt.trim().is_empty() {
             return Err("child agent prompt must not be empty".into());
         }
-        let mut provider_config = self.provider_config.clone();
-        let max_turns = arguments.max_turns.unwrap_or(3).clamp(1, 8);
-        if let Some(model) = arguments
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            provider_config.model = model.to_owned();
-        }
-        // Reject shorthand/invalid model names up front so the orchestrator can
-        // correct itself instead of surfacing a raw provider HTTP 400.
-        let selectable = provider_config.preset.selectable_models();
-        if !selectable.is_empty() && !selectable.contains(&provider_config.model.as_str()) {
-            return Err(format!(
-                "unknown model \"{}\" for {}; use a full model name such as {}",
-                provider_config.model,
-                provider_config.preset.label(),
-                selectable.join(", ")
-            ));
-        }
-        provider_config.use_previous_response_id = false;
+        let configured_agent = match arguments.agent.as_deref().map(str::trim) {
+            Some("") | None => None,
+            Some(name) => match self.configured_agent(name) {
+                Some(agent) => Some(agent),
+                None => return Err(format!("unknown configured agent \"{name}\"")),
+            },
+        };
+        let role = arguments
+            .role
+            .clone()
+            .or_else(|| configured_agent.as_ref().map(|agent| agent.name.clone()));
+        let allowed_tools = configured_agent
+            .as_ref()
+            .map(|agent| agent.allowed_tools.clone())
+            .unwrap_or_default();
+        let role = match role {
+            Some(role) => Some(role),
+            None if allowed_tools.iter().any(|tool| {
+                tool == "file_write"
+                    || tool == "file_mkdir"
+                    || tool == "file_copy"
+                    || tool == "file_move"
+            }) =>
+            {
+                Some("implement".to_owned())
+            }
+            None => None,
+        };
+        let max_turns = arguments
+            .max_turns
+            .or_else(|| configured_agent.as_ref().map(|agent| agent.max_turns))
+            .unwrap_or(3)
+            .clamp(1, 8);
+
+        let requested_preset = match arguments.provider.as_deref().map(str::trim) {
+            Some("") | None => None,
+            Some(name) => Some(
+                ProviderPreset::parse(name)
+                    .ok_or_else(|| format!("unknown provider preset \"{name}\" for agent_spawn"))?,
+            ),
+        };
+        let (provider, provider_config) =
+            self.resolve_child_provider(requested_preset, arguments.model.as_deref())?;
 
         // Create a nested session so the child's work is inspectable from the
-        // session panel, using its own model when one was requested.
+        // session panel, using its own provider/model when one was requested.
         let workspace = self
             .storage
             .session_workspace(&self.session_id)
             .map_err(|error| error.to_string())?;
-        let title = arguments
-            .title
-            .as_deref()
-            .or(arguments.role.as_deref())
-            .unwrap_or("子 Agent")
-            .to_owned();
+        let title = child_title(&arguments, configured_agent.as_ref(), role.as_deref());
+        let child_mode = if is_implement_role(role.as_deref()) {
+            "build"
+        } else {
+            "explore"
+        };
+        let child_role = role.as_deref().unwrap_or("");
         let child_id = self
             .storage
             .create_child_session(
                 Path::new(&workspace),
                 &self.session_id,
-                self.provider_config.preset.key_id(),
+                provider_config.preset.key_id(),
                 &provider_config.model,
                 &title,
+                child_mode,
+                child_role,
             )
             .map_err(|error| error.to_string())?;
         self.storage
@@ -831,102 +1186,94 @@ impl AgentRunner {
         // Let the UI refresh the session tree as soon as the child exists,
         // rather than waiting for the whole turn to complete.
         let _ = ui_events.send(AgentEvent::SessionsChanged).await;
-
-        let tools: Vec<ToolDefinition> = self
-            .tools
-            .definitions()
-            .into_iter()
-            .filter(|tool| {
-                matches!(
-                    tool.name.as_str(),
-                    "file_list"
-                        | "file_stat"
-                        | "file_read"
-                        | "file_search"
-                        | "web_search"
-                        | "web_fetch"
-                        | "git_diff"
-                        | "file_write"
-                        | "file_mkdir"
-                        | "file_copy"
-                        | "file_move"
-                ) && (is_implement_role(arguments.role.as_deref())
-                    || !matches!(
-                        tool.name.as_str(),
-                        "file_write" | "file_mkdir" | "file_copy" | "file_move"
-                    ))
+        let _ = ui_events
+            .send(AgentEvent::ChildSessionStatus {
+                session_id: child_id.clone(),
+                status: ChildSessionStatus::Running,
             })
-            .collect();
+            .await;
+
+        let tools = self.child_tool_definitions(role.as_deref(), &allowed_tools);
+        let mut child_system = prompt::child_system_prompt(role.as_deref(), &allowed_tools);
+        if let Some(agent) = &configured_agent
+            && !agent.system_prompt.trim().is_empty()
+        {
+            child_system.push_str("\n\nADDITIONAL AGENT INSTRUCTIONS\n");
+            child_system.push_str(agent.system_prompt.trim());
+        }
+
+        // Multi-turn loop: execute the child's role-filtered tools, keep its
+        // context bounded, and return only the final deliverable.
         let thinking_profile_kind =
             thinking_profile(provider_config.preset, &provider_config.model).kind;
         let native_web_search = provider_config.preset == ProviderPreset::DeepSeek
             && provider_config.kind == ProviderKind::Responses
             && provider_config.native_web_search != NativeWebSearch::Disabled;
+        let child_max_output_bytes = self.cluster.child_max_output_bytes;
 
-        // Multi-turn loop: unlike before, actually execute the read-only tools
-        // the child requests, so file-reading subtasks no longer return empty.
         let mut items = vec![ConversationItem::Message {
             role: Role::User,
             content: arguments.prompt.clone(),
         }];
-        let mut full_output = String::new();
+        let mut final_answer = String::new();
         let mut tool_call_count = 0usize;
         let mut remaining_turns = max_turns;
+        let mut failure: Option<String> = None;
+        let mut status = ChildSessionStatus::Completed;
         loop {
             if remaining_turns == 0 {
+                status = ChildSessionStatus::TurnLimit;
                 let trail = summarize_child_trail(&items, 3, 512);
-                full_output.push_str(&format!("\n[child agent reached its turn limit]{trail}"));
+                append_text_bounded(
+                    &mut final_answer,
+                    &format!("\n[child agent reached its turn limit]{trail}"),
+                    child_max_output_bytes,
+                );
                 break;
             }
             remaining_turns -= 1;
 
+            let mut request_items = vec![ConversationItem::Message {
+                role: Role::System,
+                content: child_system.clone(),
+            }];
+            request_items.extend(items.clone());
             let request = ModelRequest {
                 kind: provider_config.kind,
                 model: provider_config.model.clone(),
-                items: items.clone(),
+                items: request_items,
                 tools: tools.clone(),
                 previous_response_id: None,
                 native_web_search,
-                thinking_mode: ThinkingMode::Disabled,
+                thinking_mode: thinking_mode_for(&provider_config),
                 thinking_level: provider_config.thinking_level,
                 thinking_budget_tokens: provider_config.thinking_budget_tokens,
                 thinking_profile_kind,
             };
-            let mut collector = StreamCollector::new(Some(256 * 1024));
-            match stream_once(
-                &self.provider,
-                request,
-                &mut collector,
-                512,
-                ui_events,
-                |_| Ok(Forwarded::Ignore),
-            )
+            let mut collector = StreamCollector::new(Some(child_max_output_bytes));
+            match stream_once(&provider, request, &mut collector, 512, ui_events, |_| {
+                Ok(Forwarded::Ignore)
+            })
             .await
             {
                 Ok(()) => {}
                 Err(StreamFailure::Provider(error)) => {
-                    append_text_bounded(
-                        &mut full_output,
-                        &format!("\n[child failed: {error}]"),
-                        256 * 1024,
-                    );
+                    status = ChildSessionStatus::Failed;
+                    failure = Some(error);
                     break;
                 }
                 Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
                     return Err(error);
                 }
                 Err(StreamFailure::EndedWithoutCompletion) => {
-                    append_text_bounded(
-                        &mut full_output,
-                        "\n[child stream ended without completion]",
-                        256 * 1024,
-                    );
+                    status = ChildSessionStatus::Failed;
+                    failure = Some("child stream ended without completion".into());
                     break;
                 }
             }
-            append_text_bounded(&mut full_output, &collector.assistant_text, 256 * 1024);
             collector.finish_partials("child tool")?;
             if collector.completed_calls.is_empty() {
+                final_answer = collector.assistant_text.clone();
                 break;
             }
 
@@ -944,7 +1291,11 @@ impl AgentRunner {
                 .map_err(|error| error.to_string())?;
             for tool_call in std::mem::take(&mut collector.completed_calls) {
                 tool_call_count += 1;
-                let result = self.execute_child_tool(&tool_call, ui_events).await;
+                let result = self
+                    .execute_child_tool(&child_id, &tool_call, ui_events)
+                    .await;
+                let result =
+                    truncate_utf8_bounded(&result, self.cluster.child_max_tool_output_bytes);
                 self.storage
                     .append_tool_output(&child_id, &tool_call.id, &result)
                     .map_err(|error| error.to_string())?;
@@ -952,22 +1303,47 @@ impl AgentRunner {
                     call_id: tool_call.id.clone(),
                     output: result,
                 });
+                trim_conversation_bounded(
+                    &mut items,
+                    self.cluster.child_max_context_items,
+                    self.cluster.child_max_context_bytes,
+                );
             }
         }
 
-        if full_output.trim().is_empty() {
+        if let Some(error) = failure {
+            append_text_bounded(
+                &mut final_answer,
+                &format!("\n[child failed: {error}]"),
+                child_max_output_bytes,
+            );
+        }
+        if final_answer.trim().is_empty() {
             if tool_call_count > 0 {
-                full_output.push_str(&format!(
+                final_answer.push_str(&format!(
                     "[child agent issued {tool_call_count} tool call(s) but returned no text]"
                 ));
             } else {
-                full_output.push_str("[child agent returned no text]");
+                final_answer.push_str("[child agent returned no text]");
             }
         }
+        let final_answer = truncate_utf8_bounded(&final_answer, child_max_output_bytes);
         self.storage
-            .append_message(&child_id, Role::Assistant, &full_output)
+            .append_message(&child_id, Role::Assistant, &final_answer)
             .map_err(|error| error.to_string())?;
-        Ok(full_output)
+        let _ = ui_events
+            .send(AgentEvent::ChildSessionStatus {
+                session_id: child_id.clone(),
+                status,
+            })
+            .await;
+        Ok(serde_json::to_string(&json!({
+            "session_id": child_id,
+            "title": title,
+            "status": status.label(),
+            "output": final_answer,
+        }))
+        .unwrap_or_else(|_| final_answer.clone()))
     }
 }
 
@@ -1074,6 +1450,8 @@ struct ChildArgs {
     max_turns: Option<usize>,
     role: Option<String>,
     model: Option<String>,
+    provider: Option<String>,
+    agent: Option<String>,
     title: Option<String>,
 }
 
@@ -1331,18 +1709,176 @@ mod tests {
         };
         let (ui_events, _receiver) = mpsc::channel(16);
         let result = runner.run_child(&call, &ui_events).await.unwrap();
-        assert_eq!(result, "child result");
+        let payload: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(payload["status"], "完成");
+        assert_eq!(payload["output"], "child result");
+        assert_eq!(payload["title"], "plan·do the plan");
 
         let sessions = storage.list_sessions(temp.path()).unwrap();
         assert_eq!(sessions.len(), 2);
         let child = sessions.iter().find(|s| s.id != session_id).unwrap();
         assert_eq!(child.parent_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(child.title, "plan");
+        assert_eq!(child.title, "plan·do the plan");
         assert_eq!(
             storage.session_provider_model(&child.id).unwrap().1,
             "gpt-5"
         );
         assert_eq!(storage.load_messages(&child.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn child_tool_filter_never_grants_terminal_or_spawn() {
+        assert!(child_tool_name_allowed("file_read", Some("plan"), &[]));
+        assert!(child_tool_name_allowed(
+            "file_write",
+            Some("implement"),
+            &[]
+        ));
+        assert!(!child_tool_name_allowed("file_write", Some("plan"), &[]));
+        assert!(!child_tool_name_allowed(
+            "terminal_exec",
+            Some("implement"),
+            &[]
+        ));
+        assert!(!child_tool_name_allowed(
+            "agent_spawn",
+            Some("implement"),
+            &[]
+        ));
+        assert!(!child_tool_name_allowed(
+            "file_delete",
+            Some("implement"),
+            &[]
+        ));
+        assert!(child_tool_name_allowed(
+            "file_read",
+            None,
+            &["file_read".into()]
+        ));
+    }
+
+    #[test]
+    fn child_provider_is_inferred_from_model_prefix() {
+        assert_eq!(
+            infer_child_provider("deepseek-v4-flash", ProviderPreset::Qwen),
+            ProviderPreset::DeepSeek
+        );
+        assert_eq!(
+            infer_child_provider("qwen3.5-flash", ProviderPreset::DeepSeek),
+            ProviderPreset::Qwen
+        );
+        assert_eq!(
+            infer_child_provider("gpt-5-mini", ProviderPreset::DeepSeek),
+            ProviderPreset::OpenAi
+        );
+        // A provider that already hosts the model keeps it.
+        assert_eq!(
+            infer_child_provider("deepseek-v4-flash", ProviderPreset::Volcano),
+            ProviderPreset::Volcano
+        );
+        assert_eq!(
+            infer_child_provider("deepseek-v4-flash", ProviderPreset::DeepSeek),
+            ProviderPreset::DeepSeek
+        );
+    }
+
+    #[test]
+    fn child_model_validation_allows_unknown_full_ids_and_catches_mismatches() {
+        let mut qwen = ProviderPreset::Qwen.defaults();
+        qwen.model = "qwen3.5-flash".into();
+        assert!(validate_child_model(&qwen).is_ok());
+
+        let mut qwen_wrong = ProviderPreset::Qwen.defaults();
+        qwen_wrong.model = "deepseek-v4-flash".into();
+        let error = validate_child_model(&qwen_wrong).unwrap_err();
+        assert!(error.contains("belongs to DeepSeek"));
+        assert!(error.contains("provider=deepseek"));
+
+        let mut openai_shorthand = ProviderPreset::OpenAi.defaults();
+        openai_shorthand.model = "v4pro".into();
+        assert!(validate_child_model(&openai_shorthand).is_err());
+    }
+
+    #[test]
+    fn child_title_prefers_explicit_then_role_with_prompt_snippet() {
+        let arguments = ChildArgs {
+            prompt: "review the database schema carefully".into(),
+            max_turns: None,
+            role: Some("reviewer".into()),
+            model: None,
+            provider: None,
+            agent: None,
+            title: None,
+        };
+        assert_eq!(
+            child_title(&arguments, None, Some("reviewer")),
+            "reviewer·review the databas…"
+        );
+
+        let arguments = ChildArgs {
+            title: Some("自定义标题".into()),
+            ..arguments
+        };
+        assert_eq!(
+            child_title(&arguments, None, Some("reviewer")),
+            "自定义标题"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_agent_uses_configured_agent_template() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "parent")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![vec![
+            ModelEvent::TextDelta("review done".into()),
+            ModelEvent::Done,
+        ]])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::OpenAi.defaults(),
+            tools,
+            storage.clone(),
+            session_id.clone(),
+        )
+        .with_configured_agents(vec![AgentConfig {
+            name: "reviewer".into(),
+            mode: crate::commands::AgentMode::Explore,
+            max_turns: 2,
+            allowed_tools: vec!["file_read".into()],
+            system_prompt: "Review for correctness.".into(),
+        }]);
+
+        let call = ToolCall {
+            id: "call-agent".into(),
+            name: "agent_spawn".into(),
+            arguments: serde_json::json!({"prompt":"review the code","agent":"reviewer"}),
+        };
+        let (ui_events, mut receiver) = mpsc::channel(16);
+        let result = runner.run_child(&call, &ui_events).await.unwrap();
+        let payload: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(payload["status"], "完成");
+        assert_eq!(payload["output"], "review done");
+        assert_eq!(payload["title"], "reviewer");
+
+        let sessions = storage.list_sessions(temp.path()).unwrap();
+        let child = sessions.iter().find(|s| s.id != session_id).unwrap();
+        assert_eq!(storage.session_mode(&child.id).unwrap(), "explore");
+        assert_eq!(
+            storage.session_child_role(&child.id).unwrap().as_deref(),
+            Some("reviewer")
+        );
+        // The child session must be created before the result is returned.
+        assert!(receiver.recv().await.is_some());
     }
 
     #[tokio::test]

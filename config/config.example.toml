@@ -12,6 +12,18 @@ native_web_search = "auto"
 # Optional override for gateways or new models absent from the built-in registry.
 # context_window_tokens = 128000
 
+# Saved provider connections are managed by the Provider settings screen.
+# Each preset may appear once; API keys remain in the OS keyring and are never
+# written here. Older configs with only `[provider]` are migrated on save.
+# [[providers]]
+# preset = "deep_seek"
+# kind = "responses"
+# base_url = "https://api.deepseek.com"
+# model = "deepseek-v4-flash"
+# thinking_level = "high"
+# use_previous_response_id = false
+# native_web_search = "auto"
+
 [ui]
 context_meter = true
 
@@ -23,6 +35,18 @@ context_meter = true
 command_timeout_seconds = 60
 max_tool_output_bytes = 1048576
 max_fetch_bytes = 10485760
+
+# Cluster mode (AI 集群) child-agent budgets. Fan-out fields are reserved and
+# currently unlimited when unset or null; child context/output budgets below
+# are enforced per child agent.
+[cluster]
+# max_parallel_children = 3
+# max_children_per_turn = 8
+# max_children_per_session = 24
+child_max_output_bytes = 262144
+child_max_tool_output_bytes = 131072
+child_max_context_items = 48
+child_max_context_bytes = 524288
 
 [security]
 allow_private_networks = false
@@ -57,6 +81,8 @@ keep_alive_seconds = 30
 # timeout_seconds = 30
 # max_output_bytes = 1048576
 
+# Configured agent templates can be referenced from cluster mode via
+# `agent_spawn(agent = "reviewer", ...)`.
 # [[agents]]
 # name = "reviewer"
 # mode = "explore"

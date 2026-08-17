@@ -1,4 +1,8 @@
-use std::env;
+use std::{
+    collections::HashMap,
+    env,
+    sync::{Mutex, OnceLock},
+};
 
 use thiserror::Error;
 
@@ -6,12 +10,45 @@ use crate::config::ProviderPreset;
 
 const SERVICE: &str = "1h-agent";
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum SecretError {
     #[error("no API key is configured for {0}")]
     Missing(String),
     #[error("system keyring error: {0}")]
     Keyring(String),
+}
+
+type KeyCache = HashMap<ProviderPreset, Result<String, SecretError>>;
+
+fn key_cache() -> &'static Mutex<KeyCache> {
+    static CACHE: OnceLock<Mutex<KeyCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_key(preset: ProviderPreset) -> Option<Result<String, SecretError>> {
+    key_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&preset).cloned())
+}
+
+fn remember_key(preset: ProviderPreset, result: Result<String, SecretError>) {
+    if let Ok(mut cache) = key_cache().lock() {
+        cache.insert(preset, result);
+    }
+}
+
+/// Reads a provider API key at most once per process: environment variables
+/// first, then the OS keyring. The result (including a missing-key error) is
+/// cached so repeated settings opens and cross-provider child agents do not
+/// hit the keyring on every access.
+pub fn api_key_cached(preset: ProviderPreset) -> Result<String, SecretError> {
+    if let Some(cached) = cached_key(preset) {
+        return cached;
+    }
+    let result = api_key(preset);
+    remember_key(preset, result.clone());
+    result
 }
 
 pub fn api_key(preset: ProviderPreset) -> Result<String, SecretError> {
@@ -50,6 +87,17 @@ pub fn store_api_key(preset: ProviderPreset, api_key: &str) -> Result<(), Secret
         .map_err(|error| SecretError::Keyring(error.to_string()))
 }
 
+/// Stores a key in the OS keyring and keeps it in the process cache for the
+/// rest of this run, even if the keyring write fails (the caller can then show
+/// a "this run only" warning).
+pub fn store_api_key_cached(preset: ProviderPreset, api_key: &str) -> Result<(), SecretError> {
+    let result = store_api_key(preset, api_key);
+    if result.is_ok() || !api_key.trim().is_empty() {
+        remember_key(preset, Ok(api_key.to_owned()));
+    }
+    result
+}
+
 pub fn redact(input: &str) -> String {
     input
         .split_whitespace()
@@ -75,5 +123,23 @@ mod tests {
             "Bearer [REDACTED] end"
         );
         assert_eq!(redact("ordinary text"), "ordinary text");
+    }
+
+    #[test]
+    fn key_cache_stores_success_and_error_results() {
+        remember_key(ProviderPreset::OpenAi, Ok("cached-openai".into()));
+        match cached_key(ProviderPreset::OpenAi) {
+            Some(Ok(key)) => assert_eq!(key, "cached-openai"),
+            other => panic!("expected cached key, got {other:?}"),
+        }
+
+        remember_key(
+            ProviderPreset::DeepSeek,
+            Err(SecretError::Missing("DeepSeek".into())),
+        );
+        assert!(matches!(
+            cached_key(ProviderPreset::DeepSeek),
+            Some(Err(SecretError::Missing(_)))
+        ));
     }
 }
