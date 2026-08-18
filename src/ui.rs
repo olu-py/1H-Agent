@@ -25,6 +25,7 @@ use crate::{
         ToolDisplayStatus,
     },
     commands::{self, AgentMode},
+    input::input_cursor_viewport,
     output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
     secrets,
     settings::{FIELDS, SettingsField, SettingsForm, SettingsState},
@@ -35,6 +36,9 @@ use crate::{
         FooterLine, InputView, ThinkingControlView, UiSegment, UiViewModel, mode_label,
     },
 };
+
+#[cfg(test)]
+use crate::input::input_viewport;
 
 struct RenderedMessageLines {
     lines: Vec<Line<'static>>,
@@ -1599,10 +1603,9 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App, view: &InputView
         theme.inactive_border
     };
     let inner_width = area.width.saturating_sub(2) as usize;
-    let (visible_input, cursor_column, cursor_row) =
-        input_cursor_viewport(app.input.as_str(), app.input.cursor(), inner_width);
+    let viewport = input_cursor_viewport(app.input.as_str(), app.input.cursor(), inner_width);
     frame.render_widget(
-        Paragraph::new(visible_input).style(style).block(
+        Paragraph::new(viewport.text).style(style).block(
             Block::default()
                 .title(view.title.as_str())
                 .borders(Borders::ALL)
@@ -1611,8 +1614,8 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &mut App, view: &InputView
         area,
     );
     if !app.current.busy && app.settings.is_none() && !app.has_pending_approval() {
-        let cursor_x = area.x + 1 + cursor_column as u16;
-        let cursor_y = area.y + 1 + cursor_row.min(area.height.saturating_sub(3));
+        let cursor_x = area.x + 1 + viewport.cursor_column as u16;
+        let cursor_y = area.y + 1 + viewport.cursor_row.min(area.height.saturating_sub(3));
         frame.set_cursor_position((cursor_x.min(area.right().saturating_sub(1)), cursor_y));
     }
 }
@@ -2164,7 +2167,7 @@ fn draw_provider_list(
         let status = if list.connected.contains(&provider.preset) {
             "已连接"
         } else {
-            "未配置密钥"
+            "密钥未解锁"
         };
         lines.push(Line::from(Span::styled(
             format!(
@@ -2347,7 +2350,7 @@ fn draw_provider_form(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, th
 }
 
 fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState, theme: &UiTheme) {
-    let popup = centered_rect(90, 16, area);
+    let popup = centered_rect(84, 16, area);
     let matches = commands::matches(&palette.query, 10);
     let outer = Block::default()
         .title(" 命令面板 · Ctrl+P / Ctrl+X ")
@@ -2356,7 +2359,12 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
     let inner = outer.inner(popup);
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
     let columns =
-        Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)]).split(rows[1]);
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).split(rows[1]);
+    let label_columns = commands::PALETTE_ITEMS
+        .iter()
+        .map(|item| UnicodeWidthStr::width(item.label))
+        .max()
+        .unwrap_or_default();
     let query = Line::from(vec![
         Span::styled("/", Style::default().fg(Color::Cyan)),
         Span::raw(palette.query.clone()),
@@ -2370,19 +2378,8 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
             theme.style(VisualRole::Primary)
         };
         let item = &commands::PALETTE_ITEMS[item.index];
-        let command = item.command.unwrap_or("直接动作");
-        let shortcut = item
-            .shortcut
-            .map(|shortcut| format!(" · {shortcut}"))
-            .unwrap_or_default();
         lines.push(Line::from(Span::styled(
-            format!(
-                "{} {}  {}{}",
-                if selected { ">" } else { " " },
-                item.label,
-                command,
-                shortcut,
-            ),
+            palette_item_text(item, selected, label_columns),
             style,
         )));
     }
@@ -2431,6 +2428,21 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
             .wrap(Wrap { trim: true }),
         columns[1],
     );
+}
+
+fn palette_item_text(item: &commands::PaletteItem, selected: bool, label_columns: usize) -> String {
+    let label_padding =
+        " ".repeat(label_columns.saturating_sub(UnicodeWidthStr::width(item.label)));
+    let command = item.command.unwrap_or("直接动作");
+    let shortcut = item
+        .shortcut
+        .map(|shortcut| format!(" · {shortcut}"))
+        .unwrap_or_default();
+    format!(
+        "{} {}{label_padding}  {command}{shortcut}",
+        if selected { ">" } else { " " },
+        item.label,
+    )
 }
 
 fn draw_file_suggestions(frame: &mut Frame<'_>, input_area: Rect, app: &App) {
@@ -2724,42 +2736,6 @@ fn wrap_grapheme_lines(value: &str, width: usize) -> Vec<String> {
     output
 }
 
-fn input_viewport(input: &str, inner_width: usize) -> (&str, usize) {
-    let text_capacity = inner_width.saturating_sub(1);
-    let mut visible_width = 0;
-    let mut start = input.len();
-    for (index, character) in input.char_indices().rev() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if visible_width + character_width > text_capacity {
-            break;
-        }
-        visible_width += character_width;
-        start = index;
-    }
-    (&input[start..], visible_width)
-}
-
-fn input_cursor_viewport(input: &str, cursor: usize, inner_width: usize) -> (String, usize, u16) {
-    let cursor = cursor.min(input.len());
-    let line_start = input[..cursor].rfind('\n').map_or(0, |index| index + 1);
-    let line_row = input[..cursor]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count() as u16;
-    let line = &input[line_start..];
-    let (visible_line, column) =
-        input_viewport(&line[..cursor.saturating_sub(line_start)], inner_width);
-    let mut rendered = input[line_start..]
-        .lines()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if rendered.is_empty() {
-        rendered = visible_line.to_owned();
-    }
-    (rendered, column, line_row.min(2))
-}
-
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     let width = area
         .width
@@ -2779,6 +2755,25 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_commands_align_after_mixed_width_labels() {
+        let label_columns = commands::PALETTE_ITEMS
+            .iter()
+            .map(|item| UnicodeWidthStr::width(item.label))
+            .max()
+            .unwrap();
+        let command_columns = commands::PALETTE_ITEMS
+            .iter()
+            .filter(|item| item.command.is_some())
+            .map(|item| {
+                let text = palette_item_text(item, false, label_columns);
+                UnicodeWidthStr::width(&text[..text.find('/').unwrap()])
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(command_columns.len(), 1);
+    }
 
     #[test]
     fn long_visual_line_renders_only_the_visible_style_slices() {

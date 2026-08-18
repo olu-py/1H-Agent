@@ -30,6 +30,8 @@ xattr -d com.apple.quarantine ./1h-agent
 cargo run -- --workspace /path/to/project
 ```
 
+应用每次启动先进入轻量首页。直接输入首条消息并按 `Enter` 会创建新会话并进入主界面；按 `Tab` 可切换到最近会话列表，使用方向键和 `Enter` 恢复会话，也可以直接点击会话标题。首页不会预先创建空会话或加载历史消息。
+
 构建 release 二进制：
 
 ```bash
@@ -39,7 +41,7 @@ cargo build --release
 
 ## 配置 Provider
 
-按 `Ctrl+S` 打开 Provider 设置。首页列出已保存的供应商连接和当前连接；选择“添加供应商”后，可从尚未添加的 OpenAI、DeepSeek、Qwen/Bailian、火山方舟和自定义兼容模板中创建连接。每种模板只能添加一次，选择已有连接可编辑并切换，`Ctrl+D` 可移除连接。非密钥配置保存到 TOML；API Key 仍保存到系统钥匙串，移除连接不会删除密钥。应用启动时会统一读取钥匙串并缓存到当前进程，运行期间切换供应商不再重复请求钥匙串授权。
+进入主界面后按 `Ctrl+S` 打开 Provider 设置。设置页列出已保存的供应商连接和当前连接；选择“添加供应商”后，可从尚未添加的 OpenAI、DeepSeek、Qwen/Bailian、火山方舟和自定义兼容模板中创建连接。每种模板只能添加一次，选择已有连接可编辑并切换，`Ctrl+D` 可移除连接。非密钥配置保存到 TOML；API Key 仍保存到系统钥匙串，移除连接不会删除密钥。应用打开时只解锁当前 Provider 的钥匙串条目一次；其他 Provider 在用户显式切换或编辑时按需解锁一次，随后均使用进程缓存，不会在 Agent 热路径重复请求授权。
 
 | Provider | API Key 环境变量 | 默认模型 |
 | --- | --- | --- |
@@ -62,6 +64,7 @@ native_web_search = "disabled"
 
 | 操作 | 快捷键/语法 |
 | --- | --- |
+| 首页开始 / 恢复会话 | 输入后 `Enter` / `Tab` 后用 `Up`、`Down`、`Enter` / 点击最近会话 |
 | 发送 / 换行 | `Enter` / `Shift+Enter` 或 `Ctrl+J` |
 | 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` / 点击会话行（父会话点击展开/收起子会话） |
 | 切换模式 | 在命令面板选择“切换模式” / `/plan` `/build` `/explore` `/cluster` / 点击输入框标题的模式标签 |

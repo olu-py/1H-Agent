@@ -30,7 +30,7 @@ excluded: Web UI、内置浏览器、远程 MCP、动态插件、图片和语音
 | 启动、全局状态、会话路由 | `src/main.rs`、`src/app.rs`、`src/session.rs` | 无；仅沿目标事件链读取 |
 | Provider、模型、密钥、协议、压缩恢复 | `src/config.rs`、`src/agent.rs`、`src/provider/openai.rs` | [Provider](.agents/guides/provider.md) |
 | 子 Agent、审批、取消、集群停滞 | `src/agent.rs`、`src/app.rs` | [Cluster](.agents/guides/cluster.md) |
-| 渲染、长文本、滚动、鼠标交互 | `src/app.rs`、`src/ui.rs`、`src/output.rs` | [TUI](.agents/guides/tui.md) |
+| 首页、渲染、长文本、滚动、鼠标交互 | `src/home.rs`、`src/app.rs`、`src/ui.rs`、`src/output.rs` | [TUI](.agents/guides/tui.md) |
 | 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | 无；遵守全局安全规则 |
 | 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | 涉及 Provider 状态时再读 Provider |
 | CI、版本、安装包、tag | `.github/workflows/`、`Cargo.toml` | [Release](.agents/guides/release.md) |
@@ -59,8 +59,9 @@ terminal event -> App -> SessionRuntime -> AgentRunner -> OpenAiClient / ToolReg
 | 改动 | 最小验证 |
 | --- | --- |
 | 文档 | `bash scripts/check-agent-docs.sh`、`git diff --check` |
-| 局部 Rust | `cargo fmt --all -- --check` 加目标测试过滤器 |
-| 跨模块/公共行为 | `cargo clippy --all-targets --all-features --locked -- -D warnings`、`cargo test --all-features --locked` |
+| 迭代中 | `cargo test --lib --all-features --locked <filter>`；每次只选一个相关过滤器 |
+| 局部 Rust 完成 | `cargo fmt --all -- --check`、`cargo test --lib --all-features --locked` |
+| 工具/存储/安全/进程或跨模块 | `cargo clippy --all-targets --all-features --locked -- -D warnings`、`cargo test --all-features --locked` |
 | 发布 | 读取 Release 专题并运行其完整验证 |
 
 保持改动聚焦，复用现有 helper，不清理无法证明无用的文件。未运行的检查必须在最终回复说明；不要因 Cargo 锁或冷缓存终止正常构建。

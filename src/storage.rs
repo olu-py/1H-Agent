@@ -269,6 +269,27 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    pub(crate) fn list_recent_sessions(
+        &self,
+        workspace: &Path,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT id, title, parent_id FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![workspace.display().to_string(), limit], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                parent_id: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
     pub fn append_message(
         &self,
         session_id: &str,
@@ -962,6 +983,51 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session);
         assert_eq!(sessions[0].title, "hello");
+    }
+
+    #[test]
+    fn recent_sessions_are_bounded_ordered_and_workspace_scoped() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..7 {
+            let session = storage.create_session(root.path()).unwrap();
+            storage
+                .append_message(&session, Role::User, &format!("session {index}"))
+                .unwrap();
+            storage
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+                    params![session, format!("2026-01-01T00:00:{index:02}Z")],
+                )
+                .unwrap();
+            ids.push(session);
+        }
+        let other_session = storage.create_session(other.path()).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET updated_at = '2099-01-01T00:00:00Z' WHERE id = ?1",
+                [&other_session],
+            )
+            .unwrap();
+        storage.delete_session(&ids[6]).unwrap();
+
+        let recent = storage.list_recent_sessions(root.path(), 5).unwrap();
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent[0].id, ids[5]);
+        assert_eq!(recent[4].id, ids[1]);
+        assert!(recent.iter().all(|session| session.id != other_session));
+        assert!(
+            storage
+                .list_recent_sessions(root.path(), 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

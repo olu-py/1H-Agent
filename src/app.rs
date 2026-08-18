@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::pending,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -30,6 +30,7 @@ use crate::{
     agent::{AgentEvent, AgentRunner, ChildSessionProgress, ChildSessionStatus},
     commands::{self, AgentMode, Command},
     config::{Config, ProviderPreset, ThinkingLevel, ThinkingProfile, thinking_profile},
+    home::{self, HomeAction, HomeSelection, HomeState, RECENT_SESSION_LIMIT},
     input::InputBuffer,
     output::{EdgeScroll, InteractionTarget, OutputSelection},
     provider::{ConversationItem, OpenAiClient, Role, ToolCall, Usage},
@@ -110,14 +111,151 @@ struct RoutedEvent {
     event: AgentEvent,
 }
 
-pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
+pub async fn run(workspace_path: PathBuf, mut config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("cannot create data directory {}", config.data_dir.display()))?;
     let storage = Storage::open(&config.data_dir.join("agent.db"))?;
-    let session_id = match storage.latest_session(&workspace_path)? {
-        Some(session_id) => session_id,
-        None => storage.create_session(&workspace_path)?,
+    // Only the active provider may touch the OS keyring during startup. Each
+    // provider is a separate credential on macOS, so enumerating all presets
+    // can produce one authorization dialog per saved key. Environment-backed
+    // keys are safe to preload without interacting with any platform backend.
+    secrets::preload_environment_keys();
+    let _ = secrets::api_key_cached(config.provider.preset);
+    let recent_sessions = storage.list_recent_sessions(&workspace_path, RECENT_SESSION_LIMIT)?;
+    let mut home = HomeState::new(
+        &workspace_path,
+        config.provider.clone(),
+        config.providers.clone(),
+        recent_sessions,
+    );
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
+    // Best-effort kitty keyboard protocol enhancement. Terminals without
+    // support ignore it and the legacy Windows console API returns
+    // Unsupported, so a failure here must not prevent startup. This makes
+    // Alt+Up/Down arrive as `KeyCode::Up`/`Down` with the ALT modifier set.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    );
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                PopKeyboardEnhancementFlags,
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                DisableBracketedPaste
+            );
+            return Err(error.into());
+        }
     };
+    if let Err(error) = terminal.clear() {
+        let _ = disable_raw_mode();
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        let _ = execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
+        return Err(error.into());
+    }
+
+    let result = async {
+        let action = home_event_loop(&mut terminal, &mut home).await?;
+        if action == HomeAction::Quit {
+            return Ok(());
+        }
+        let selection = matches!(action, HomeAction::StartNew(_)).then(|| home.selection());
+        home.set_loading();
+        terminal.draw(|frame| home::draw(frame, &mut home))?;
+        let Some((session_id, first_prompt)) =
+            resolve_home_action(&storage, &workspace_path, action)?
+        else {
+            return Ok(());
+        };
+        if let Some(selection) = selection {
+            if selection.provider.preset != config.provider.preset {
+                let _ = secrets::api_key_cached(selection.provider.preset);
+            }
+            apply_home_selection(&mut config, &storage, &session_id, selection)?;
+        }
+        drop(home);
+        let mut app = build_app(workspace_path, config, storage, session_id).await?;
+        if let Some(prompt) = first_prompt {
+            app.input.set(prompt);
+            submit_input(&mut app)?;
+        }
+        event_loop(&mut terminal, &mut app).await
+    }
+    .await;
+
+    let raw_mode_result = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let screen_result = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
+    let cursor_result = terminal.show_cursor();
+    result?;
+    raw_mode_result?;
+    screen_result?;
+    cursor_result?;
+    Ok(())
+}
+
+fn apply_home_selection(
+    config: &mut Config,
+    storage: &Storage,
+    session_id: &str,
+    selection: HomeSelection,
+) -> Result<()> {
+    config.provider = selection.provider;
+    config.upsert_provider(config.provider.clone());
+    let _ = config.save();
+    storage.set_session_mode(session_id, selection.mode.as_str())?;
+    Ok(())
+}
+
+fn resolve_home_action(
+    storage: &Storage,
+    workspace: &Path,
+    action: HomeAction,
+) -> Result<Option<(String, Option<String>)>> {
+    match action {
+        HomeAction::StartNew(prompt) => {
+            Ok(Some((storage.create_session(workspace)?, Some(prompt))))
+        }
+        HomeAction::Resume(session_id) => Ok(Some((session_id, None))),
+        HomeAction::Quit => Ok(None),
+    }
+}
+
+async fn build_app(
+    workspace_path: PathBuf,
+    config: Config,
+    storage: Storage,
+    session_id: String,
+) -> Result<App> {
     let sessions = storage.list_sessions(&workspace_path)?;
     let workspace = Workspace::new(&workspace_path)?;
     let registry = Arc::new(ToolRegistry::new(
@@ -130,10 +268,15 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
     let _ = registry.initialize_mcp().await;
     let (router_tx, router_rx) = mpsc::channel(256);
     let approval_lock = Arc::new(Mutex::new(()));
-    // Concentrate all keyring access at startup. Runtime provider switching,
-    // restored sessions, settings, and cross-provider children are cache-only.
-    for preset in ProviderPreset::ALL {
-        let _ = secrets::api_key_cached(preset);
+    // A restored child session may own a different provider. This is an
+    // explicit resume action, so unlock only that one additional credential.
+    if let Some(provider_config) = storage
+        .session_provider_model(&session_id)
+        .ok()
+        .and_then(|(provider_id, model)| session_provider_config(&config, &provider_id, &model))
+        && provider_config.preset != config.provider.preset
+    {
+        let _ = secrets::api_key_cached(provider_config.preset);
     }
     let (active_secret, initial_status) = match secrets::api_key_cached_only(config.provider.preset)
     {
@@ -170,7 +313,7 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         &session_id,
     );
     runtime.status = initial_status;
-    let mut app = App {
+    Ok(App {
         workspace: workspace_path,
         input: InputBuffer::new(),
         context_meter_enabled: config.ui.context_meter,
@@ -212,60 +355,27 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         router_tx,
         router_rx,
         should_quit: false,
-    };
+    })
+}
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    if let Err(error) = execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    ) {
-        let _ = disable_raw_mode();
-        return Err(error.into());
+async fn home_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut HomeState,
+) -> Result<HomeAction> {
+    let mut terminal_events = EventStream::new();
+    terminal.draw(|frame| home::draw(frame, state))?;
+    loop {
+        let Some(event) = terminal_events.next().await else {
+            return Ok(HomeAction::Quit);
+        };
+        let outcome = state.handle_event(event?);
+        if let Some(action) = outcome.action {
+            return Ok(action);
+        }
+        if outcome.redraw {
+            terminal.draw(|frame| home::draw(frame, state))?;
+        }
     }
-    // Best-effort kitty keyboard protocol enhancement. Terminals without
-    // support ignore it and the legacy Windows console API returns
-    // Unsupported, so a failure here must not prevent startup. This makes
-    // Alt+Up/Down arrive as `KeyCode::Up`/`Down` with the ALT modifier set.
-    let _ = execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
-    );
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    if let Err(error) = terminal.clear() {
-        let _ = disable_raw_mode();
-        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-        let _ = execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableBracketedPaste
-        );
-        return Err(error.into());
-    }
-
-    let result = event_loop(&mut terminal, &mut app).await;
-
-    let raw_mode_result = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    let screen_result = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    );
-    let cursor_result = terminal.show_cursor();
-    result?;
-    raw_mode_result?;
-    screen_result?;
-    cursor_result?;
-    Ok(())
 }
 
 async fn event_loop(
@@ -823,7 +933,7 @@ fn apply_provider_choice(app: &mut App, preset: ProviderPreset) -> Result<()> {
         .as_ref()
         .filter(|(active, _)| *active == preset)
         .map(|(_, key)| key.clone())
-        .or_else(|| secrets::api_key_cached_only(preset).ok());
+        .or_else(|| secrets::api_key_cached(preset).ok());
     let Some(api_key) = api_key else {
         app.current.status = format!("{} 的 API Key 不可用，请在供应商设置中补充", preset.label());
         return Ok(());
@@ -1735,6 +1845,7 @@ fn open_selected_profile(app: &mut App) {
         .as_ref()
         .and_then(SettingsState::selected_profile)
     {
+        let _ = secrets::api_key_cached(provider.preset);
         open_provider_form(app, provider);
         app.current.status = "编辑供应商".into();
     }
@@ -1766,7 +1877,7 @@ fn remove_settings_provider(app: &mut App) -> Result<()> {
             .first()
             .cloned()
             .unwrap_or_else(|| ProviderPreset::OpenAi.defaults());
-        app.active_secret = secrets::api_key_cached_only(app.config.provider.preset)
+        app.active_secret = secrets::api_key_cached(app.config.provider.preset)
             .ok()
             .map(|key| (app.config.provider.preset, key));
         rebuild_runner(app)?;
@@ -2828,6 +2939,62 @@ mod tests {
         assert_eq!(next_mode(AgentMode::Plan), AgentMode::Explore);
         assert_eq!(next_mode(AgentMode::Explore), AgentMode::Cluster);
         assert_eq!(next_mode(AgentMode::Cluster), AgentMode::Build);
+    }
+
+    #[test]
+    fn home_actions_create_only_explicit_new_sessions() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().to_path_buf();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+
+        assert!(
+            resolve_home_action(&storage, &workspace, HomeAction::Quit)
+                .unwrap()
+                .is_none()
+        );
+        assert!(storage.list_sessions(&workspace).unwrap().is_empty());
+
+        let (created, prompt) =
+            resolve_home_action(&storage, &workspace, HomeAction::StartNew("hello".into()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(prompt.as_deref(), Some("hello"));
+        assert_eq!(storage.list_sessions(&workspace).unwrap().len(), 1);
+
+        let mut config = Config::default();
+        apply_home_selection(
+            &mut config,
+            &storage,
+            &created,
+            HomeSelection {
+                provider: ProviderPreset::DeepSeek.defaults(),
+                mode: AgentMode::Explore,
+            },
+        )
+        .unwrap();
+        assert_eq!(config.provider.preset, ProviderPreset::DeepSeek);
+        assert_eq!(storage.session_mode(&created).unwrap(), "explore");
+
+        let (resumed, prompt) =
+            resolve_home_action(&storage, &workspace, HomeAction::Resume(created.clone()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(resumed, created);
+        assert!(prompt.is_none());
+        assert_eq!(storage.list_sessions(&workspace).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn submit_keeps_first_prompt_when_provider_is_unavailable() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.current.runner = None;
+        app.input.set("keep this prompt");
+
+        submit_input(&mut app).unwrap();
+
+        assert_eq!(app.input.as_str(), "keep this prompt");
+        assert_eq!(app.current.status, "请打开提供商设置配置 API Key");
     }
 
     #[test]

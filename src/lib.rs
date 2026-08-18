@@ -3,6 +3,7 @@ pub mod app;
 pub mod clipboard;
 pub mod commands;
 pub mod config;
+mod home;
 pub mod input;
 pub mod model;
 pub mod output;

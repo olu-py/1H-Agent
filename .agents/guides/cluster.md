@@ -33,11 +33,5 @@
 
 ## 验证
 
-```bash
-cargo test child_status_has_stable_wire_names_and_localized_labels
-cargo test child_concurrency_slots_enforce_the_configured_limit
-cargo test cancellation_progress_survives_a_temporarily_full_channel
-cargo test background_child_approval_is_globally_visible_and_routed
-cargo test cluster_batch_status_tracks_queued_running_and_completed_children
-cargo test main_agent_completes_after_one_hundred_tool_rounds
-```
+- 迭代过滤器：`child_`、`approval`、`cluster_batch_`、`cancellation_progress_`、`main_agent_completes_`。
+- 完成阶段按根文档运行一次 lib 测试；调度、审批或取消协议变更升级到完整测试和 Clippy。

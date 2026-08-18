@@ -25,14 +25,10 @@ jobs:
           test -n "$package_version"
           test "$tag_version" = "$package_version"
 
-  verify:
-    name: Verify (${{ matrix.os }})
+  verify-linux:
+    name: Verify (Linux)
     needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -40,8 +36,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes libdbus-1-dev pkg-config
@@ -50,12 +46,28 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Formatting
-        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+
+  verify-platforms:
+    name: Verify (${{ matrix.os }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --all-features --locked
 
   build:
     name: Build (${{ matrix.target }})
-    needs: [version, verify]
+    needs: [version, verify-linux, verify-platforms]
     strategy:
       fail-fast: false
       matrix:
@@ -136,7 +148,7 @@ jobs:
 
   installers:
     name: Installer (${{ matrix.os }})
-    needs: [version, verify]
+    needs: [version, verify-linux, verify-platforms]
     strategy:
       fail-fast: false
       matrix:

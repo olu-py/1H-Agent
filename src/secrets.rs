@@ -38,6 +38,32 @@ fn remember_key(preset: ProviderPreset, result: Result<String, SecretError>) {
     }
 }
 
+fn environment_key(preset: ProviderPreset) -> Option<String> {
+    let variables: &[&str] = match preset {
+        ProviderPreset::OpenAi => &["OPENAI_API_KEY", "AGENT_API_KEY"],
+        ProviderPreset::DeepSeek => &["DEEPSEEK_API_KEY", "AGENT_API_KEY"],
+        ProviderPreset::Qwen => &["DASHSCOPE_API_KEY", "QWEN_API_KEY", "AGENT_API_KEY"],
+        ProviderPreset::Volcano => &["ARK_API_KEY", "VOLCANO_API_KEY", "AGENT_API_KEY"],
+        ProviderPreset::Custom => &["AGENT_API_KEY"],
+    };
+    variables
+        .iter()
+        .find_map(|variable| env::var(variable).ok().filter(|key| !key.trim().is_empty()))
+}
+
+/// Caches environment-backed keys without touching the OS keyring. This keeps
+/// cross-provider agents available when their keys come from the environment,
+/// while startup performs only one potentially interactive keyring read.
+pub fn preload_environment_keys() {
+    for preset in ProviderPreset::ALL {
+        if cached_key(preset).is_none()
+            && let Some(key) = environment_key(preset)
+        {
+            remember_key(preset, Ok(key));
+        }
+    }
+}
+
 /// Reads a provider API key at most once per process: environment variables
 /// first, then the OS keyring. The result (including a missing-key error) is
 /// cached so repeated settings opens and cross-provider child agents do not
@@ -59,19 +85,8 @@ pub fn api_key_cached_only(preset: ProviderPreset) -> Result<String, SecretError
 }
 
 pub fn api_key(preset: ProviderPreset) -> Result<String, SecretError> {
-    let variables: &[&str] = match preset {
-        ProviderPreset::OpenAi => &["OPENAI_API_KEY", "AGENT_API_KEY"],
-        ProviderPreset::DeepSeek => &["DEEPSEEK_API_KEY", "AGENT_API_KEY"],
-        ProviderPreset::Qwen => &["DASHSCOPE_API_KEY", "QWEN_API_KEY", "AGENT_API_KEY"],
-        ProviderPreset::Volcano => &["ARK_API_KEY", "VOLCANO_API_KEY", "AGENT_API_KEY"],
-        ProviderPreset::Custom => &["AGENT_API_KEY"],
-    };
-    for variable in variables {
-        if let Ok(key) = env::var(variable) {
-            if !key.trim().is_empty() {
-                return Ok(key);
-            }
-        }
+    if let Some(key) = environment_key(preset) {
+        return Ok(key);
     }
 
     let entry = keyring::Entry::new(SERVICE, preset.key_id())
@@ -156,6 +171,15 @@ mod tests {
         assert_eq!(
             api_key_cached_only(ProviderPreset::Custom).unwrap(),
             "cached-custom"
+        );
+    }
+
+    #[test]
+    fn cached_lookup_never_invokes_another_backend_read() {
+        remember_key(ProviderPreset::Volcano, Ok("cached-volcano".into()));
+        assert_eq!(
+            api_key_cached(ProviderPreset::Volcano).unwrap(),
+            "cached-volcano"
         );
     }
 }
