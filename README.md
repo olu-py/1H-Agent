@@ -84,7 +84,7 @@ native_web_search = "disabled"
 
 ## AI 维护文档
 
-维护或开发本项目的 AI Agent 请读取 [AGENT.md](AGENT.md)。该文档提供架构、源码路由、安全边界、资源上限、验证和发布规则。
+维护或开发本项目的 AI Agent 请先读取 [AGENTS.md](AGENTS.md)，再按任务路由只加载相关专题指南。该入口提供架构、源码路由、安全边界和分级验证规则。
 
 ## 第三方声明
 
