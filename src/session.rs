@@ -124,6 +124,21 @@ impl SessionRuntime {
                 self.model_phase = ModelPhase::Streaming;
                 self.status = "等待模型流式响应".into();
             }
+            AgentEvent::CompactionStarted => {
+                self.status = "正在压缩上下文…… | Esc 取消".into();
+                self.agent_phase = AgentPhase::Thinking;
+                self.model_phase = ModelPhase::Streaming;
+            }
+            AgentEvent::CompactionCompleted { hidden } => {
+                self.status = format!("上下文已压缩，隐藏 {hidden} 条历史消息");
+            }
+            AgentEvent::CompactionFailed(error) => {
+                self.status = format!("上下文压缩失败，已使用安全裁剪：{error}");
+                self.push_entry(DisplayEntry {
+                    kind: DisplayKind::Error,
+                    content: DisplayContent::Markdown(self.status.clone()),
+                });
+            }
             AgentEvent::WebSearchStarted { query } => {
                 self.finish_thinking("思考完成");
                 self.agent_phase = AgentPhase::ToolRunning;
@@ -307,8 +322,15 @@ impl SessionRuntime {
             }
             AgentEvent::Completed { items } => {
                 self.finish_thinking("思考完成");
+                let compacted = items
+                    .iter()
+                    .any(|item| matches!(item, ConversationItem::CompactionSummary { .. }));
                 self.conversation = items;
                 trim_conversation(&mut self.conversation);
+                if compacted {
+                    self.entries = display_entries(&self.conversation);
+                    self.invalidate_output_layout();
+                }
                 self.busy = false;
                 self.active_task = None;
                 self.agent_phase = AgentPhase::Idle;
@@ -652,6 +674,7 @@ fn conversation_bytes(items: &[ConversationItem]) -> usize {
             ConversationItem::Message { content, .. }
             | ConversationItem::Context { content, .. } => content.len(),
             ConversationItem::ThinkingSummary { .. } => 0,
+            ConversationItem::CompactionSummary { content } => content.len(),
             ConversationItem::ProviderItem { item } => item.to_string().len(),
             ConversationItem::AssistantToolCalls { calls } => calls
                 .iter()
@@ -719,6 +742,10 @@ pub(crate) fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayE
                     }),
                 });
             }
+            ConversationItem::CompactionSummary { content } => entries.push(DisplayEntry {
+                kind: DisplayKind::System,
+                content: DisplayContent::Markdown(format!("上下文压缩摘要\n\n{content}")),
+            }),
             ConversationItem::Context { label, content } => entries.push(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(format!("### @{label}\n\n{content}")),

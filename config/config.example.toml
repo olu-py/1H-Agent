@@ -36,6 +36,13 @@ command_timeout_seconds = 60
 max_tool_output_bytes = 1048576
 max_fetch_bytes = 10485760
 
+[compaction]
+enabled = true
+auto_threshold = 0.80
+target_ratio = 0.55
+# preserve_recent_tokens = 8000
+max_summary_bytes = 65536
+
 # Cluster mode (AI 集群) child-agent concurrency and execution budgets.
 # Per-turn/session fan-out counts remain reserved; active children are bounded
 # by max_parallel_children.

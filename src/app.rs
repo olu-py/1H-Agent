@@ -2012,18 +2012,43 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 app.current.status = "没有可重做的内容".into();
             }
         }
-        Command::Compact => {
-            let hidden = app.storage.compact_session(&app.current.session_id, 8)?;
-            if hidden > 0 {
-                app.storage.append_message(
-                    &app.current.session_id,
-                    Role::System,
-                    &format!("Local compaction hid {hidden} older messages."),
-                )?;
+        Command::Compact(focus) => {
+            let Some(runner) = app.current.runner.clone() else {
+                app.current.status = "请打开提供商设置配置 API Key".into();
+                return Ok(());
+            };
+            let mut items = app.current.conversation.clone();
+            let events = app.current.agent_tx.clone();
+            let focus = focus.map(|value| value.trim().to_owned());
+            app.current.busy = true;
+            app.current.status = "准备压缩上下文…… | Esc 取消".into();
+            app.current.active_task = Some(tokio::spawn(async move {
+                match runner
+                    .compact_context(&mut items, focus.as_deref(), &events)
+                    .await
+                {
+                    Ok(_) => {
+                        let _ = events.send(AgentEvent::Completed { items }).await;
+                    }
+                    Err(error) => {
+                        trim_conversation(&mut items);
+                        let _ = events.send(AgentEvent::CompactionFailed(error)).await;
+                        let _ = events.send(AgentEvent::Completed { items }).await;
+                    }
+                }
+            }));
+        }
+        Command::Uncompact => {
+            if app
+                .storage
+                .restore_latest_compaction(&app.current.session_id)?
+            {
+                let session_id = app.current.session_id.clone();
+                activate_session(app, session_id)?;
+                app.current.status = "已恢复最近一次压缩".into();
+            } else {
+                app.current.status = "没有可恢复的压缩检查点".into();
             }
-            let session_id = app.current.session_id.clone();
-            activate_session(app, session_id)?;
-            app.current.status = format!("已压缩 {hidden} 条旧消息");
         }
         Command::Export(path) => export_session(app, path)?,
         Command::Diff => start_diff(app)?,
@@ -2716,6 +2741,7 @@ fn build_runtime(
                 .with_cluster_config(config.cluster.clone())
                 .with_approval_lock(approval_lock.clone())
                 .with_configured_agents(config.agents.clone())
+                .with_compaction_config(config.compaction.clone())
                 .with_child_role(child_role.clone())
                 .with_child_provider_resolver(child_provider_resolver)
             })

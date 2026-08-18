@@ -101,8 +101,17 @@ impl Storage {
                 response_id TEXT,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS compactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                hidden_ids TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (1, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (2, CURRENT_TIMESTAMP);
             ",
         )?;
         // These checks keep databases created by the first release compatible
@@ -341,6 +350,75 @@ impl Storage {
         content: &str,
     ) -> Result<(), StorageError> {
         self.append_typed_item(session_id, "thinking", "thinking_summary", content, None)
+    }
+
+    pub fn append_compaction_summary(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<(), StorageError> {
+        self.append_typed_item(session_id, "user", "compaction_summary", content, None)
+    }
+
+    pub fn compact_with_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        keep: usize,
+    ) -> Result<usize, StorageError> {
+        let connection = self.lock()?;
+        let tx = connection.unchecked_transaction()?;
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM messages WHERE session_id = ?1 AND hidden = 0 ORDER BY id DESC",
+            )?;
+            stmt.query_map([session_id], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let hidden: Vec<i64> = ids.into_iter().skip(keep).collect();
+        let now = Utc::now().to_rfc3339();
+        tx.execute("INSERT INTO compactions(session_id, hidden_ids, summary, created_at) VALUES (?1, ?2, ?3, ?4)", params![session_id, serde_json::to_string(&hidden)?, summary, now])?;
+        for id in &hidden {
+            tx.execute("UPDATE messages SET hidden = 1 WHERE id = ?1", [id])?;
+        }
+        let turn: Option<String> = tx
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(turn_id) = turn {
+            tx.execute("INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden) VALUES (?1, 'user', ?2, ?3, ?4, 'compaction_summary', 0)", params![session_id, summary, now, turn_id])?;
+        }
+        tx.execute(
+            "DELETE FROM provider_state WHERE session_id = ?1",
+            [session_id],
+        )?;
+        tx.commit()?;
+        Ok(hidden.len())
+    }
+
+    pub fn restore_latest_compaction(&self, session_id: &str) -> Result<bool, StorageError> {
+        let connection = self.lock()?;
+        let tx = connection.unchecked_transaction()?;
+        let row: Option<(i64, String)> = tx.query_row("SELECT id, hidden_ids FROM compactions WHERE session_id = ?1 ORDER BY id DESC LIMIT 1", [session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((id, encoded)) = row else {
+            return Ok(false);
+        };
+        let ids: Vec<i64> = serde_json::from_str(&encoded)?;
+        for msg_id in ids {
+            tx.execute("UPDATE messages SET hidden = 0 WHERE id = ?1", [msg_id])?;
+        }
+        tx.execute("UPDATE messages SET hidden = 1 WHERE session_id = ?1 AND kind = 'compaction_summary' AND id = (SELECT max(id) FROM messages WHERE session_id = ?1 AND kind = 'compaction_summary')", [session_id])?;
+        tx.execute("DELETE FROM compactions WHERE id = ?1", [id])?;
+        tx.execute(
+            "DELETE FROM provider_state WHERE session_id = ?1",
+            [session_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn append_provider_item(
@@ -604,6 +682,7 @@ impl Storage {
                     content,
                 }),
                 "thinking_summary" => Ok(ConversationItem::ThinkingSummary { content }),
+                "compaction_summary" => Ok(ConversationItem::CompactionSummary { content }),
                 "provider_item" => Ok(ConversationItem::ProviderItem {
                     item: serde_json::from_str(&content)?,
                 }),
@@ -883,6 +962,39 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session);
         assert_eq!(sessions[0].title, "hello");
+    }
+
+    #[test]
+    fn compaction_checkpoint_restores_raw_messages_and_clears_response_state() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        storage.append_message(&session, Role::User, "old").unwrap();
+        storage
+            .append_message(&session, Role::Assistant, "answer")
+            .unwrap();
+        storage
+            .append_message(&session, Role::User, "latest")
+            .unwrap();
+        storage.save_response_id(&session, "resp").unwrap();
+        assert_eq!(
+            storage
+                .compact_with_summary(&session, "goals and next step", 1)
+                .unwrap(),
+            2
+        );
+        assert!(storage.response_id(&session).unwrap().is_none());
+        let compacted = storage.load_messages(&session).unwrap();
+        assert!(
+            compacted
+                .iter()
+                .any(|item| matches!(item, ConversationItem::CompactionSummary { .. }))
+        );
+        assert!(storage.restore_latest_compaction(&session).unwrap());
+        assert!(storage.load_messages(&session).unwrap().iter().any(
+            |item| matches!(item, ConversationItem::Message { content, .. } if content == "old")
+        ));
+        assert!(!storage.restore_latest_compaction(&session).unwrap());
     }
 
     #[test]

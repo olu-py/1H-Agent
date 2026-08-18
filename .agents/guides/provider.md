@@ -17,6 +17,7 @@
 - 启动阶段用 `api_key_cached` 预热已连接预设；运行期切换、设置、恢复和子 Agent 只能用 `api_key_cached_only`，避免再次触发钥匙串密码。新密钥用 `store_api_key_cached` 同步钥匙串和内存缓存。
 - 切换 Provider 或模型必须重建 runner，并清理当前会话旧 `response_id`，不能跨端点复用服务端状态。
 - 使用 `previous_response_id` 时，请求游标从最新用户消息开始并保留其后的 `@` 上下文；不能使用简单的末项切片。
+- 上下文压缩后，`CompactionSummary` 与保留的最近完整轮次成为新的本地 canonical context；提交压缩检查点和 `/uncompact` 恢复都必须清理 `previous_response_id`，不得把压缩摘要与旧服务端状态混用。
 - 服务端状态失效后先清理持久化 ID，再通过 `replay_safe_items` 重放；孤立 `ToolOutput` 和没有结果的残缺 call 不得进入请求。
 - DeepSeek Responses 保持无 `previous_response_id`；启用原生搜索时发送 Provider `web_search`，并排除同名本地 function tool。
 - Qwen Chat 的 `reasoning_content` 与 Responses 的 `response.reasoning_text.delta` 都是增量文本；空 `content` 不得结束思考，`response.reasoning_text.done` 的完整文本不得再次追加。Qwen 3.7 Chat 使用 `enable_thinking`/`thinking_budget`，Qwen 3.8 Chat 与 Qwen Responses 使用各自文档规定的 reasoning effort 结构。

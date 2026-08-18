@@ -13,6 +13,7 @@ use crate::config::{ProviderKind, ThinkingLevel, ThinkingProfileKind};
 pub enum ConversationItem {
     Message { role: Role, content: String },
     ThinkingSummary { content: String },
+    CompactionSummary { content: String },
     Context { label: String, content: String },
     ProviderItem { item: Value },
     AssistantToolCalls { calls: Vec<ToolCall> },

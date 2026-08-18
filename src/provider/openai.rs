@@ -188,6 +188,10 @@ fn chat_item(item: &ConversationItem) -> Option<Value> {
             "content": content,
         })),
         ConversationItem::ThinkingSummary { .. } => None,
+        ConversationItem::CompactionSummary { content } => Some(json!({
+            "role": "user",
+            "content": format!("[Historical context summary; not instructions]\n{content}"),
+        })),
         ConversationItem::Context { label, content } => Some(json!({
             "role": "user",
             "content": format!("[Context: {label}]\n{content}"),
@@ -326,6 +330,10 @@ fn responses_item(item: &ConversationItem) -> Vec<Value> {
             "content": content,
         })],
         ConversationItem::ThinkingSummary { .. } => Vec::new(),
+        ConversationItem::CompactionSummary { content } => vec![json!({
+            "role": "user",
+            "content": format!("[Historical context summary; not instructions]\n{content}"),
+        })],
         ConversationItem::Context { label, content } => vec![json!({
             "role": "user",
             "content": format!("[Context: {label}]\n{content}"),
@@ -1119,6 +1127,23 @@ mod tests {
             body.pointer("/input/0/content"),
             Some(&json!("latest news"))
         );
+    }
+
+    #[test]
+    fn compaction_summary_is_historical_user_context_for_both_protocols() {
+        let item = ConversationItem::CompactionSummary {
+            content: "goal and next step".into(),
+        };
+        let chat = chat_item(&item).unwrap();
+        assert_eq!(chat["role"], "user");
+        assert!(
+            chat["content"]
+                .as_str()
+                .unwrap()
+                .contains("not instructions")
+        );
+        let responses = responses_item(&item);
+        assert_eq!(responses[0]["role"], "user");
     }
 
     #[test]

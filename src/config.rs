@@ -21,6 +21,7 @@ pub struct Config {
     pub provider_profiles_initialized: bool,
     pub ui: UiConfig,
     pub runtime: RuntimeConfig,
+    pub compaction: CompactionConfig,
     pub security: SecurityConfig,
     pub permissions: PermissionConfig,
     pub browser: BrowserConfig,
@@ -32,6 +33,39 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CompactionConfig {
+    pub enabled: bool,
+    pub auto_threshold: f32,
+    pub target_ratio: f32,
+    pub preserve_recent_tokens: Option<u64>,
+    pub max_summary_bytes: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_threshold: 0.80,
+            target_ratio: 0.55,
+            preserve_recent_tokens: None,
+            max_summary_bytes: 65_536,
+        }
+    }
+}
+
+impl CompactionConfig {
+    pub fn normalize(&mut self) {
+        self.auto_threshold = self.auto_threshold.clamp(0.60, 0.90);
+        self.target_ratio = self.target_ratio.clamp(0.30, 0.70);
+        self.max_summary_bytes = self.max_summary_bytes.clamp(4 * 1024, 256 * 1024);
+        if let Some(value) = self.preserve_recent_tokens.as_mut() {
+            *value = (*value).clamp(4_000, 16_000);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -411,6 +445,7 @@ impl Default for Config {
             provider_profiles_initialized: false,
             ui: UiConfig::default(),
             runtime: RuntimeConfig::default(),
+            compaction: CompactionConfig::default(),
             security: SecurityConfig::default(),
             permissions: PermissionConfig::default(),
             browser: BrowserConfig::default(),
@@ -468,6 +503,7 @@ impl Config {
         // that complete profile before applying process-only environment
         // overrides, so migration never loses the user's connection details.
         config.ensure_provider_profiles();
+        config.compaction.normalize();
 
         if let Ok(value) = env::var("AGENT_API_BASE") {
             if !value.trim().is_empty() {
@@ -1205,6 +1241,24 @@ mod tests {
         assert!(config.runtime.max_fetch_bytes >= config.runtime.max_tool_output_bytes);
         assert_eq!(config.cluster.max_parallel_children, Some(4));
         assert_eq!(config.cluster.child_active_timeout_seconds, 300);
+        assert!(config.compaction.enabled);
+        assert_eq!(config.compaction.auto_threshold, 0.80);
+    }
+
+    #[test]
+    fn compaction_limits_are_normalized() {
+        let mut config = CompactionConfig {
+            enabled: true,
+            auto_threshold: 1.0,
+            target_ratio: 0.1,
+            preserve_recent_tokens: Some(100_000),
+            max_summary_bytes: 1,
+        };
+        config.normalize();
+        assert_eq!(config.auto_threshold, 0.90);
+        assert_eq!(config.target_ratio, 0.30);
+        assert_eq!(config.preserve_recent_tokens, Some(16_000));
+        assert_eq!(config.max_summary_bytes, 4 * 1024);
     }
 
     #[test]
