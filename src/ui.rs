@@ -4,7 +4,7 @@ use pulldown_cmark::{
 };
 use ratatui::{
     Frame,
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
@@ -21,8 +21,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     agent::ChildSessionStatus,
     app::{
-        App, CommandPaletteState, DisplayContent, DisplayKind, LeaderAction, ThinkingDisplay,
-        ToolDisplay, ToolDisplayStatus,
+        App, CommandPaletteState, DisplayContent, DisplayKind, ThinkingDisplay, ToolDisplay,
+        ToolDisplayStatus,
     },
     commands::{self, AgentMode},
     output::{InteractionTarget, MessageLayout, OutputSelection, VisualLine},
@@ -96,9 +96,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if let Some(palette) = &app.palette {
         draw_palette(frame, area, palette, &theme);
-    }
-    if app.leader_pending {
-        draw_leader_hint(frame, area, app, &theme);
     }
     if app.has_pending_approval() {
         draw_approval(frame, area, app, &theme);
@@ -2350,13 +2347,21 @@ fn draw_provider_form(frame: &mut Frame<'_>, area: Rect, form: &SettingsForm, th
 }
 
 fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState, theme: &UiTheme) {
-    let popup = centered_rect(70, 14, area);
+    let popup = centered_rect(90, 16, area);
     let matches = commands::matches(&palette.query, 10);
-    let mut lines = vec![Line::from(vec![
+    let outer = Block::default()
+        .title(" 命令面板 · Ctrl+P / Ctrl+X ")
+        .borders(Borders::ALL)
+        .border_style(theme.focus_border);
+    let inner = outer.inner(popup);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)]).split(rows[1]);
+    let query = Line::from(vec![
         Span::styled("/", Style::default().fg(Color::Cyan)),
         Span::raw(palette.query.clone()),
-    ])];
-    lines.push(Line::default());
+    ]);
+    let mut lines = Vec::new();
     for (index, item) in matches.iter().enumerate() {
         let selected = index == palette.selected;
         let style = if selected {
@@ -2364,11 +2369,19 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
         } else {
             theme.style(VisualRole::Primary)
         };
+        let item = &commands::PALETTE_ITEMS[item.index];
+        let command = item.command.unwrap_or("直接动作");
+        let shortcut = item
+            .shortcut
+            .map(|shortcut| format!(" · {shortcut}"))
+            .unwrap_or_default();
         lines.push(Line::from(Span::styled(
             format!(
-                "{} {}",
+                "{} {}  {}{}",
                 if selected { ">" } else { " " },
-                commands::COMMAND_NAMES[item.index]
+                item.label,
+                command,
+                shortcut,
             ),
             style,
         )));
@@ -2380,67 +2393,43 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &CommandPaletteState
         )));
     }
     frame.render_widget(Clear, popup);
+    frame.render_widget(outer, popup);
+    frame.render_widget(Paragraph::new(query), rows[0]);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), columns[0]);
+
+    let detail = matches
+        .get(palette.selected)
+        .map(|item| &commands::PALETTE_ITEMS[item.index])
+        .map(|item| {
+            let command = item.command.unwrap_or("直接动作");
+            vec![
+                Line::from(Span::styled(item.label, theme.strong(VisualRole::Success))),
+                Line::default(),
+                Line::from(item.description),
+                Line::default(),
+                Line::from(Span::styled(command, Style::default().fg(Color::Cyan))),
+                Line::default(),
+                Line::from(Span::styled(
+                    "↑/↓ 选择 · Enter 执行 · Esc 关闭",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        })
+        .unwrap_or_else(|| {
+            vec![Line::from(Span::styled(
+                "输入命令名或功能名称进行筛选",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        });
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(detail)
             .block(
                 Block::default()
-                    .title(" 命令面板 ")
-                    .borders(Borders::ALL)
+                    .borders(Borders::LEFT)
                     .border_style(theme.focus_border),
             )
-            .wrap(Wrap { trim: false }),
-        popup,
-    );
-}
-
-const LEADER_POPUP_WIDTH_PERCENT: u16 = 70;
-const LEADER_POPUP_HEIGHT: u16 = 11;
-/// Inner row (0-based, relative to the block's inner area) where the first
-/// leader action is drawn. Shared by rendering and hit-testing so a click
-/// always resolves to the same action that was displayed.
-const LEADER_ACTION_FIRST_ROW: u16 = 1;
-
-/// Maps a mouse position to the leader action drawn at that row, or `None`
-/// when the position is outside the popup or not on an action line.
-pub(crate) fn leader_action_at(rect: Rect, column: u16, row: u16) -> Option<LeaderAction> {
-    let inner = Block::bordered().inner(rect);
-    if column < inner.x || column >= inner.right() || row < inner.y || row >= inner.bottom() {
-        return None;
-    }
-    let row_in_inner = row.checked_sub(inner.y)?;
-    let index = row_in_inner.checked_sub(LEADER_ACTION_FIRST_ROW)?;
-    LeaderAction::ALL.get(index as usize).copied()
-}
-
-fn draw_leader_hint(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &UiTheme) {
-    let popup = centered_rect(LEADER_POPUP_WIDTH_PERCENT, LEADER_POPUP_HEIGHT, area);
-    let mut lines = vec![Line::default()];
-    for action in LeaderAction::ALL {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {}  ", action.key()),
-                theme.strong(VisualRole::Success),
-            ),
-            Span::styled(action.label(), theme.style(VisualRole::Primary)),
-        ]));
-    }
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "Esc 取消",
-        Style::default().fg(Color::DarkGray),
-    )));
-    app.leader_hint_rect = Some(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(" 快捷键 ")
-                    .borders(Borders::ALL)
-                    .border_style(theme.focus_border),
-            )
-            .wrap(Wrap { trim: false }),
-        popup,
+            .wrap(Wrap { trim: true }),
+        columns[1],
     );
 }
 
@@ -2825,25 +2814,6 @@ mod tests {
             &UiTheme::default(),
         );
         assert!(selected.spans.len() <= 2);
-    }
-
-    #[test]
-    fn leader_action_at_maps_rows_and_rejects_borders_and_gaps() {
-        let rect = Rect::new(10, 4, 40, 11);
-        // Block::bordered() inner starts at (11, 5); the first action is drawn
-        // one inner row below the top, so New sits at row 6.
-        assert_eq!(leader_action_at(rect, 11, 6), Some(LeaderAction::New));
-        assert_eq!(leader_action_at(rect, 11, 7), Some(LeaderAction::Mode));
-        assert_eq!(leader_action_at(rect, 11, 8), Some(LeaderAction::Settings));
-        assert_eq!(leader_action_at(rect, 11, 9), Some(LeaderAction::Fork));
-        assert_eq!(leader_action_at(rect, 11, 10), Some(LeaderAction::Palette));
-        assert_eq!(leader_action_at(rect, 11, 11), Some(LeaderAction::Cluster));
-        assert_eq!(leader_action_at(rect, 11, 12), Some(LeaderAction::Quit));
-        // Top gap row, trailing gap / Esc hint row, and the border column are
-        // not clickable actions.
-        assert_eq!(leader_action_at(rect, 11, 5), None);
-        assert_eq!(leader_action_at(rect, 11, 13), None);
-        assert_eq!(leader_action_at(rect, 10, 6), None);
     }
 
     #[test]

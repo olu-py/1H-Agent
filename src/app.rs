@@ -66,7 +66,6 @@ pub struct App {
     pub settings: Option<SettingsState>,
     pub settings_rect: Option<Rect>,
     pub palette: Option<CommandPaletteState>,
-    pub leader_pending: bool,
     pub thinking_menu_open: bool,
     pub thinking_control_rect: Option<Rect>,
     pub thinking_menu_rect: Option<Rect>,
@@ -80,7 +79,6 @@ pub struct App {
     pub model_menu_open: bool,
     pub model_menu_rect: Option<Rect>,
     pub model_menu_selected: usize,
-    pub leader_hint_rect: Option<Rect>,
     pub force_full_redraw: bool,
     pub mouse_press_target: Option<InteractionTarget>,
     pub mouse_press_position: Option<(u16, u16)>,
@@ -179,7 +177,6 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         settings: None,
         settings_rect: None,
         palette: None,
-        leader_pending: false,
         thinking_menu_open: false,
         thinking_control_rect: None,
         thinking_menu_rect: None,
@@ -193,7 +190,6 @@ pub async fn run(workspace_path: PathBuf, config: Config) -> Result<()> {
         model_menu_open: false,
         model_menu_rect: None,
         model_menu_selected: 0,
-        leader_hint_rect: None,
         force_full_redraw: false,
         mouse_press_target: None,
         mouse_press_position: None,
@@ -437,9 +433,6 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         if let Some(outcome) = handle_settings_mouse(app, mouse)? {
             return Ok(outcome);
         }
-        if let Some(outcome) = handle_leader_mouse(app, mouse)? {
-            return Ok(outcome);
-        }
         if let Some(outcome) = handle_thinking_mouse(app, mouse)? {
             return Ok(outcome);
         }
@@ -536,14 +529,10 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         });
     }
     let redraw = match key.code {
-        KeyCode::Char('p')
+        KeyCode::Char('p' | 'x')
             if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
         {
-            app.palette = Some(CommandPaletteState {
-                query: String::new(),
-                selected: 0,
-            });
-            app.current.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
+            open_palette(app);
             true
         }
         KeyCode::PageUp if !app.current.busy => app.current.scroll_messages(5),
@@ -564,24 +553,6 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         KeyCode::PageDown if !app.current.busy && key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.current.scroll_messages(-5)
         }
-        KeyCode::Char('x')
-            if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
-        {
-            app.leader_pending = true;
-            app.current.status = "快捷键待命 | 按下对应键执行 | Esc 取消".into();
-            true
-        }
-        _ if app.leader_pending => {
-            app.leader_pending = false;
-            match key.code {
-                KeyCode::Esc => app.current.status = "已取消".into(),
-                _ => match LeaderAction::from_key(key.code) {
-                    Some(action) => execute_leader_action(app, action)?,
-                    None => app.current.status = "未知快捷键".into(),
-                },
-            }
-            true
-        }
         KeyCode::Char('s')
             if key.modifiers.contains(KeyModifiers::CONTROL) && !app.current.busy =>
         {
@@ -601,7 +572,6 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
             true
         }
         KeyCode::Esc => {
-            app.leader_pending = false;
             if app.current.active_task.is_some() {
                 cancel_active_request(app);
             }
@@ -728,27 +698,6 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
         redraw,
         osc52: None,
     })
-}
-
-/// Handles left clicks while the `Ctrl+X` leader hint is pending. A click on a
-/// listed action executes it; a click anywhere else cancels the pending state,
-/// mirroring `Esc`.
-fn handle_leader_mouse(
-    app: &mut App,
-    mouse: crossterm::event::MouseEvent,
-) -> Result<Option<EventOutcome>> {
-    if !app.leader_pending || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return Ok(None);
-    }
-    app.leader_pending = false;
-    let action = app
-        .leader_hint_rect
-        .and_then(|rect| ui::leader_action_at(rect, mouse.column, mouse.row));
-    match action {
-        Some(action) => execute_leader_action(app, action)?,
-        None => app.current.status = "已取消".into(),
-    }
-    Ok(Some(EventOutcome::redraw()))
 }
 
 fn handle_settings_mouse(
@@ -929,7 +878,6 @@ fn handle_provider_mouse(
         || app.has_pending_approval()
         || app.settings.is_some()
         || app.palette.is_some()
-        || app.leader_pending
     {
         return Ok(None);
     }
@@ -1043,7 +991,6 @@ fn handle_model_mouse(
         || app.has_pending_approval()
         || app.settings.is_some()
         || app.palette.is_some()
-        || app.leader_pending
     {
         return Ok(None);
     }
@@ -1171,7 +1118,6 @@ fn handle_navigation_mouse(
         || app.settings.is_some()
         || app.palette.is_some()
         || app.has_pending_approval()
-        || app.leader_pending
     {
         return Ok(None);
     }
@@ -1843,11 +1789,10 @@ fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Enter => {
             let selected = results.get(palette.selected).copied();
-            let command =
-                selected.and_then(|item| commands::parse(commands::COMMAND_NAMES[item.index]));
+            let action = selected.map(|item| commands::PALETTE_ITEMS[item.index].action);
             app.palette = None;
-            if let Some(command) = command {
-                if let Err(error) = execute_command(app, command) {
+            if let Some(action) = action {
+                if let Err(error) = execute_palette_action(app, action) {
                     app.current.status = format!("命令失败：{error}");
                 }
             }
@@ -1870,13 +1815,31 @@ fn handle_palette_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     }
 }
 
+fn open_palette(app: &mut App) {
+    app.palette = Some(CommandPaletteState {
+        query: String::new(),
+        selected: 0,
+    });
+    app.current.status = "命令面板 | 输入筛选 | ↑/↓ 选择 | Enter 执行 | Esc 关闭".into();
+}
+
+fn execute_palette_action(app: &mut App, action: commands::PaletteAction) -> Result<()> {
+    match action {
+        commands::PaletteAction::Command(input) => {
+            let command = commands::parse(input).context("invalid palette command")?;
+            execute_command(app, command)
+        }
+        commands::PaletteAction::CycleMode => switch_mode(app, next_mode(app.current.mode)),
+    }
+}
+
 fn execute_command(app: &mut App, command: Command) -> Result<()> {
     match command {
         Command::Help => {
             app.current.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(
-                    "## 命令\n\n`/new` `/sessions` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 命令面板 | Ctrl+X 快捷键 | @ 文件 | ! Shell"
+                    "## 命令\n\n`/new` `/sessions` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
                         .into(),
                 ),
             });
@@ -2054,90 +2017,6 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         Command::Diff => start_diff(app)?,
     }
     Ok(())
-}
-
-/// Actions reachable from the `Ctrl+X` leader prefix. The key, label, and
-/// dispatch are all driven by this single source of truth so the on-screen
-/// hint, the keyboard handler, and the mouse hit-test cannot drift apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeaderAction {
-    New,
-    Mode,
-    Settings,
-    Fork,
-    Palette,
-    Cluster,
-    Quit,
-}
-
-impl LeaderAction {
-    pub const ALL: [Self; 7] = [
-        Self::New,
-        Self::Mode,
-        Self::Settings,
-        Self::Fork,
-        Self::Palette,
-        Self::Cluster,
-        Self::Quit,
-    ];
-
-    pub fn key(self) -> char {
-        match self {
-            Self::New => 'n',
-            Self::Mode => 'm',
-            Self::Settings => 's',
-            Self::Fork => 'f',
-            Self::Palette => 'p',
-            Self::Cluster => 'c',
-            Self::Quit => 'q',
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::New => "新建会话",
-            Self::Mode => "切换模式",
-            Self::Settings => "Provider 设置",
-            Self::Fork => "分支当前会话",
-            Self::Palette => "命令面板",
-            Self::Cluster => "集群模式",
-            Self::Quit => "退出",
-        }
-    }
-
-    fn from_key(code: KeyCode) -> Option<Self> {
-        let KeyCode::Char(character) = code else {
-            return None;
-        };
-        Self::ALL
-            .into_iter()
-            .find(|action| action.key() == character)
-    }
-}
-
-fn execute_leader_action(app: &mut App, action: LeaderAction) -> Result<()> {
-    match action {
-        LeaderAction::New => create_session(app),
-        LeaderAction::Mode => switch_mode(app, next_mode(app.current.mode)),
-        LeaderAction::Settings => {
-            open_settings(app);
-            Ok(())
-        }
-        LeaderAction::Fork => execute_command(app, Command::Fork),
-        LeaderAction::Palette => {
-            app.palette = Some(CommandPaletteState {
-                query: String::new(),
-                selected: 0,
-            });
-            app.current.status = "命令面板 | 输入筛选 | Enter 执行 | Esc 关闭".into();
-            Ok(())
-        }
-        LeaderAction::Cluster => switch_mode(app, AgentMode::Cluster),
-        LeaderAction::Quit => {
-            app.should_quit = true;
-            Ok(())
-        }
-    }
 }
 
 fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
@@ -2600,8 +2479,8 @@ fn next_mode(mode: AgentMode) -> AgentMode {
     }
 }
 
-/// Shared mode-switch entry point for slash commands, the leader `m` shortcut,
-/// and clicking the mode label in the input title. It updates UI state,
+/// Shared mode-switch entry point for slash commands, palette actions, and
+/// clicking the mode label in the input title. It updates UI state,
 /// tool permissions, persistence, and clears the provider response id so the
 /// next request uses the new mode contract.
 fn switch_mode(app: &mut App, mode: AgentMode) -> Result<()> {
@@ -3011,75 +2890,77 @@ mod tests {
     }
 
     #[test]
-    fn leader_action_from_key_maps_shortcuts_and_rejects_others() {
-        assert_eq!(
-            LeaderAction::from_key(KeyCode::Char('n')),
-            Some(LeaderAction::New)
-        );
-        assert_eq!(
-            LeaderAction::from_key(KeyCode::Char('m')),
-            Some(LeaderAction::Mode)
-        );
-        assert_eq!(
-            LeaderAction::from_key(KeyCode::Char('s')),
-            Some(LeaderAction::Settings)
-        );
-        assert_eq!(
-            LeaderAction::from_key(KeyCode::Char('f')),
-            Some(LeaderAction::Fork)
-        );
-        assert_eq!(
-            LeaderAction::from_key(KeyCode::Char('p')),
-            Some(LeaderAction::Palette)
-        );
-        assert_eq!(
-            LeaderAction::from_key(KeyCode::Char('c')),
-            Some(LeaderAction::Cluster)
-        );
-        assert_eq!(
-            LeaderAction::from_key(KeyCode::Char('q')),
-            Some(LeaderAction::Quit)
-        );
-        assert_eq!(LeaderAction::from_key(KeyCode::Esc), None);
-        assert_eq!(LeaderAction::from_key(KeyCode::Char('z')), None);
-        assert_eq!(LeaderAction::from_key(KeyCode::Enter), None);
-    }
-
-    #[test]
-    fn leader_action_keys_and_labels_are_stable() {
-        let keys: Vec<char> = LeaderAction::ALL
-            .iter()
-            .map(|action| action.key())
-            .collect();
-        assert_eq!(keys, vec!['n', 'm', 's', 'f', 'p', 'c', 'q']);
-        let labels: Vec<&str> = LeaderAction::ALL
-            .iter()
-            .map(|action| action.label())
-            .collect();
-        assert_eq!(
-            labels,
-            vec![
-                "新建会话",
-                "切换模式",
-                "Provider 设置",
-                "分支当前会话",
-                "命令面板",
-                "集群模式",
-                "退出"
-            ]
-        );
-    }
-
-    #[test]
-    fn execute_leader_action_dispatches_settings_palette_and_quit() {
+    fn palette_actions_dispatch_commands_and_cycle_mode() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        execute_leader_action(&mut app, LeaderAction::Settings).unwrap();
+        execute_palette_action(&mut app, commands::PaletteAction::Command("/provider")).unwrap();
         assert!(app.settings.is_some());
-        execute_leader_action(&mut app, LeaderAction::Palette).unwrap();
+
+        let mut app = test_app(&temp);
+        execute_palette_action(&mut app, commands::PaletteAction::CycleMode).unwrap();
+        assert_eq!(app.current.mode, AgentMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn ctrl_p_and_ctrl_x_open_the_same_palette() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+        )
+        .await
+        .unwrap();
         assert!(app.palette.is_some());
-        execute_leader_action(&mut app, LeaderAction::Quit).unwrap();
+        assert!(app.current.status.contains("↑/↓"));
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .await
+        .unwrap();
+        assert!(app.palette.is_none());
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        )
+        .await
+        .unwrap();
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn palette_selection_changes_the_visible_description() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        open_palette(&mut app);
+        let matches = commands::matches("", 10);
+        let first = commands::PALETTE_ITEMS[matches[0].index].description;
+        let first_screen = render_screen(&mut app, 120, 30).join("\n");
+        assert!(first_screen.replace(' ', "").contains(first));
+        handle_palette_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        let selected = app.palette.as_ref().unwrap().selected;
+        let selected_description = commands::PALETTE_ITEMS[matches[selected].index].description;
+        assert_ne!(first, selected_description);
+        let selected_screen = render_screen(&mut app, 120, 30).join("\n");
+        assert!(
+            selected_screen
+                .replace(' ', "")
+                .contains(selected_description)
+        );
+    }
+
+    #[test]
+    fn palette_enter_executes_the_selected_command() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        open_palette(&mut app);
+        app.palette.as_mut().unwrap().query = "quit".into();
+        handle_palette_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.should_quit);
+        assert!(app.palette.is_none());
     }
 
     #[test]
@@ -3225,15 +3106,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_leader_action_mode_uses_next_mode() {
-        let temp = TempDir::new().unwrap();
-        let mut app = test_app(&temp);
-        assert_eq!(app.current.mode, AgentMode::Build);
-        execute_leader_action(&mut app, LeaderAction::Mode).unwrap();
-        assert_eq!(app.current.mode, AgentMode::Plan);
-    }
-
-    #[test]
     fn cluster_command_switches_to_cluster_mode() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
@@ -3373,40 +3245,6 @@ mod tests {
         assert!(app.background.contains_key(&new_session));
     }
 
-    #[tokio::test]
-    async fn leader_mouse_click_executes_action_and_outside_cancels() {
-        let temp = TempDir::new().unwrap();
-        let mut app = test_app(&temp);
-        app.leader_pending = true;
-        app.leader_hint_rect = Some(Rect::new(10, 4, 40, 11));
-        // First action (New) renders at inner.y + LEADER_ACTION_FIRST_ROW = 6.
-        let click_new = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 11,
-            row: 6,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert!(handle_leader_mouse(&mut app, click_new).unwrap().is_some());
-        assert!(!app.leader_pending);
-        assert!(app.current.status.contains("新会话"));
-
-        app.leader_pending = true;
-        app.leader_hint_rect = Some(Rect::new(10, 4, 40, 11));
-        let click_outside = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert!(
-            handle_leader_mouse(&mut app, click_outside)
-                .unwrap()
-                .is_some()
-        );
-        assert!(!app.leader_pending);
-        assert_eq!(app.current.status, "已取消");
-    }
-
     fn thinking_summary_count(app: &App) -> usize {
         app.current
             .entries
@@ -3492,7 +3330,6 @@ mod tests {
             settings: None,
             settings_rect: None,
             palette: None,
-            leader_pending: false,
             thinking_menu_open: false,
             thinking_control_rect: None,
             thinking_menu_rect: None,
@@ -3506,7 +3343,6 @@ mod tests {
             model_menu_open: false,
             model_menu_rect: None,
             model_menu_selected: 0,
-            leader_hint_rect: None,
             force_full_redraw: false,
             mouse_press_target: None,
             mouse_press_position: None,

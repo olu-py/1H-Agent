@@ -189,7 +189,7 @@ pub fn contextual_shortcuts(app: &App) -> Vec<ShortcutHint> {
         return vec![hint("Ctrl+L", "回到底部", 1), hint("Enter", "发送", 3)];
     }
     if app.input.is_empty() {
-        vec![hint("Enter", "发送", 1), hint("Ctrl+P", "命令", 2)]
+        vec![hint("Enter", "发送", 1), hint("Ctrl+P/X", "命令", 2)]
     } else {
         vec![hint("Enter", "发送", 1), hint("Shift+Enter", "换行", 2)]
     }
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn shortcut_fitting_drops_low_priority_items_first() {
-        let hints = vec![hint("Enter", "发送", 1), hint("Ctrl+P", "命令", 3)];
+        let hints = vec![hint("Enter", "发送", 1), hint("Ctrl+P/X", "命令", 3)];
         assert_eq!(fit_shortcuts(&hints, 12), vec![hints[0]]);
         assert!(fit_shortcuts(&hints, 2).is_empty());
     }
