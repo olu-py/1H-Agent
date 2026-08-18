@@ -59,6 +59,7 @@ pub struct ModelRequest {
 pub enum ThinkingMode {
     OpenAiResponsesSummary,
     DeepSeekResponses,
+    QwenResponses,
     DeepSeekChat,
     QwenChat,
     VolcanoChat,

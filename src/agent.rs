@@ -1741,7 +1741,7 @@ fn thinking_mode_for(config: &ProviderConfig) -> ThinkingMode {
         ThinkingCapability::Qwen => Some(if config.kind == ProviderKind::ChatCompletions {
             ThinkingMode::QwenChat
         } else {
-            ThinkingMode::CompatibleAuto
+            ThinkingMode::QwenResponses
         }),
         ThinkingCapability::Volcano => Some(if config.kind == ProviderKind::ChatCompletions {
             ThinkingMode::VolcanoChat
@@ -1758,6 +1758,9 @@ fn thinking_mode_for(config: &ProviderConfig) -> ThinkingMode {
         (ProviderPreset::OpenAi, ProviderKind::Responses) => ThinkingMode::OpenAiResponsesSummary,
         (ProviderPreset::DeepSeek, ProviderKind::Responses) => ThinkingMode::DeepSeekResponses,
         (ProviderPreset::DeepSeek, ProviderKind::ChatCompletions) => ThinkingMode::DeepSeekChat,
+        (ProviderPreset::Qwen, ProviderKind::Responses) if qwen_thinking_model(&config.model) => {
+            ThinkingMode::QwenResponses
+        }
         (ProviderPreset::Qwen, ProviderKind::ChatCompletions)
             if qwen_thinking_model(&config.model) =>
         {
@@ -1849,6 +1852,9 @@ mod tests {
         }
         config.model = "unknown-qwen-model".into();
         assert_eq!(thinking_mode_for(&config), ThinkingMode::Disabled);
+        config.model = "qwen3.8-max".into();
+        config.kind = ProviderKind::Responses;
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::QwenResponses);
 
         config = ProviderPreset::Volcano.defaults();
         assert_eq!(thinking_mode_for(&config), ThinkingMode::VolcanoChat);
@@ -1857,8 +1863,9 @@ mod tests {
         assert_eq!(thinking_mode_for(&config), ThinkingMode::CompatibleAuto);
         config.thinking = ThinkingCapability::Qwen;
         assert_eq!(thinking_mode_for(&config), ThinkingMode::QwenChat);
-        config.thinking = ThinkingCapability::OpenAi;
         config.kind = ProviderKind::Responses;
+        assert_eq!(thinking_mode_for(&config), ThinkingMode::QwenResponses);
+        config.thinking = ThinkingCapability::OpenAi;
         assert_eq!(
             thinking_mode_for(&config),
             ThinkingMode::OpenAiResponsesSummary

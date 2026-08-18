@@ -285,9 +285,12 @@ fn apply_responses_thinking(body: &mut Value, request: &ModelRequest) {
                 body["reasoning"] = json!({"effort": effort});
             }
         }
-        ThinkingProfileKind::Qwen38
-        | ThinkingProfileKind::Qwen37
-        | ThinkingProfileKind::Volcano => {}
+        ThinkingProfileKind::Qwen38 | ThinkingProfileKind::Qwen37 => {
+            if let Some(effort) = reasoning_effort(request.thinking_level) {
+                body["reasoning"] = json!({"effort": effort});
+            }
+        }
+        ThinkingProfileKind::Volcano => {}
     }
 }
 
@@ -390,7 +393,11 @@ pub(crate) fn parse_chat_event(value: &Value) -> Result<Vec<ModelEvent>, Provide
         if let Some(reasoning) = recognized_reasoning_delta(delta) {
             events.push(ModelEvent::ReasoningDelta(reasoning.to_owned()));
         }
-        if let Some(content) = delta.get("content").and_then(Value::as_str) {
+        if let Some(content) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|content| !content.is_empty())
+        {
             events.push(ModelEvent::TextDelta(content.to_owned()));
         }
         for call in delta
@@ -445,7 +452,11 @@ pub(crate) fn parse_responses_event_for_mode(
             }
         }
         "response.output_text.delta" => {
-            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+            if let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            {
                 events.push(ModelEvent::TextDelta(delta.to_owned()));
             }
         }
@@ -461,24 +472,28 @@ pub(crate) fn parse_responses_event_for_mode(
             }
         }
         "response.reasoning_text.delta"
-        | "response.reasoning_text.done"
         | "response.reasoning_content.delta"
         | "response.reasoning.delta"
-            if matches!(thinking_mode, ThinkingMode::DeepSeekResponses) =>
+            if matches!(
+                thinking_mode,
+                ThinkingMode::DeepSeekResponses | ThinkingMode::QwenResponses
+            ) =>
         {
-            let field = if event_type == "response.reasoning_text.done" {
-                "text"
-            } else {
-                "delta"
-            };
             if let Some(delta) = value
-                .get(field)
+                .get("delta")
                 .and_then(Value::as_str)
                 .filter(|delta| safe_reasoning_text(delta))
             {
                 events.push(ModelEvent::ReasoningDelta(delta.to_owned()));
             }
         }
+        // This event carries the complete text accumulated from all preceding
+        // deltas. Re-emitting it as a delta duplicates and fragments summaries.
+        "response.reasoning_text.done"
+            if matches!(
+                thinking_mode,
+                ThinkingMode::DeepSeekResponses | ThinkingMode::QwenResponses
+            ) => {}
         "response.output_item.added" => {
             let item = value.get("item").unwrap_or(&Value::Null);
             if item.get("type").and_then(Value::as_str) == Some("function_call") {
@@ -833,6 +848,22 @@ mod tests {
     }
 
     #[test]
+    fn qwen_reasoning_chunk_does_not_emit_empty_text_delta() {
+        let events = parse_chat_event(&json!({
+            "model":"qwen3.8-max",
+            "choices":[{"delta":{
+                "reasoning_content":"同一句话的增量",
+                "content":""
+            }}]
+        }))
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![ModelEvent::ReasoningDelta("同一句话的增量".into())]
+        );
+    }
+
+    #[test]
     fn parses_responses_text() {
         let events = parse_responses_event(&json!({
             "type":"response.output_text.delta", "delta":"hello"
@@ -970,10 +1001,34 @@ mod tests {
             ThinkingMode::DeepSeekResponses,
         )
         .unwrap();
-        assert_eq!(
-            done,
-            vec![ModelEvent::ReasoningDelta("检查项目结构".into())]
-        );
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn parses_qwen_responses_reasoning_deltas_without_replaying_done_text() {
+        let delta = parse_responses_event_for_mode(
+            &json!({
+                "type":"response.reasoning_text.delta",
+                "delta":"正在检查",
+                "item_id":"msg_1",
+                "output_index":0
+            }),
+            ThinkingMode::QwenResponses,
+        )
+        .unwrap();
+        assert_eq!(delta, vec![ModelEvent::ReasoningDelta("正在检查".into())]);
+
+        let done = parse_responses_event_for_mode(
+            &json!({
+                "type":"response.reasoning_text.done",
+                "text":"正在检查项目结构",
+                "item_id":"msg_1",
+                "output_index":0
+            }),
+            ThinkingMode::QwenResponses,
+        )
+        .unwrap();
+        assert!(done.is_empty());
     }
 
     fn assert_chat_reasoning(model: &str, field: &str) {
@@ -1173,6 +1228,22 @@ mod tests {
         assert_eq!(qwen38_body["reasoning_effort"], "xhigh");
         assert!(qwen38_body.get("enable_thinking").is_none());
         assert!(qwen38_body.get("thinking_budget").is_none());
+
+        qwen38.kind = ProviderKind::Responses;
+        qwen38.thinking_mode = ThinkingMode::QwenResponses;
+        let qwen38_responses = responses_body(&qwen38);
+        assert_eq!(qwen38_responses["reasoning"], json!({"effort":"xhigh"}));
+
+        let mut qwen37 = empty_request(ProviderKind::Responses, ThinkingMode::QwenResponses);
+        qwen37.thinking_profile_kind = ThinkingProfileKind::Qwen37;
+        qwen37.thinking_level = ThinkingLevel::None;
+        assert_eq!(
+            responses_body(&qwen37)["reasoning"],
+            json!({"effort":"none"})
+        );
+        qwen37.thinking_level = ThinkingLevel::Enabled;
+        assert!(responses_body(&qwen37).get("reasoning").is_none());
+
         let compatible = chat_body(&empty_request(
             ProviderKind::ChatCompletions,
             ThinkingMode::CompatibleAuto,

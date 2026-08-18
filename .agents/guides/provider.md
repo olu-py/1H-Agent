@@ -19,6 +19,7 @@
 - 使用 `previous_response_id` 时，请求游标从最新用户消息开始并保留其后的 `@` 上下文；不能使用简单的末项切片。
 - 服务端状态失效后先清理持久化 ID，再通过 `replay_safe_items` 重放；孤立 `ToolOutput` 和没有结果的残缺 call 不得进入请求。
 - DeepSeek Responses 保持无 `previous_response_id`；启用原生搜索时发送 Provider `web_search`，并排除同名本地 function tool。
+- Qwen Chat 的 `reasoning_content` 与 Responses 的 `response.reasoning_text.delta` 都是增量文本；空 `content` 不得结束思考，`response.reasoning_text.done` 的完整文本不得再次追加。Qwen 3.7 Chat 使用 `enable_thinking`/`thinking_budget`，Qwen 3.8 Chat 与 Qwen Responses 使用各自文档规定的 reasoning effort 结构。
 - Provider 私有 JSON 和 SSE 必须先转换为公共模型事件；UI、存储和工具层不解析私有协议。
 
 ## 常见故障顺序

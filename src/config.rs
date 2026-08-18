@@ -730,7 +730,10 @@ impl ProviderPreset {
     }
 
     pub fn supports_responses(self) -> bool {
-        matches!(self, Self::OpenAi | Self::DeepSeek | Self::Custom)
+        matches!(
+            self,
+            Self::OpenAi | Self::DeepSeek | Self::Qwen | Self::Custom
+        )
     }
 
     pub fn supports_previous_response_id(self) -> bool {
@@ -1276,6 +1279,7 @@ mod tests {
         let qwen = ProviderPreset::Qwen.defaults();
         assert!(qwen.base_url.contains("{WorkspaceId}"));
         assert_eq!(qwen.kind, ProviderKind::ChatCompletions);
+        assert!(ProviderPreset::Qwen.supports_responses());
         let volcano = ProviderPreset::Volcano.defaults();
         assert!(volcano.base_url.ends_with("/api/v3"));
     }
