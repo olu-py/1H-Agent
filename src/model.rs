@@ -8,7 +8,6 @@ use crate::provider::ToolCall;
 
 #[derive(Clone, Debug)]
 pub enum DisplayKind {
-    Todo,
     User,
     Assistant,
     Thinking,
@@ -72,7 +71,6 @@ pub struct DisplayEntry {
 #[derive(Clone, Debug)]
 pub enum DisplayContent {
     Markdown(String),
-    Todo(TodoDisplay),
     Diff(String),
     Tool(ToolDisplay),
     Thinking(ThinkingDisplay),

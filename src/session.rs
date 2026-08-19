@@ -150,7 +150,6 @@ impl SessionRuntime {
             }
             AgentEvent::TodoUpdated { tasks } => {
                 self.todos = tasks;
-                self.invalidate_output_layout();
             }
             AgentEvent::CompactionStarted => {
                 self.status = "正在压缩上下文…… | Esc 取消".into();
@@ -732,7 +731,6 @@ fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
                     + tool.result.as_ref().map_or(0, String::len)
             }
             DisplayContent::Thinking(thinking) => thinking.id.len() + thinking.content.len(),
-            DisplayContent::Todo(todo) => todo.tasks.len() * 16,
         })
         .sum()
 }

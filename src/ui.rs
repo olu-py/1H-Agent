@@ -331,6 +331,98 @@ fn draw_messages(
             .wrap(Wrap { trim: false }),
         area,
     );
+    draw_todo_window(frame, viewport, app, theme);
+}
+
+pub(crate) const TODO_WINDOW_MAX_WIDTH: u16 = 44;
+
+pub(crate) fn todo_window_rect(viewport: Rect, task_count: usize) -> Option<Rect> {
+    let minimum_height = if task_count == 1 { 3 } else { 4 };
+    if task_count == 0 || viewport.width < 4 || viewport.height < minimum_height {
+        return None;
+    }
+    let width = TODO_WINDOW_MAX_WIDTH.min(viewport.width);
+    let desired_height = task_count.saturating_add(2).min(usize::from(u16::MAX));
+    let height = desired_height.min(usize::from(viewport.height)) as u16;
+    if height < minimum_height {
+        return None;
+    }
+    Some(Rect {
+        x: viewport.right().saturating_sub(width),
+        y: viewport.bottom().saturating_sub(height),
+        width,
+        height,
+    })
+}
+
+fn draw_todo_window(frame: &mut Frame<'_>, viewport: Rect, app: &mut App, theme: &UiTheme) {
+    if app.current.todos.is_empty() {
+        app.todo_window_rect = None;
+        return;
+    }
+    let Some(rect) = todo_window_rect(viewport, app.current.todos.len()) else {
+        app.todo_window_rect = None;
+        return;
+    };
+    app.todo_window_rect = Some(rect);
+    let todo = TodoDisplay {
+        tasks: app.current.todos.clone(),
+    };
+    let lines = todo_window_lines(
+        &todo,
+        usize::from(rect.width.saturating_sub(2)),
+        usize::from(rect.height.saturating_sub(2)),
+    );
+    let (done, total) = todo.progress();
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(format!(" 任务清单 {done}/{total} "))
+                .borders(Borders::ALL)
+                .border_style(theme.focus_border),
+        ),
+        rect,
+    );
+}
+
+pub(crate) fn todo_visible_task_count(task_count: usize, visible_rows: usize) -> usize {
+    if task_count > visible_rows {
+        visible_rows.saturating_sub(1)
+    } else {
+        task_count
+    }
+}
+
+fn todo_window_lines(todo: &TodoDisplay, width: usize, visible_rows: usize) -> Vec<Line<'static>> {
+    let visible_tasks = todo_visible_task_count(todo.tasks.len(), visible_rows);
+    let tasks = &todo.tasks[..visible_tasks];
+    let mut lines = Vec::new();
+    if todo.tasks.len() > visible_rows {
+        let hidden = todo.tasks.len().saturating_sub(visible_tasks);
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("… 还有 {hidden} 项"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    for (index, task) in tasks.iter().enumerate() {
+        let number = (index + 1).to_string();
+        let prefix_width = number.width() + 4;
+        let title = fit_text(&task.title, width.saturating_sub(prefix_width));
+        let (marker, color) = match task.status {
+            TodoStatus::Pending => ("○", Color::DarkGray),
+            TodoStatus::InProgress => ("◐", Color::Yellow),
+            TodoStatus::Done => ("●", Color::Green),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_owned(), Style::default().fg(color)),
+            Span::raw(format!(" {number}. ")),
+            Span::raw(title),
+        ]));
+    }
+    lines
 }
 
 pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
@@ -425,14 +517,6 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
     let expanded_thinking = &current.expanded_thinking;
     let thinking_anchor = current.thinking_anchor;
     let render_cache = &mut current.markdown_render_cache;
-    if !current.todos.is_empty() {
-        let todo_content = DisplayContent::Todo(TodoDisplay {
-            tasks: current.todos.clone(),
-        });
-        if let DisplayContent::Todo(todo) = &todo_content {
-            render_todo(todo, width, &mut lines, &mut interactions);
-        }
-    }
     for (entry_index, entry) in entries.iter().enumerate() {
         if thinking_anchor == Some(entry_index) {
             thinking_before = Some(lines.len());
@@ -513,7 +597,6 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
         let (label, role) = match &entry.kind {
             DisplayKind::User => ("用户", VisualRole::User),
             DisplayKind::Assistant => ("Agent", VisualRole::Accent),
-            DisplayKind::Todo => ("任务清单", VisualRole::Tool),
             DisplayKind::Thinking => ("思考摘要", VisualRole::Thinking),
             DisplayKind::Tool => ("工具", VisualRole::Tool),
             DisplayKind::Error => ("错误", VisualRole::Danger),
@@ -550,7 +633,6 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
                 }
             }
             DisplayContent::Tool(_) => unreachable!("tool entries are rendered as a group"),
-            DisplayContent::Todo(_) => unreachable!("todo card is rendered before entries"),
             DisplayContent::Thinking(_) => unreachable!("thinking entries are rendered inline"),
         }
         push_rendered_line(&mut lines, &mut interactions, Line::default(), None);
@@ -1265,47 +1347,6 @@ fn raw_html_style() -> Style {
 
 fn table_border_style() -> Style {
     Style::default().fg(Color::DarkGray)
-}
-
-fn render_todo(
-    todo: &TodoDisplay,
-    width: usize,
-    lines: &mut Vec<Line<'static>>,
-    interactions: &mut Vec<Option<InteractionTarget>>,
-) {
-    let theme = UiTheme::default();
-    let (done, total) = todo.progress();
-    push_rendered_line(lines, interactions, Line::from(" "), None);
-    push_rendered_line(
-        lines,
-        interactions,
-        Line::from(Span::styled(
-            format!("任务清单  {done}/{total}"),
-            theme.strong(VisualRole::Tool),
-        )),
-        None,
-    );
-    for (index, task) in todo.tasks.iter().enumerate() {
-        let number = (index + 1).to_string();
-        let prefix_width = number.width() + 4;
-        let title = fit_text(&task.title, width.saturating_sub(prefix_width));
-        let (marker, color) = match task.status {
-            TodoStatus::Pending => ("○", Color::DarkGray),
-            TodoStatus::InProgress => ("◐", Color::Yellow),
-            TodoStatus::Done => ("●", Color::Green),
-        };
-        push_rendered_line(
-            lines,
-            interactions,
-            Line::from(vec![
-                Span::styled(marker.to_owned(), Style::default().fg(color)),
-                Span::raw(format!(" {number}. ")),
-                Span::raw(title),
-            ]),
-            Some(InteractionTarget::Todo(task.id.clone())),
-        );
-    }
-    push_rendered_line(lines, interactions, Line::default(), None);
 }
 
 fn render_tool(

@@ -81,6 +81,7 @@ pub struct App {
     pub model_menu_open: bool,
     pub model_menu_rect: Option<Rect>,
     pub model_menu_selected: usize,
+    pub todo_window_rect: Option<Rect>,
     pub force_full_redraw: bool,
     pub mouse_press_target: Option<InteractionTarget>,
     pub mouse_press_position: Option<(u16, u16)>,
@@ -334,6 +335,7 @@ async fn build_app(
         model_menu_open: false,
         model_menu_rect: None,
         model_menu_selected: 0,
+        todo_window_rect: None,
         force_full_redraw: false,
         mouse_press_target: None,
         mouse_press_position: None,
@@ -1259,6 +1261,23 @@ fn handle_navigation_mouse(
     Ok(None)
 }
 
+fn todo_interaction_at(app: &App, column: u16, row: u16) -> Option<InteractionTarget> {
+    let rect = app.todo_window_rect?;
+    if row <= rect.y || row >= rect.bottom() || column != rect.x + 1 {
+        return None;
+    }
+    let index = usize::from(row - rect.y - 1);
+    let visible_rows = usize::from(rect.height.saturating_sub(2));
+    let visible_tasks = ui::todo_visible_task_count(app.current.todos.len(), visible_rows);
+    if index >= visible_tasks {
+        return None;
+    }
+    app.current
+        .todos
+        .get(index)
+        .map(|task| InteractionTarget::Todo(task.id.clone()))
+}
+
 fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> EventOutcome {
     match mouse.kind {
         MouseEventKind::ScrollUp => EventOutcome {
@@ -1272,11 +1291,13 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
         MouseEventKind::Down(MouseButton::Left) => {
             app.mouse_dragged = false;
             app.mouse_press_position = Some((mouse.column, mouse.row));
-            app.mouse_press_target = app
-                .current
-                .message_layout
-                .as_ref()
-                .and_then(|layout| layout.interaction_at(mouse.column, mouse.row));
+            app.mouse_press_target =
+                todo_interaction_at(app, mouse.column, mouse.row).or_else(|| {
+                    app.current
+                        .message_layout
+                        .as_ref()
+                        .and_then(|layout| layout.interaction_at(mouse.column, mouse.row))
+                });
             if app.mouse_press_target.is_some() {
                 app.current.clear_output_selection();
                 app.current.edge_scroll = EdgeScroll::default();
@@ -1345,13 +1366,16 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
             let pressed_target = app.mouse_press_target.take();
             app.mouse_press_position = None;
             if let Some(target) = pressed_target {
-                let released_target = app
-                    .current
-                    .message_layout
-                    .as_ref()
-                    .and_then(|layout| layout.interaction_at(mouse.column, mouse.row));
+                let released_target =
+                    todo_interaction_at(app, mouse.column, mouse.row).or_else(|| {
+                        app.current
+                            .message_layout
+                            .as_ref()
+                            .and_then(|layout| layout.interaction_at(mouse.column, mouse.row))
+                    });
                 if !app.mouse_dragged && released_target.as_ref() == Some(&target) {
-                    if !app.current.follow_output {
+                    let todo_target = matches!(&target, InteractionTarget::Todo(_));
+                    if !app.current.follow_output && !todo_target {
                         app.layout_restore_anchor =
                             app.current.message_layout.as_ref().and_then(|layout| {
                                 layout
@@ -1394,7 +1418,7 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                             }
                         }
                     }
-                    if !live_thinking_target {
+                    if !live_thinking_target && !todo_target {
                         app.current.invalidate_output_layout();
                     }
                 }
@@ -2228,7 +2252,6 @@ fn update_todo_status(
 fn apply_todo_tasks(app: &mut App, tasks: Vec<TodoTask>) -> Result<()> {
     app.storage.replace_tasks(&app.current.session_id, &tasks)?;
     app.current.todos = tasks;
-    app.current.invalidate_output_layout();
     Ok(())
 }
 
@@ -2952,6 +2975,7 @@ fn reload_current_session(app: &mut App) -> Result<()> {
     app.registry.set_mode(app.current.mode);
     app.input.clear();
     app.file_suggestions.clear();
+    app.todo_window_rect = None;
     app.current.invalidate_output_layout();
     Ok(())
 }
@@ -2984,6 +3008,7 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     app.registry.set_mode(app.current.mode);
     app.input.clear();
     app.file_suggestions.clear();
+    app.todo_window_rect = None;
     app.current.invalidate_output_layout();
     app.current.status = if app.current.runner.is_some() {
         "就绪".into()
@@ -4069,6 +4094,7 @@ mod tests {
             model_menu_open: false,
             model_menu_rect: None,
             model_menu_selected: 0,
+            todo_window_rect: None,
             force_full_redraw: false,
             mouse_press_target: None,
             mouse_press_position: None,
@@ -5552,6 +5578,8 @@ mod tests {
     fn todo_commands_update_storage_and_runtime() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
+        crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 80, 24));
+        let rebuilds = app.current.output_layout_rebuild_count;
 
         execute_command(
             &mut app,
@@ -5565,7 +5593,8 @@ mod tests {
         assert_eq!(tasks[0].title, "write tests");
         assert_eq!(tasks[0].status, TodoStatus::InProgress);
         assert_eq!(app.current.todos, tasks);
-        assert!(app.current.output_layout_dirty);
+        assert!(!app.current.output_layout_dirty);
+        assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
         assert_eq!(app.current.status, "任务已标记为进行中");
     }
 
@@ -5573,7 +5602,9 @@ mod tests {
     fn todo_updated_event_updates_runtime_without_rebuilding_entries() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
+        crate::ui::update_message_layout(&mut app, Rect::new(0, 0, 80, 24));
         let entries = app.current.entries.len();
+        let rebuilds = app.current.output_layout_rebuild_count;
         let tasks = vec![TodoTask::new("verify", TodoStatus::Done)];
 
         handle_event_for_test(&mut app, AgentEvent::TodoUpdated { tasks });
@@ -5581,7 +5612,8 @@ mod tests {
         assert_eq!(app.current.entries.len(), entries);
         assert_eq!(app.current.todos.len(), 1);
         assert_eq!(app.current.todos[0].status, TodoStatus::Done);
-        assert!(app.current.output_layout_dirty);
+        assert!(!app.current.output_layout_dirty);
+        assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
     }
 
     #[test]
@@ -5609,14 +5641,9 @@ mod tests {
     }
 
     #[test]
-    fn todo_card_renders_and_status_click_cycles() {
+    fn todo_window_renders_bottom_right_and_status_click_cycles() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        app.current.todos = vec![TodoTask::new("clickable", TodoStatus::Pending)];
-        app.current.follow_output = false;
-        app.current.message_scroll = 0;
-        app.current.output_scroll_top = Some(0);
-
         app.current.todos = (0..10)
             .map(|index| {
                 let title = if index == 9 {
@@ -5627,39 +5654,53 @@ mod tests {
                 TodoTask::new(title, TodoStatus::Pending)
             })
             .collect();
-        let screen = render_screen(&mut app, 20, 30);
-        assert!(screen.iter().any(|line| line.contains("0/10")));
-        assert!(screen.iter().any(|line| line.contains("○ 1. clickable")));
-        let layout = app.current.message_layout.as_ref().unwrap();
-        let long_line = layout
-            .lines
-            .iter()
-            .find(|line| line.text.contains("10. "))
-            .expect("long todo task should be rendered");
-        assert!(unicode_width::UnicodeWidthStr::width(long_line.text.as_str()) <= 20);
-        assert!(long_line.text.ends_with("..."));
+        for _ in 0..80 {
+            app.current.push_entry(DisplayEntry {
+                kind: DisplayKind::Assistant,
+                content: DisplayContent::Markdown("underlying message".into()),
+            });
+        }
+        app.current.follow_output = false;
+        app.current.message_scroll = 0;
+        app.current.output_scroll_top = Some(0);
 
-        let (column, row, target) = {
-            let layout = app.current.message_layout.as_ref().unwrap();
-            let mut cursor = layout.viewport.y;
-            let mut found = None;
-            while cursor < layout.viewport.bottom() {
-                if let Some(target) = layout.interaction_at(layout.viewport.x, cursor) {
-                    found = Some((cursor, target));
-                    break;
-                }
-                cursor += 1;
-            }
-            let (row, target) = found.expect("todo task should be clickable");
-            (layout.viewport.x, row, target)
-        };
-        assert!(matches!(target, InteractionTarget::Todo(_)));
+        let screen = render_screen(&mut app, 80, 30);
+        let rect = app
+            .todo_window_rect
+            .expect("todo window should be rendered");
+        let viewport = app
+            .current
+            .message_layout
+            .as_ref()
+            .expect("message layout should exist")
+            .viewport;
+        assert_eq!(rect.right(), viewport.right());
+        assert_eq!(rect.bottom(), viewport.bottom());
+        assert_eq!(rect.width, crate::ui::TODO_WINDOW_MAX_WIDTH);
+        assert_eq!(rect.height, 12);
+        assert!(screen[usize::from(rect.y)].contains("0/10"));
+        let title_slice: String = screen[usize::from(rect.y)]
+            .chars()
+            .skip(usize::from(rect.x))
+            .take(usize::from(rect.width))
+            .collect();
+        assert!(!title_slice.contains("underlying message"));
+        assert!(screen[usize::from(rect.y + 1)].contains("○ 1. clickable"));
+        let long_row = &screen[usize::from(rect.y + 10)];
+        assert!(long_row.contains("10. xxx"));
+        assert!(!long_row.contains(&"x".repeat(40)));
+
+        let column = rect.x + 1;
+        let row = rect.y + 1;
+        let target = todo_interaction_at(&app, column, row);
+        assert!(matches!(target, Some(InteractionTarget::Todo(_))));
         let mouse = |kind| MouseEvent {
             kind,
             column,
             row,
             modifiers: KeyModifiers::NONE,
         };
+        let rebuilds = app.current.output_layout_rebuild_count;
         handle_output_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left)));
         handle_output_mouse(&mut app, mouse(MouseEventKind::Up(MouseButton::Left)));
 
@@ -5668,5 +5709,6 @@ mod tests {
             app.storage.list_tasks(&app.current.session_id).unwrap()[0].status,
             TodoStatus::InProgress
         );
+        assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
     }
 }
