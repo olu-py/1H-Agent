@@ -104,9 +104,32 @@ pub struct SessionRuntime {
     pub runner: Option<AgentRunner>,
     pub agent_tx: mpsc::Sender<AgentEvent>,
     pub active_task: Option<JoinHandle<()>>,
+    /// When the runtime was last parked into the background; used to evict the
+    /// least-recently-parked idle runtime when background capacity is exceeded.
+    pub parked_at: Instant,
 }
 
 impl SessionRuntime {
+    /// Fully stops this runtime: aborts its in-flight agent task (which also
+    /// tears down any nested child-agent futures) and rejects any approval
+    /// still waiting on it. Used when deleting a session and when evicting or
+    /// exiting background runtimes.
+    pub(crate) fn shutdown(&mut self) {
+        if let Some(approval) = self.take_pending_approval() {
+            if let ApprovalAction::Agent(reply) = approval.action {
+                let _ = reply.send(false);
+            }
+        }
+        if let Some(task) = self.active_task.take() {
+            task.abort();
+        }
+    }
+
+    /// Whether this runtime can be evicted without interrupting work.
+    pub(crate) fn idle(&self) -> bool {
+        !self.busy && self.active_task.is_none() && self.pending_approval.is_none()
+    }
+
     /// Applies a single agent event to this session's runtime state. Session
     /// list refreshes are deferred to the caller via SessionOutcome, so this
     /// method only touches per-session state plus ctx.storage.

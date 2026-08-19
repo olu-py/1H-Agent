@@ -519,9 +519,24 @@ impl Storage {
         Ok(())
     }
 
-    pub fn delete_session(&self, session_id: &str) -> Result<(), StorageError> {
+    /// Soft-deletes the session and all of its descendants, returning every
+    /// deleted id (root first) so callers can tear down their in-memory
+    /// runtimes and tracking state for the whole subtree.
+    pub fn delete_session(&self, session_id: &str) -> Result<Vec<String>, StorageError> {
         let now = Utc::now().to_rfc3339();
         let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "WITH RECURSIVE descendants(id, depth) AS (
+                 SELECT id, 0 FROM sessions WHERE id = ?1
+                 UNION ALL
+                 SELECT s.id, d.depth + 1 FROM sessions s JOIN descendants d ON s.parent_id = d.id
+             )
+             SELECT id FROM descendants ORDER BY depth",
+        )?;
+        let deleted = statement
+            .query_map([session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
         connection.execute(
             "WITH RECURSIVE descendants(id) AS (
                  SELECT id FROM sessions WHERE id = ?1
@@ -531,7 +546,7 @@ impl Storage {
              UPDATE sessions SET deleted_at = ?2 WHERE id IN (SELECT id FROM descendants)",
             params![session_id, now],
         )?;
-        Ok(())
+        Ok(deleted)
     }
 
     pub fn fork_session(&self, session_id: &str) -> Result<String, StorageError> {
@@ -937,7 +952,11 @@ mod tests {
             )
             .unwrap();
 
-        storage.delete_session(&parent).unwrap();
+        let deleted = storage.delete_session(&parent).unwrap();
+        assert_eq!(
+            deleted,
+            vec![parent.clone(), child.clone(), grandchild.clone()]
+        );
         let sessions = storage.list_sessions(root.path()).unwrap();
         assert!(sessions.is_empty());
 

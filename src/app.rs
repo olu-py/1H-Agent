@@ -492,18 +492,9 @@ async fn event_loop(
             terminal.draw(|frame| ui::draw(frame, app))?;
         }
     }
-    if let Some(task) = app.current.active_task.take() {
-        task.abort();
-    }
+    app.current.shutdown();
     for runtime in app.background.values_mut() {
-        if let Some(task) = runtime.active_task.take() {
-            task.abort();
-        }
-    }
-    if let Some(approval) = app.current.take_pending_approval() {
-        if let ApprovalAction::Agent(reply) = approval.action {
-            let _ = reply.send(false);
-        }
+        runtime.shutdown();
     }
     Ok(())
 }
@@ -2046,19 +2037,28 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             app.current.status = format!("会话已重命名为 {}", title.trim());
         }
         Command::Delete => {
-            if app.sessions.len() <= 1 {
-                app.current.status = "不能删除最后一个会话，请先执行 /new".into();
-            } else {
-                let deleted = app.current.session_id.clone();
-                app.storage.delete_session(&deleted)?;
-                let next = app
-                    .storage
-                    .latest_session(&app.workspace)?
-                    .context("no session remains after delete")?;
-                activate_session(app, next)?;
-                refresh_sessions(app)?;
-                app.current.status = "会话已删除".into();
+            let deleted = app.current.session_id.clone();
+            let deleted_ids = app.storage.delete_session(&deleted)?;
+            let next = match app.storage.latest_session(&app.workspace)? {
+                Some(session_id) => session_id,
+                None => app.storage.create_session(&app.workspace)?,
+            };
+            activate_session(app, next)?;
+            let deleted_ids = deleted_ids.into_iter().collect::<HashSet<_>>();
+            for session_id in &deleted_ids {
+                if let Some(mut runtime) = app.background.remove(session_id) {
+                    runtime.shutdown();
+                }
+                app.child_status.remove(session_id);
+                app.child_batches.remove(session_id);
+                app.expanded_sessions.remove(session_id);
             }
+            app.child_batches.retain(|_, children| {
+                children.retain(|child_id| !deleted_ids.contains(child_id));
+                !children.is_empty()
+            });
+            refresh_sessions(app)?;
+            app.current.status = "会话已删除".into();
         }
         Command::Fork => {
             let fork = app.storage.fork_session(&app.current.session_id)?;
@@ -2423,6 +2423,9 @@ fn handle_routed_event(app: &mut App, routed: RoutedEvent) -> bool {
     }
     if outcome.sessions_dirty && refresh_sessions(app).is_err() && is_active {
         app.current.status = "就绪，但刷新会话失败".into();
+    }
+    if !is_active {
+        evict_background_overflow(app);
     }
     is_active || app.has_pending_approval()
 }
@@ -2797,6 +2800,7 @@ fn build_runtime(
         runner,
         agent_tx,
         active_task: None,
+        parked_at: Instant::now(),
     }
 }
 
@@ -2820,8 +2824,10 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
         )
     });
     let old_id = app.active_session.clone();
-    let old = std::mem::replace(&mut app.current, target);
+    let mut old = std::mem::replace(&mut app.current, target);
+    old.parked_at = Instant::now();
     app.background.insert(old_id, old);
+    evict_background_overflow(app);
     app.active_session = session_id;
     app.registry.set_mode(app.current.mode);
     app.input.clear();
@@ -2835,8 +2841,47 @@ fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     Ok(())
 }
 
+fn evict_background_overflow(app: &mut App) {
+    let capacity = app.config.runtime.max_background_sessions;
+    while app.background.len() > capacity {
+        let eviction_id = app
+            .background
+            .iter()
+            .filter(|(_, runtime)| runtime.idle())
+            .min_by_key(|(_, runtime)| runtime.parked_at)
+            .or_else(|| {
+                app.background
+                    .iter()
+                    .min_by_key(|(_, runtime)| runtime.parked_at)
+            })
+            .map(|(session_id, _)| session_id.clone());
+        let Some(eviction_id) = eviction_id else {
+            break;
+        };
+        if let Some(mut runtime) = app.background.remove(&eviction_id) {
+            runtime.shutdown();
+        }
+    }
+}
+
 fn refresh_sessions(app: &mut App) -> Result<()> {
     app.sessions = app.storage.list_sessions(&app.workspace)?;
+    let live_ids = app
+        .sessions
+        .iter()
+        .map(|session| session.id.as_str())
+        .collect::<HashSet<_>>();
+    app.child_status
+        .retain(|session_id, _| live_ids.contains(session_id.as_str()));
+    app.child_batches.retain(|session_id, children| {
+        if !live_ids.contains(session_id.as_str()) {
+            return false;
+        }
+        children.retain(|child_id| live_ids.contains(child_id.as_str()));
+        !children.is_empty()
+    });
+    app.expanded_sessions
+        .retain(|session_id| live_ids.contains(session_id.as_str()));
     Ok(())
 }
 
@@ -2995,6 +3040,43 @@ mod tests {
 
         assert_eq!(app.input.as_str(), "keep this prompt");
         assert_eq!(app.current.status, "请打开提供商设置配置 API Key");
+    }
+
+    #[tokio::test]
+    async fn delete_last_session_creates_replacement_and_removes_old_runtime() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let deleted = app.active_session.clone();
+
+        execute_command(&mut app, Command::Delete).unwrap();
+
+        assert_ne!(app.active_session, deleted);
+        assert_eq!(app.current.session_id, app.active_session);
+        assert!(!app.background.contains_key(&deleted));
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, app.active_session);
+        assert_eq!(app.current.mode, AgentMode::Build);
+        assert_eq!(app.current.status, "会话已删除");
+        let sessions = app.storage.list_sessions(&app.workspace).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, app.active_session);
+    }
+
+    #[tokio::test]
+    async fn delete_session_switches_to_most_recent_remaining_session() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let deleted = app.active_session.clone();
+        let replacement = app.storage.create_session(&app.workspace).unwrap();
+
+        execute_command(&mut app, Command::Delete).unwrap();
+
+        assert_eq!(app.active_session, replacement);
+        assert_eq!(app.current.session_id, replacement);
+        assert!(!app.background.contains_key(&deleted));
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, replacement);
+        assert_eq!(app.current.status, "会话已删除");
     }
 
     #[test]
@@ -3298,12 +3380,23 @@ mod tests {
     async fn handle_routed_event_records_child_session_status() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
-        let child_id = "child-1".to_owned();
-        let active_session = app.active_session.clone();
+        let parent = app.active_session.clone();
+        let child_id = app
+            .storage
+            .create_child_session(
+                &app.workspace,
+                &parent,
+                "openai",
+                "gpt-5-mini",
+                "child",
+                "explore",
+                "reviewer",
+            )
+            .unwrap();
         let redraw = handle_routed_event(
             &mut app,
             RoutedEvent {
-                session_id: active_session,
+                session_id: parent,
                 event: AgentEvent::ChildSessionProgress {
                     session_id: child_id.clone(),
                     progress: ChildSessionProgress {
@@ -3330,6 +3423,30 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         let parent = app.active_session.clone();
+        let child_a = app
+            .storage
+            .create_child_session(
+                &app.workspace,
+                &parent,
+                "openai",
+                "gpt-5-mini",
+                "child-a",
+                "explore",
+                "reviewer",
+            )
+            .unwrap();
+        let child_b = app
+            .storage
+            .create_child_session(
+                &app.workspace,
+                &parent,
+                "openai",
+                "gpt-5-mini",
+                "child-b",
+                "explore",
+                "reviewer",
+            )
+            .unwrap();
         let route = |app: &mut App, child: &str, status| {
             handle_routed_event(
                 app,
@@ -3349,11 +3466,11 @@ mod tests {
             )
         };
 
-        assert!(route(&mut app, "child-a", ChildSessionStatus::Queued));
-        assert!(route(&mut app, "child-b", ChildSessionStatus::Queued));
-        assert!(route(&mut app, "child-a", ChildSessionStatus::WaitingModel));
+        assert!(route(&mut app, &child_a, ChildSessionStatus::Queued));
+        assert!(route(&mut app, &child_b, ChildSessionStatus::Queued));
+        assert!(route(&mut app, &child_a, ChildSessionStatus::WaitingModel));
         assert_eq!(app.current.status, "集群 0/2 完成 · 1 运行 · 1 排队");
-        assert!(route(&mut app, "child-a", ChildSessionStatus::Completed));
+        assert!(route(&mut app, &child_a, ChildSessionStatus::Completed));
         assert_eq!(app.current.status, "集群 1/2 完成 · 0 运行 · 1 排队");
     }
 
@@ -3410,6 +3527,197 @@ mod tests {
         activate_session(&mut app, old_session.clone()).unwrap();
         assert_eq!(app.active_session, old_session);
         assert!(app.background.contains_key(&new_session));
+    }
+
+    #[tokio::test]
+    async fn delete_running_session_aborts_task_and_rejects_approval() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let deleted = app.active_session.clone();
+        let (task_finished, task_result) = oneshot::channel();
+        app.current.busy = true;
+        app.current.active_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = task_finished.send(());
+        }));
+        let (approval_reply, approval_result) = oneshot::channel();
+        app.current.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "delete-running".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/lib.rs"}),
+            },
+            reason: "test deletion shutdown".into(),
+            source_session_id: None,
+            source_title: None,
+            action: ApprovalAction::Agent(approval_reply),
+            created_at: Instant::now(),
+        });
+
+        execute_command(&mut app, Command::Delete).unwrap();
+
+        assert!(!app.background.contains_key(&deleted));
+        assert!(!approval_result.await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), task_result)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_parent_shutdowns_descendant_runtimes_and_tracking() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let parent = app.active_session.clone();
+        let child = app
+            .storage
+            .create_child_session(
+                &app.workspace,
+                &parent,
+                "openai",
+                "gpt-5-mini",
+                "child",
+                "explore",
+                "reviewer",
+            )
+            .unwrap();
+        activate_session(&mut app, child.clone()).unwrap();
+        activate_session(&mut app, parent.clone()).unwrap();
+        let (approval_reply, approval_result) = oneshot::channel();
+        app.background.get_mut(&child).unwrap().pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "descendant-approval".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/lib.rs"}),
+            },
+            reason: "test descendant shutdown".into(),
+            source_session_id: Some(child.clone()),
+            source_title: Some("child".into()),
+            action: ApprovalAction::Agent(approval_reply),
+            created_at: Instant::now(),
+        });
+        app.child_status.insert(
+            child.clone(),
+            ChildSessionProgress {
+                status: ChildSessionStatus::WaitingApproval,
+                turn: 1,
+                max_turns: 1,
+                tool: Some("file_write".into()),
+                updated_at: Instant::now(),
+            },
+        );
+        app.child_batches
+            .insert(parent.clone(), HashSet::from([child.clone()]));
+        app.expanded_sessions
+            .extend([parent.clone(), child.clone()]);
+
+        execute_command(&mut app, Command::Delete).unwrap();
+
+        assert!(!app.background.contains_key(&parent));
+        assert!(!app.background.contains_key(&child));
+        assert!(!app.child_status.contains_key(&child));
+        assert!(!app.child_batches.contains_key(&parent));
+        assert!(!app.expanded_sessions.contains(&parent));
+        assert!(!app.expanded_sessions.contains(&child));
+        assert!(!approval_result.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn background_capacity_evicts_least_recently_parked_idle_runtime() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.config.runtime.max_background_sessions = 2;
+        let first = app.active_session.clone();
+        let second = app.storage.create_session(&app.workspace).unwrap();
+        let third = app.storage.create_session(&app.workspace).unwrap();
+        let fourth = app.storage.create_session(&app.workspace).unwrap();
+
+        activate_session(&mut app, second.clone()).unwrap();
+        app.background.get_mut(&first).unwrap().parked_at = Instant::now();
+        activate_session(&mut app, third.clone()).unwrap();
+        app.background.get_mut(&second).unwrap().parked_at =
+            Instant::now() + Duration::from_secs(1);
+        activate_session(&mut app, fourth).unwrap();
+
+        assert_eq!(app.background.len(), 2);
+        assert!(!app.background.contains_key(&first));
+        assert!(app.background.contains_key(&second));
+        assert!(app.background.contains_key(&third));
+    }
+
+    #[tokio::test]
+    async fn background_capacity_protects_busy_and_approval_runtimes() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.config.runtime.max_background_sessions = 2;
+        let busy = app.active_session.clone();
+        let waiting = app.storage.create_session(&app.workspace).unwrap();
+        let evicted = app.storage.create_session(&app.workspace).unwrap();
+        let active = app.storage.create_session(&app.workspace).unwrap();
+
+        activate_session(&mut app, waiting.clone()).unwrap();
+        app.background.get_mut(&busy).unwrap().busy = true;
+        activate_session(&mut app, evicted.clone()).unwrap();
+        let (approval_reply, approval_result) = oneshot::channel();
+        app.background.get_mut(&waiting).unwrap().pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "capacity-approval".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/lib.rs"}),
+            },
+            reason: "test protected approval".into(),
+            source_session_id: None,
+            source_title: None,
+            action: ApprovalAction::Agent(approval_reply),
+            created_at: Instant::now(),
+        });
+        activate_session(&mut app, active).unwrap();
+
+        assert_eq!(app.background.len(), 2);
+        assert!(app.background.contains_key(&busy));
+        assert!(app.background.contains_key(&waiting));
+        assert!(!app.background.contains_key(&evicted));
+        app.background.get_mut(&waiting).unwrap().shutdown();
+        assert!(!approval_result.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn background_capacity_stops_oldest_busy_runtime_when_required() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.config.runtime.max_background_sessions = 2;
+        let oldest = app.active_session.clone();
+        let second = app.storage.create_session(&app.workspace).unwrap();
+        let third = app.storage.create_session(&app.workspace).unwrap();
+        let active = app.storage.create_session(&app.workspace).unwrap();
+
+        activate_session(&mut app, second.clone()).unwrap();
+        let (approval_reply, approval_result) = oneshot::channel();
+        app.background.get_mut(&oldest).unwrap().pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "forced-capacity-approval".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path":"src/lib.rs"}),
+            },
+            reason: "test strict capacity".into(),
+            source_session_id: None,
+            source_title: None,
+            action: ApprovalAction::Agent(approval_reply),
+            created_at: Instant::now(),
+        });
+        activate_session(&mut app, third.clone()).unwrap();
+        app.background.get_mut(&second).unwrap().busy = true;
+        app.current.busy = true;
+
+        activate_session(&mut app, active).unwrap();
+
+        assert_eq!(app.background.len(), 2);
+        assert!(!app.background.contains_key(&oldest));
+        assert!(app.background.contains_key(&second));
+        assert!(app.background.contains_key(&third));
+        assert!(!approval_result.await.unwrap());
     }
 
     fn thinking_summary_count(app: &App) -> usize {
@@ -3489,6 +3797,7 @@ mod tests {
             runner: None,
             agent_tx,
             active_task: None,
+            parked_at: Instant::now(),
         };
         App {
             workspace,

@@ -321,6 +321,10 @@ pub struct RuntimeConfig {
     pub command_timeout_seconds: u64,
     pub max_tool_output_bytes: usize,
     pub max_fetch_bytes: usize,
+    /// Hard cap on runtimes parked in the background (the active session is
+    /// not counted). Overflow prefers the least-recently-parked idle runtime,
+    /// then shuts down the oldest busy runtime if necessary.
+    pub max_background_sessions: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -482,6 +486,7 @@ impl Default for RuntimeConfig {
             command_timeout_seconds: 60,
             max_tool_output_bytes: 1024 * 1024,
             max_fetch_bytes: 10 * 1024 * 1024,
+            max_background_sessions: 8,
         }
     }
 }
@@ -536,6 +541,8 @@ impl Config {
         }
         config.browser.max_output_bytes = config.browser.max_output_bytes.min(8 * 1024 * 1024);
         config.browser.keep_alive_seconds = config.browser.keep_alive_seconds.min(300);
+        config.runtime.max_background_sessions =
+            config.runtime.max_background_sessions.clamp(2, 64);
         config.cluster.child_max_output_bytes = config
             .cluster
             .child_max_output_bytes
@@ -1218,6 +1225,8 @@ fn default_config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
@@ -1239,10 +1248,24 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.provider.kind, ProviderKind::Responses);
         assert!(config.runtime.max_fetch_bytes >= config.runtime.max_tool_output_bytes);
+        assert_eq!(config.runtime.max_background_sessions, 8);
         assert_eq!(config.cluster.max_parallel_children, Some(4));
         assert_eq!(config.cluster.child_active_timeout_seconds, 300);
         assert!(config.compaction.enabled);
         assert_eq!(config.compaction.auto_threshold, 0.80);
+    }
+
+    #[test]
+    fn background_session_limit_is_normalized() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[runtime]\nmax_background_sessions = 0\n").unwrap();
+        let low = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(low.runtime.max_background_sessions, 2);
+
+        fs::write(&path, "[runtime]\nmax_background_sessions = 1000\n").unwrap();
+        let high = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(high.runtime.max_background_sessions, 64);
     }
 
     #[test]

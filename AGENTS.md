@@ -46,6 +46,7 @@ terminal event -> App -> SessionRuntime -> AgentRunner -> OpenAiClient / ToolReg
 ```
 
 - `App` 管全局 UI、当前/后台 runtime 和路由；`SessionRuntime` 独占单会话状态，切换不停止后台任务。
+- 后台 runtime 总量受 `runtime.max_background_sessions` 硬上限约束：优先 LRU 淘汰空闲项，必要时关停最旧忙碌项；`/delete` 必须关停被删子树任务、拒绝未决审批并清理跟踪状态。
 - Provider 私有协议先规范化为 `ModelEvent`；UI、存储和工具层不解析私有 JSON。
 - 恢复沿 `head_turn_id` 父链；fork 不复制 Provider 服务端状态；undo/redo 只移动 head。
 - workspace 必须 canonicalize；拒绝绝对路径、`..`、符号链接逃逸；新目标验证 canonical parent。
