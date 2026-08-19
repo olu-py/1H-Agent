@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     sync::{Mutex, Semaphore, mpsc, oneshot},
@@ -18,6 +18,7 @@ use crate::{
         AgentConfig, ClusterConfig, CompactionConfig, NativeWebSearch, ProviderConfig,
         ProviderKind, ProviderPreset, ThinkingCapability, thinking_profile,
     },
+    model::{TodoStatus, TodoTask},
     prompt,
     provider::{
         ConversationItem, ModelEvent, ModelRequest, OpenAiClient, Role, ThinkingMode, ToolCall,
@@ -516,6 +517,48 @@ pub enum AgentEvent {
         hidden: usize,
     },
     CompactionFailed(String),
+    TodoUpdated {
+        tasks: Vec<TodoTask>,
+    },
+}
+
+#[derive(Deserialize)]
+struct TodoWriteArguments {
+    tasks: Vec<TodoWriteTask>,
+}
+
+#[derive(Deserialize)]
+struct TodoWriteTask {
+    #[serde(default)]
+    id: Option<String>,
+    title: String,
+    status: TodoStatus,
+}
+
+#[derive(Serialize)]
+struct TodoToolTask<'a> {
+    id: &'a str,
+    title: &'a str,
+    status: TodoStatus,
+}
+
+#[derive(Serialize)]
+struct TodoToolResponse<'a> {
+    tasks: Vec<TodoToolTask<'a>>,
+}
+
+fn todo_tool_response(tasks: &[TodoTask]) -> Result<String, String> {
+    serde_json::to_string(&TodoToolResponse {
+        tasks: tasks
+            .iter()
+            .map(|task| TodoToolTask {
+                id: task.id.as_str(),
+                title: task.title.as_str(),
+                status: task.status,
+            })
+            .collect(),
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone)]
@@ -1265,6 +1308,25 @@ impl AgentRunner {
                         .await?;
                     continue;
                 }
+                if matches!(call.name.as_str(), "todo_read" | "todo_write") {
+                    self.storage
+                        .begin_tool(&self.session_id, &call, "allowed")
+                        .map_err(|error| error.to_string())?;
+                    ui_events
+                        .send(AgentEvent::ToolStarted(call.clone()))
+                        .await
+                        .map_err(|_| "UI event receiver closed".to_owned())?;
+                    let (result, updated_tasks) = self.execute_todo_tool(&call);
+                    self.complete_tool(&call, &result, ui_events, items, &mut executed_tool_calls)
+                        .await?;
+                    if let Some(tasks) = updated_tasks {
+                        ui_events
+                            .send(AgentEvent::TodoUpdated { tasks })
+                            .await
+                            .map_err(|_| "UI event receiver closed".to_owned())?;
+                    }
+                    continue;
+                }
                 let decision = self.tools.policy(&call);
                 let approved = match decision {
                     PolicyDecision::Allow => true,
@@ -1362,6 +1424,66 @@ impl AgentRunner {
                 }
             }
         }
+    }
+
+    fn execute_todo_tool(&self, call: &ToolCall) -> (String, Option<Vec<TodoTask>>) {
+        let result: Result<(String, Option<Vec<TodoTask>>), String> = match call.name.as_str() {
+            "todo_read" => self
+                .storage
+                .list_tasks(&self.session_id)
+                .map_err(|error| error.to_string())
+                .and_then(|tasks| todo_tool_response(&tasks).map(|output| (output, None))),
+            "todo_write" => self
+                .execute_todo_write(&call.arguments)
+                .map(|(output, tasks)| (output, Some(tasks))),
+            _ => Err(format!("unknown todo tool: {}", call.name)),
+        };
+        match result {
+            Ok((output, updated_tasks)) => (output, updated_tasks),
+            Err(error) => (format!("todo tool error: {error}"), None),
+        }
+    }
+
+    fn execute_todo_write(&self, arguments: &Value) -> Result<(String, Vec<TodoTask>), String> {
+        let arguments: TodoWriteArguments =
+            serde_json::from_value(arguments.clone()).map_err(|error| error.to_string())?;
+        let current = self
+            .storage
+            .list_tasks(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let existing: std::collections::HashMap<String, TodoTask> = current
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect();
+        let now = chrono::Utc::now().to_rfc3339();
+        let tasks = arguments
+            .tasks
+            .into_iter()
+            .map(|input| {
+                let title = input.title.trim().to_owned();
+                if let Some(existing) = input.id.as_deref().and_then(|id| existing.get(id)) {
+                    TodoTask {
+                        id: existing.id.clone(),
+                        title,
+                        status: input.status,
+                        created_at: existing.created_at.clone(),
+                        updated_at: now.clone(),
+                    }
+                } else {
+                    TodoTask {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        title,
+                        status: input.status,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        self.storage
+            .replace_tasks(&self.session_id, &tasks)
+            .map_err(|error| error.to_string())?;
+        Ok((todo_tool_response(&tasks)?, tasks))
     }
 
     /// Finishes an already-started tool call: persists the result, emits the
@@ -2820,5 +2942,86 @@ mod tests {
         assert_eq!(starts, 1);
         assert!(duplicate_notice);
         assert!(completed);
+    }
+
+    #[test]
+    fn todo_tools_are_session_scoped_and_replace_the_whole_list() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let runner = AgentRunner::new(
+            OpenAiClient::scripted(Vec::new()).unwrap(),
+            ProviderPreset::OpenAi.defaults(),
+            tools.clone(),
+            storage.clone(),
+            session_id.clone(),
+        );
+
+        assert!(matches!(
+            tools.policy(&ToolCall {
+                id: "policy".into(),
+                name: "todo_write".into(),
+                arguments: serde_json::json!({"tasks":[]})
+            }),
+            PolicyDecision::Allow
+        ));
+        assert!(!child_tool_name_allowed(
+            "todo_write",
+            Some("implement"),
+            &[]
+        ));
+        assert!(
+            tools
+                .definitions()
+                .iter()
+                .any(|tool| tool.name == "todo_write")
+        );
+
+        let read = ToolCall {
+            id: "todo-read".into(),
+            name: "todo_read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let (output, updated) = runner.execute_todo_tool(&read);
+        assert_eq!(output, r#"{"tasks":[]}"#);
+        assert!(updated.is_none());
+
+        let write = ToolCall {
+            id: "todo-write".into(),
+            name: "todo_write".into(),
+            arguments: serde_json::json!({
+                "tasks": [
+                    {"title":"inspect","status":"pending"},
+                    {"title":"implement","status":"in_progress"}
+                ]
+            }),
+        };
+        let (output, updated) = runner.execute_todo_tool(&write);
+        let tasks = updated.expect("todo_write should return updated tasks");
+        assert_eq!(tasks.len(), 2);
+        let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["tasks"][1]["title"], "implement");
+        assert_eq!(storage.list_tasks(&session_id).unwrap(), tasks);
+
+        let first_id = tasks[0].id.clone();
+        let write = ToolCall {
+            id: "todo-write-2".into(),
+            name: "todo_write".into(),
+            arguments: serde_json::json!({
+                "tasks": [
+                    {"id":first_id,"title":"inspect and test","status":"done"}
+                ]
+            }),
+        };
+        let (_, updated) = runner.execute_todo_tool(&write);
+        let tasks = updated.unwrap();
+        assert_eq!(tasks[0].id, first_id);
+        assert_eq!(tasks[0].title, "inspect and test");
+        assert_eq!(storage.list_tasks(&session_id).unwrap().len(), 1);
     }
 }

@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     agent::{AgentEvent, AgentRunner, ChildSessionProgress, ChildSessionStatus},
-    commands::{self, AgentMode, Command},
+    commands::{self, AgentMode, Command, TodoCommand},
     config::{Config, ProviderPreset, ThinkingLevel, ThinkingProfile, thinking_profile},
     home::{self, HomeAction, HomeSelection, HomeState, RECENT_SESSION_LIMIT},
     input::InputBuffer,
@@ -51,7 +51,8 @@ const DEFERRED_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) use crate::model::ThinkingResult;
 pub use crate::model::{
     AgentPhase, ApprovalAction, DisplayContent, DisplayEntry, DisplayKind, ModelPhase,
-    PendingApproval, ThinkingDisplay, ToolDisplay, ToolDisplayStatus,
+    PendingApproval, ThinkingDisplay, TodoDisplay, TodoStatus, TodoTask, ToolDisplay,
+    ToolDisplayStatus,
 };
 
 #[derive(Clone, Debug)]
@@ -1377,6 +1378,21 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                                 app.current.expanded_thinking.remove(&id);
                             }
                         }
+                        InteractionTarget::Todo(task_id) => {
+                            let mut tasks = app.current.todos.clone();
+                            if let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) {
+                                task.status = task.status.next();
+                                task.updated_at = chrono::Utc::now().to_rfc3339();
+                                match app.storage.replace_tasks(&app.current.session_id, &tasks) {
+                                    Ok(()) => {
+                                        app.current.todos = tasks;
+                                    }
+                                    Err(error) => {
+                                        app.current.status = format!("任务更新失败：{error}");
+                                    }
+                                }
+                            }
+                        }
                     }
                     if !live_thinking_target {
                         app.current.invalidate_output_layout();
@@ -1941,7 +1957,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             app.current.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(
-                    "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export [路径]` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
+                    "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export [路径]` `/todo [add|doing|done|undo|edit|remove|clear]` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
                         .into(),
                 ),
             });
@@ -2069,6 +2085,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 app.current.status = "没有可重做的内容".into();
             }
         }
+        Command::Todo(action) => handle_todo_command(app, action)?,
         Command::Compact(focus) => {
             let Some(runner) = app.current.runner.clone() else {
                 app.current.status = "请打开提供商设置配置 API Key".into();
@@ -2113,6 +2130,108 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
     Ok(())
 }
 
+fn handle_todo_command(app: &mut App, action: TodoCommand) -> Result<()> {
+    match action {
+        TodoCommand::Show => {
+            let (done, total) = todo_progress(&app.current.todos);
+            let mut content = format!("## 任务清单 {done}/{total}\n");
+            for (index, task) in app.current.todos.iter().enumerate() {
+                content.push_str(&format!(
+                    "- {} {}. {}\n",
+                    task.status.symbol(),
+                    index + 1,
+                    task.title
+                ));
+            }
+            app.current.push_entry(DisplayEntry {
+                kind: DisplayKind::System,
+                content: DisplayContent::Markdown(content),
+            });
+            app.current.status = if total == 0 {
+                "任务清单为空".into()
+            } else {
+                format!("任务清单 {done}/{total}")
+            };
+        }
+        TodoCommand::Add(title) => {
+            let mut tasks = app.current.todos.clone();
+            tasks.push(TodoTask::new(title, TodoStatus::Pending));
+            apply_todo_tasks(app, tasks)?;
+            app.current.status = "任务已添加".into();
+        }
+        TodoCommand::Doing(index) => {
+            update_todo_status(app, index, TodoStatus::InProgress, "任务已标记为进行中")?;
+        }
+        TodoCommand::Done(index) => {
+            update_todo_status(app, index, TodoStatus::Done, "任务已完成")?;
+        }
+        TodoCommand::Undo(index) => {
+            update_todo_status(app, index, TodoStatus::Pending, "任务已标记为待处理")?;
+        }
+        TodoCommand::Edit(index, title) => {
+            let mut tasks = app.current.todos.clone();
+            let Some(task) = tasks.get_mut(index.checked_sub(1).unwrap_or(usize::MAX)) else {
+                app.current.status = "任务序号不存在".into();
+                return Ok(());
+            };
+            task.title = title;
+            task.updated_at = chrono::Utc::now().to_rfc3339();
+            apply_todo_tasks(app, tasks)?;
+            app.current.status = "任务已更新".into();
+        }
+        TodoCommand::Remove(index) => {
+            let mut tasks = app.current.todos.clone();
+            if index == 0 || index > tasks.len() {
+                app.current.status = "任务序号不存在".into();
+                return Ok(());
+            }
+            tasks.remove(index - 1);
+            apply_todo_tasks(app, tasks)?;
+            app.current.status = "任务已删除".into();
+        }
+        TodoCommand::Clear => {
+            apply_todo_tasks(app, Vec::new())?;
+            app.current.status = "任务清单已清空".into();
+        }
+    }
+    Ok(())
+}
+
+fn todo_progress(tasks: &[TodoTask]) -> (usize, usize) {
+    (
+        tasks
+            .iter()
+            .filter(|task| task.status == TodoStatus::Done)
+            .count(),
+        tasks.len(),
+    )
+}
+
+fn update_todo_status(
+    app: &mut App,
+    index: usize,
+    status: TodoStatus,
+    message: &str,
+) -> Result<()> {
+    let mut tasks = app.current.todos.clone();
+    let Some(task) = tasks.get_mut(index.checked_sub(1).unwrap_or(usize::MAX)) else {
+        app.current.status = "任务序号不存在".into();
+        return Ok(());
+    };
+    task.status = status;
+    task.updated_at = chrono::Utc::now().to_rfc3339();
+    apply_todo_tasks(app, tasks)?;
+    app.current.status = message.into();
+    Ok(())
+}
+
+fn apply_todo_tasks(app: &mut App, tasks: Vec<TodoTask>) -> Result<()> {
+    app.storage.replace_tasks(&app.current.session_id, &tasks)?;
+    app.current.todos = tasks;
+    app.current.invalidate_output_layout();
+    Ok(())
+}
+
 fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
     let requested = requested
         .as_deref()
@@ -2126,6 +2245,24 @@ fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
         .resolve_new(filename)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let mut output = String::new();
+    if !app.current.todos.is_empty() {
+        let (done, total) = todo_progress(&app.current.todos);
+        output.push_str(&format!("## 任务清单（{done}/{total}）\n\n"));
+        for task in &app.current.todos {
+            let checkbox = if task.status == TodoStatus::Done {
+                "x"
+            } else {
+                " "
+            };
+            let suffix = if task.status == TodoStatus::InProgress {
+                "（进行中）"
+            } else {
+                ""
+            };
+            output.push_str(&format!("- [{checkbox}] {}{suffix}\n", task.title));
+        }
+        output.push('\n');
+    }
     for item in &app.current.conversation {
         if let ConversationItem::Message { role, content } = item {
             let label = match role {
@@ -2695,6 +2832,7 @@ fn build_runtime(
 ) -> SessionRuntime {
     let mut conversation = storage.load_messages(session_id).unwrap_or_default();
     trim_conversation(&mut conversation);
+    let todos = storage.list_tasks(session_id).unwrap_or_default();
     let entries = display_entries(&conversation);
     let mode = storage
         .session_mode(session_id)
@@ -2753,6 +2891,7 @@ fn build_runtime(
         session_id: session_id.to_owned(),
         status: String::new(),
         entries,
+        todos,
         busy: false,
         agent_phase: AgentPhase::Idle,
         model_phase: ModelPhase::Idle,
@@ -3871,6 +4010,7 @@ mod tests {
                 kind: DisplayKind::Assistant,
                 content: DisplayContent::Markdown("first line\n\n中文 🙂 long output".into()),
             }],
+            todos: Vec::new(),
             busy: false,
             agent_phase: AgentPhase::Idle,
             model_phase: ModelPhase::Idle,
@@ -5406,5 +5546,127 @@ mod tests {
         assert_eq!(app.current.message_scroll, 0);
         assert!(!handle_output_mouse(&mut app, wheel_event(MouseEventKind::ScrollDown)).redraw);
         assert_eq!(app.current.output_layout_rebuild_count, 1);
+    }
+
+    #[test]
+    fn todo_commands_update_storage_and_runtime() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+
+        execute_command(
+            &mut app,
+            Command::Todo(TodoCommand::Add("write tests".into())),
+        )
+        .unwrap();
+        execute_command(&mut app, Command::Todo(TodoCommand::Doing(1))).unwrap();
+
+        let tasks = app.storage.list_tasks(&app.current.session_id).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "write tests");
+        assert_eq!(tasks[0].status, TodoStatus::InProgress);
+        assert_eq!(app.current.todos, tasks);
+        assert!(app.current.output_layout_dirty);
+        assert_eq!(app.current.status, "任务已标记为进行中");
+    }
+
+    #[test]
+    fn todo_updated_event_updates_runtime_without_rebuilding_entries() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let entries = app.current.entries.len();
+        let tasks = vec![TodoTask::new("verify", TodoStatus::Done)];
+
+        handle_event_for_test(&mut app, AgentEvent::TodoUpdated { tasks });
+
+        assert_eq!(app.current.entries.len(), entries);
+        assert_eq!(app.current.todos.len(), 1);
+        assert_eq!(app.current.todos[0].status, TodoStatus::Done);
+        assert!(app.current.output_layout_dirty);
+    }
+
+    #[test]
+    fn export_includes_todo_checklist() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        execute_command(
+            &mut app,
+            Command::Todo(TodoCommand::Add("pending task".into())),
+        )
+        .unwrap();
+        execute_command(
+            &mut app,
+            Command::Todo(TodoCommand::Add("done task".into())),
+        )
+        .unwrap();
+        execute_command(&mut app, Command::Todo(TodoCommand::Done(2))).unwrap();
+
+        export_session(&mut app, None).unwrap();
+        let filename = format!("1h-agent-{}.md", app.current.session_id);
+        let output = std::fs::read_to_string(app.workspace.join(filename)).unwrap();
+        assert!(output.contains("## 任务清单（1/2）"));
+        assert!(output.contains("- [ ] pending task"));
+        assert!(output.contains("- [x] done task"));
+    }
+
+    #[test]
+    fn todo_card_renders_and_status_click_cycles() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.current.todos = vec![TodoTask::new("clickable", TodoStatus::Pending)];
+        app.current.follow_output = false;
+        app.current.message_scroll = 0;
+        app.current.output_scroll_top = Some(0);
+
+        app.current.todos = (0..10)
+            .map(|index| {
+                let title = if index == 9 {
+                    "x".repeat(80)
+                } else {
+                    "clickable".to_owned()
+                };
+                TodoTask::new(title, TodoStatus::Pending)
+            })
+            .collect();
+        let screen = render_screen(&mut app, 20, 30);
+        assert!(screen.iter().any(|line| line.contains("0/10")));
+        assert!(screen.iter().any(|line| line.contains("○ 1. clickable")));
+        let layout = app.current.message_layout.as_ref().unwrap();
+        let long_line = layout
+            .lines
+            .iter()
+            .find(|line| line.text.contains("10. "))
+            .expect("long todo task should be rendered");
+        assert!(unicode_width::UnicodeWidthStr::width(long_line.text.as_str()) <= 20);
+        assert!(long_line.text.ends_with("..."));
+
+        let (column, row, target) = {
+            let layout = app.current.message_layout.as_ref().unwrap();
+            let mut cursor = layout.viewport.y;
+            let mut found = None;
+            while cursor < layout.viewport.bottom() {
+                if let Some(target) = layout.interaction_at(layout.viewport.x, cursor) {
+                    found = Some((cursor, target));
+                    break;
+                }
+                cursor += 1;
+            }
+            let (row, target) = found.expect("todo task should be clickable");
+            (layout.viewport.x, row, target)
+        };
+        assert!(matches!(target, InteractionTarget::Todo(_)));
+        let mouse = |kind| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_output_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left)));
+        handle_output_mouse(&mut app, mouse(MouseEventKind::Up(MouseButton::Left)));
+
+        assert_eq!(app.current.todos[0].status, TodoStatus::InProgress);
+        assert_eq!(
+            app.storage.list_tasks(&app.current.session_id).unwrap()[0].status,
+            TodoStatus::InProgress
+        );
     }
 }

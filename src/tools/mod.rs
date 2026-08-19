@@ -246,6 +246,36 @@ impl ToolRegistry {
                 "Read the current repository diff without changing files",
                 json!({"type":"object","properties":{"cwd":{"type":"string"}},"additionalProperties":false}),
             ),
+            definition(
+                "todo_read",
+                "Read the current session task list",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            ),
+            definition(
+                "todo_write",
+                "Replace the current session task list",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "tasks":{
+                            "type":"array",
+                            "maxItems":50,
+                            "items":{
+                                "type":"object",
+                                "properties":{
+                                    "id":{"type":"string"},
+                                    "title":{"type":"string","minLength":1,"maxLength":240},
+                                    "status":{"type":"string","enum":["pending","in_progress","done"]}
+                                },
+                                "required":["title","status"],
+                                "additionalProperties":false
+                            }
+                        }
+                    },
+                    "required":["tasks"],
+                    "additionalProperties":false
+                }),
+            ),
         ];
         if self
             .browser

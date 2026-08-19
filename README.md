@@ -69,6 +69,7 @@ native_web_search = "disabled"
 | 新会话 / 切换会话 | `Ctrl+N` / `Alt+Up`、`Alt+Down` / 点击会话行（父会话点击展开/收起子会话） |
 | 切换模式 | 在命令面板选择“切换模式” / `/plan` `/build` `/explore` `/cluster` / 点击输入框标题的模式标签 |
 | 命令面板 / 命令 | `Ctrl+P` / `Ctrl+X` / `/` |
+| 任务清单 | `/todo`、`/todo add <标题>`、`/todo doing|done|undo <序号>`、`/todo edit <序号> <标题>`、`/todo remove <序号>`、`/todo clear`；点击任务状态符号循环切换 |
 | 选择供应商 / 模型 | 分别点击输入框下方的供应商或模型文字 / `/model <模型名>` |
 | 引用文件 / 执行命令 | `@path` / `!command`（命令须审批） |
 | 滚动 / 回到底部 | `PageUp`、`PageDown` / `Ctrl+L` |

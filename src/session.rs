@@ -13,7 +13,7 @@ use crate::{
     commands::AgentMode,
     model::{
         AgentPhase, ApprovalAction, DisplayContent, DisplayEntry, DisplayKind, ModelPhase,
-        PendingApproval, ThinkingDisplay, ThinkingResult, ToolDisplay, ToolDisplayStatus,
+        PendingApproval, ThinkingDisplay, ThinkingResult, TodoTask, ToolDisplay, ToolDisplayStatus,
     },
     output::{CachedMarkdown, EdgeScroll, MessageLayout, OutputSelection},
     provider::{ConversationItem, Role, Usage},
@@ -65,6 +65,7 @@ pub struct SessionRuntime {
     pub session_id: String,
     pub status: String,
     pub entries: Vec<DisplayEntry>,
+    pub todos: Vec<TodoTask>,
     pub busy: bool,
     pub agent_phase: AgentPhase,
     pub model_phase: ModelPhase,
@@ -146,6 +147,10 @@ impl SessionRuntime {
                 self.agent_phase = AgentPhase::Thinking;
                 self.model_phase = ModelPhase::Streaming;
                 self.status = "等待模型流式响应".into();
+            }
+            AgentEvent::TodoUpdated { tasks } => {
+                self.todos = tasks;
+                self.invalidate_output_layout();
             }
             AgentEvent::CompactionStarted => {
                 self.status = "正在压缩上下文…… | Esc 取消".into();
@@ -727,6 +732,7 @@ fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
                     + tool.result.as_ref().map_or(0, String::len)
             }
             DisplayContent::Thinking(thinking) => thinking.id.len() + thinking.content.len(),
+            DisplayContent::Todo(todo) => todo.tasks.len() * 16,
         })
         .sum()
 }

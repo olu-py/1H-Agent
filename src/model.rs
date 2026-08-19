@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -7,6 +8,7 @@ use crate::provider::ToolCall;
 
 #[derive(Clone, Debug)]
 pub enum DisplayKind {
+    Todo,
     User,
     Assistant,
     Thinking,
@@ -70,9 +72,83 @@ pub struct DisplayEntry {
 #[derive(Clone, Debug)]
 pub enum DisplayContent {
     Markdown(String),
+    Todo(TodoDisplay),
     Diff(String),
     Tool(ToolDisplay),
     Thinking(ThinkingDisplay),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+impl TodoStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Pending => Self::InProgress,
+            Self::InProgress => Self::Done,
+            Self::Done => Self::Pending,
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Pending => "○",
+            Self::InProgress => "◐",
+            Self::Done => "●",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoTask {
+    pub id: String,
+    pub title: String,
+    pub status: TodoStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl TodoTask {
+    pub fn new(title: impl Into<String>, status: TodoStatus) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.into(),
+            status,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TodoDisplay {
+    pub tasks: Vec<TodoTask>,
+}
+
+impl TodoDisplay {
+    pub fn progress(&self) -> (usize, usize) {
+        (
+            self.tasks
+                .iter()
+                .filter(|task| task.status == TodoStatus::Done)
+                .count(),
+            self.tasks.len(),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]

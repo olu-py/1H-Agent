@@ -8,7 +8,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::provider::{ConversationItem, Role, ToolCall};
+use crate::{
+    model::{TodoStatus, TodoTask},
+    provider::{ConversationItem, Role, ToolCall},
+};
 
 #[derive(Clone)]
 pub struct Storage {
@@ -30,6 +33,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("storage lock is poisoned")]
     Poisoned,
+    #[error("invalid todo task: {0}")]
+    InvalidTodo(String),
 }
 
 impl Storage {
@@ -108,10 +113,21 @@ impl Storage {
                 summary TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS session_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (1, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (2, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (3, CURRENT_TIMESTAMP);
             ",
         )?;
         // These checks keep databases created by the first release compatible
@@ -149,7 +165,7 @@ impl Storage {
         ensure_column(&connection, "messages", "metadata", "TEXT")?;
         backfill_turns(&connection)?;
         connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP)",
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, CURRENT_TIMESTAMP)",
             [],
         )?;
         Ok(Self {
@@ -598,7 +614,88 @@ impl Storage {
                 params![new_id, role, content, now, root_turn, kind, hidden, metadata],
             )?;
         }
+        let tasks = {
+            let mut statement = connection.prepare(
+                "SELECT title, status, created_at, updated_at FROM session_tasks WHERE session_id = ?1 ORDER BY position ASC",
+            )?;
+            statement
+                .query_map([session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (position, (title, status, created_at, updated_at)) in tasks.into_iter().enumerate() {
+            connection.execute(
+                "INSERT INTO session_tasks(id, session_id, position, title, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    new_id,
+                    position as i64,
+                    title,
+                    status,
+                    created_at,
+                    updated_at
+                ],
+            )?;
+        }
         Ok(new_id)
+    }
+
+    pub fn list_tasks(&self, session_id: &str) -> Result<Vec<TodoTask>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT id, title, status, created_at, updated_at FROM session_tasks \
+             WHERE session_id = ?1 ORDER BY position ASC",
+        )?;
+        let rows = statement
+            .query_map([session_id], |row| {
+                Ok(TodoTask {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    status: parse_todo_status(row.get::<_, String>(2)?)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn replace_tasks(&self, session_id: &str, tasks: &[TodoTask]) -> Result<(), StorageError> {
+        validate_todo_tasks(tasks)?;
+        let now = Utc::now().to_rfc3339();
+        let connection = self.lock()?;
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM session_tasks WHERE session_id = ?1",
+            [session_id],
+        )?;
+        for (position, task) in tasks.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO session_tasks(id, session_id, position, title, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    task.id,
+                    session_id,
+                    position as i64,
+                    task.title,
+                    task.status.as_str(),
+                    task.created_at,
+                    task.updated_at
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![session_id, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn undo(&self, session_id: &str) -> Result<bool, StorageError> {
@@ -887,6 +984,39 @@ fn backfill_turns(connection: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn parse_todo_status(value: String) -> Result<TodoStatus, rusqlite::Error> {
+    match value.as_str() {
+        "pending" => Ok(TodoStatus::Pending),
+        "in_progress" => Ok(TodoStatus::InProgress),
+        "done" => Ok(TodoStatus::Done),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::fmt::Error),
+        )),
+    }
+}
+
+fn validate_todo_tasks(tasks: &[TodoTask]) -> Result<(), StorageError> {
+    if tasks.len() > 50 {
+        return Err(StorageError::InvalidTodo("at most 50 tasks".into()));
+    }
+    let mut ids = std::collections::HashSet::with_capacity(tasks.len());
+    for task in tasks {
+        let title = task.title.trim();
+        let title_chars = title.chars().count();
+        if title_chars == 0 || title_chars > 240 {
+            return Err(StorageError::InvalidTodo(
+                "task title must contain 1 to 240 characters".into(),
+            ));
+        }
+        if !ids.insert(task.id.as_str()) {
+            return Err(StorageError::InvalidTodo("duplicate task id".into()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,5 +1287,59 @@ mod tests {
             &items[1],
             ConversationItem::ProviderItem { item } if item["id"] == "ws_1"
         ));
+    }
+
+    #[test]
+    fn todo_tasks_replace_list_and_are_copied_on_fork() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let first = TodoTask::new("first", TodoStatus::Pending);
+        let second = TodoTask::new("second", TodoStatus::InProgress);
+
+        storage
+            .replace_tasks(&session, &[first.clone(), second])
+            .unwrap();
+        assert_eq!(storage.list_tasks(&session).unwrap().len(), 2);
+
+        let first_updated = TodoTask {
+            status: TodoStatus::Done,
+            ..first
+        };
+        let third = TodoTask::new("third", TodoStatus::Pending);
+        storage
+            .replace_tasks(&session, &[first_updated.clone(), third])
+            .unwrap();
+        let tasks = storage.list_tasks(&session).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, first_updated.id);
+        assert_eq!(tasks[0].status, TodoStatus::Done);
+        assert_eq!(tasks[0].title, "first");
+        assert_eq!(tasks[1].title, "third");
+
+        let fork = storage.fork_session(&session).unwrap();
+        let forked = storage.list_tasks(&fork).unwrap();
+        assert_eq!(forked.len(), 2);
+        assert_ne!(forked[0].id, tasks[0].id);
+        assert_ne!(forked[1].id, tasks[1].id);
+        assert_eq!(forked[1].title, tasks[1].title);
+    }
+
+    #[test]
+    fn todo_task_bounds_are_enforced() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let tasks = (0..51)
+            .map(|index| TodoTask::new(format!("task {index}"), TodoStatus::Pending))
+            .collect::<Vec<_>>();
+        let error = storage.replace_tasks(&session, &tasks).unwrap_err();
+        assert!(error.to_string().contains("at most 50 tasks"));
+
+        let long = "x".repeat(241);
+        let error = storage
+            .replace_tasks(&session, &[TodoTask::new(long, TodoStatus::Pending)])
+            .unwrap_err();
+        assert!(error.to_string().contains("1 to 240 characters"));
     }
 }

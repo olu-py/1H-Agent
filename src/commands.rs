@@ -19,6 +19,7 @@ pub enum Command {
     Provider,
     Agent(Option<String>),
     Mode(AgentMode),
+    Todo(TodoCommand),
     Clear,
     Quit,
 }
@@ -60,6 +61,51 @@ impl fmt::Display for AgentMode {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TodoCommand {
+    Show,
+    Add(String),
+    Doing(usize),
+    Done(usize),
+    Undo(usize),
+    Edit(usize, String),
+    Remove(usize),
+    Clear,
+}
+
+impl TodoCommand {
+    fn parse(argument: Option<&str>) -> Option<Self> {
+        let Some(argument) = argument else {
+            return Some(Self::Show);
+        };
+        let mut parts = argument.trim().splitn(2, char::is_whitespace);
+        let action = parts.next()?.to_ascii_lowercase();
+        let value = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        Some(match action.as_str() {
+            "add" => Self::Add(value?.to_owned()),
+            "doing" => Self::Doing(value?.parse().ok()?),
+            "done" => Self::Done(value?.parse().ok()?),
+            "undo" => Self::Undo(value?.parse().ok()?),
+            "edit" => {
+                let value = value?;
+                let mut parts = value.splitn(2, char::is_whitespace);
+                let index = parts.next()?.parse().ok()?;
+                let title = parts
+                    .next()
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())?;
+                Self::Edit(index, title.to_owned())
+            }
+            "remove" => Self::Remove(value?.parse().ok()?),
+            "clear" => Self::Clear,
+            _ => return None,
+        })
+    }
+}
+
 pub fn parse(input: &str) -> Option<Command> {
     let mut parts = input.trim().splitn(2, char::is_whitespace);
     let name = parts.next()?.strip_prefix('/')?.to_ascii_lowercase();
@@ -86,6 +132,7 @@ pub fn parse(input: &str) -> Option<Command> {
         "build" => Command::Mode(AgentMode::Build),
         "explore" => Command::Mode(AgentMode::Explore),
         "cluster" => Command::Mode(AgentMode::Cluster),
+        "todo" | "todos" => Command::Todo(TodoCommand::parse(argument)?),
         "clear" => Command::Clear,
         "quit" | "exit" | "q" => Command::Quit,
         _ => return None,
@@ -163,7 +210,7 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
         label: "删除会话",
         command: Some("/delete"),
         shortcut: None,
-        description: "删除当前会话（至少保留一个会话）",
+        description: "删除当前会话；若删除最后一个会话会自动新建空白会话",
         action: PaletteAction::Command("/delete"),
     },
     PaletteItem {
@@ -207,6 +254,13 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
         shortcut: None,
         description: "将当前会话导出为工作区内 Markdown；参数为工作区内路径",
         action: PaletteAction::Command("/export"),
+    },
+    PaletteItem {
+        label: "任务清单",
+        command: Some("/todo"),
+        shortcut: None,
+        description: "查看并维护当前会话任务：add、doing、done、undo、edit、remove、clear",
+        action: PaletteAction::Command("/todo"),
     },
     PaletteItem {
         label: "查看改动",
@@ -353,5 +407,28 @@ mod tests {
         assert!(PALETTE_ITEMS.iter().any(|item| {
             item.action == PaletteAction::CycleMode && item.description.contains("循环")
         }));
+    }
+
+    #[test]
+    fn parses_todo_commands() {
+        assert_eq!(parse("/todo"), Some(Command::Todo(TodoCommand::Show)));
+        assert_eq!(
+            parse("/todo add write tests"),
+            Some(Command::Todo(TodoCommand::Add("write tests".into())))
+        );
+        assert_eq!(
+            parse("/todo doing 2"),
+            Some(Command::Todo(TodoCommand::Doing(2)))
+        );
+        assert_eq!(
+            parse("/todo edit 3 new title"),
+            Some(Command::Todo(TodoCommand::Edit(3, "new title".into())))
+        );
+        assert_eq!(
+            parse("/todo clear"),
+            Some(Command::Todo(TodoCommand::Clear))
+        );
+        assert_eq!(parse("/todo add"), None);
+        assert_eq!(parse("/todo remove nope"), None);
     }
 }

@@ -29,6 +29,7 @@ pub enum InteractionTarget {
     Tool(String),
     Thinking,
     ThinkingSummary(String),
+    Todo(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,7 +346,11 @@ fn build_visual_lines(
 fn wrap_line(logical_line: usize, line: &LayoutLine, width: usize) -> Vec<VisualLine> {
     if matches!(
         line.interaction,
-        Some(InteractionTarget::Tool(_) | InteractionTarget::ThinkingSummary(_))
+        Some(
+            InteractionTarget::Tool(_)
+                | InteractionTarget::ThinkingSummary(_)
+                | InteractionTarget::Todo(_),
+        )
     ) {
         let mut used = 0usize;
         let mut end = 0usize;
@@ -363,7 +368,10 @@ fn wrap_line(logical_line: usize, line: &LayoutLine, width: usize) -> Vec<Visual
             end: line.start + end,
             interaction: line.interaction.clone(),
             synthetic: false,
-            clickable_width: used,
+            clickable_width: match line.interaction {
+                Some(InteractionTarget::Todo(_)) => 1,
+                _ => used,
+            },
         }];
     }
     if line.text.is_empty() {
