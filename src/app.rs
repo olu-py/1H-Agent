@@ -1941,37 +1941,13 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             app.current.push_entry(DisplayEntry {
                 kind: DisplayKind::System,
                 content: DisplayContent::Markdown(
-                    "## 命令\n\n`/new` `/sessions` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
+                    "## 命令\n\n`/new` `/rename` `/fork` `/delete`\n`/undo` `/redo` `/compact` `/export [路径]` `/diff`\n`/plan` `/build` `/explore` `/model` `/provider`\n\nCtrl+P 或 Ctrl+X 打开命令面板 | @ 文件 | ! Shell"
                         .into(),
                 ),
             });
             app.current.status = "命令帮助".into();
         }
         Command::NewSession => create_session(app)?,
-        Command::Sessions => {
-            let listing = app
-                .sessions
-                .iter()
-                .enumerate()
-                .map(|(index, session)| {
-                    let marker = if session.id == app.current.session_id {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    format!("{marker} {}. {}", index + 1, session.title)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            app.current.push_entry(DisplayEntry {
-                kind: DisplayKind::System,
-                content: DisplayContent::Markdown(if listing.is_empty() {
-                    "暂无会话".into()
-                } else {
-                    format!("## 会话\n\n{listing}")
-                }),
-            });
-        }
         Command::Provider => open_settings(app),
         Command::Model(model) => {
             if let Some(model) = model {
@@ -2030,11 +2006,18 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         }
         Command::Quit => app.should_quit = true,
         Command::Rename(title) => {
-            let title = title.unwrap_or_else(|| "Untitled session".into());
-            app.storage
-                .rename_session(&app.current.session_id, &title)?;
+            let Some(title) = title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+            else {
+                app.input.set("/rename ");
+                app.current.status = "请输入新会话名称：/rename <名称>".into();
+                return Ok(());
+            };
+            app.storage.rename_session(&app.current.session_id, title)?;
             refresh_sessions(app)?;
-            app.current.status = format!("会话已重命名为 {}", title.trim());
+            app.current.status = format!("会话已重命名为 {title}");
         }
         Command::Delete => {
             let deleted = app.current.session_id.clone();
@@ -2069,8 +2052,8 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         Command::Undo => {
             if app.storage.undo(&app.current.session_id)? {
                 app.storage.clear_response_id(&app.current.session_id)?;
-                let session_id = app.current.session_id.clone();
-                activate_session(app, session_id)?;
+                reload_current_session(app)?;
+                refresh_sessions(app)?;
                 app.current.status = "已撤销上一轮".into();
             } else {
                 app.current.status = "没有可撤销的内容".into();
@@ -2079,8 +2062,8 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
         Command::Redo => {
             if app.storage.redo(&app.current.session_id)? {
                 app.storage.clear_response_id(&app.current.session_id)?;
-                let session_id = app.current.session_id.clone();
-                activate_session(app, session_id)?;
+                reload_current_session(app)?;
+                refresh_sessions(app)?;
                 app.current.status = "已重做上一轮".into();
             } else {
                 app.current.status = "没有可重做的内容".into();
@@ -2131,11 +2114,16 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
 }
 
 fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
-    let filename = requested.unwrap_or_else(|| format!(".1h-agent-{}.md", app.current.session_id));
+    let requested = requested
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let default_filename = format!("1h-agent-{}.md", app.current.session_id);
+    let filename = requested.unwrap_or(default_filename.as_str());
     let target = app
         .registry
         .workspace()
-        .resolve_new(&filename)
+        .resolve_new(filename)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let mut output = String::new();
     for item in &app.current.conversation {
@@ -2154,7 +2142,11 @@ fn export_session(app: &mut App, requested: Option<String>) -> Result<()> {
     }
     std::fs::write(&target, output)
         .with_context(|| format!("cannot write export {}", target.display()))?;
-    app.current.status = format!("对话已导出到 {}", target.display());
+    let display_path = match target.strip_prefix(&app.workspace) {
+        Ok(path) => path.display(),
+        Err(_) => target.display(),
+    };
+    app.current.status = format!("对话已导出到工作区 {}", display_path);
     Ok(())
 }
 
@@ -2804,6 +2796,27 @@ fn build_runtime(
     }
 }
 
+fn reload_current_session(app: &mut App) -> Result<()> {
+    let session_id = app.active_session.clone();
+    let active_secret = app.active_secret.clone();
+    let target = build_runtime(
+        &app.storage,
+        &app.config,
+        &app.registry,
+        &app.router_tx,
+        &app.approval_lock,
+        active_secret.as_ref(),
+        &session_id,
+    );
+    let mut old = std::mem::replace(&mut app.current, target);
+    old.shutdown();
+    app.registry.set_mode(app.current.mode);
+    app.input.clear();
+    app.file_suggestions.clear();
+    app.current.invalidate_output_layout();
+    Ok(())
+}
+
 fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     if session_id == app.active_session {
         return Ok(());
@@ -3077,6 +3090,103 @@ mod tests {
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.sessions[0].id, replacement);
         assert_eq!(app.current.status, "会话已删除");
+    }
+
+    #[test]
+    fn rename_command_requires_title_and_updates_current_session() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let original_title = app.sessions[0].title.clone();
+
+        execute_palette_action(&mut app, commands::PaletteAction::Command("/rename")).unwrap();
+
+        assert_eq!(app.input.as_str(), "/rename ");
+        assert_eq!(app.sessions[0].title, original_title);
+        assert_eq!(
+            app.storage.list_sessions(&app.workspace).unwrap()[0]
+                .title
+                .clone(),
+            original_title
+        );
+        assert!(app.current.status.contains("新会话名称"));
+
+        execute_command(&mut app, Command::Rename(Some("  新名称  ".into()))).unwrap();
+
+        assert_eq!(app.sessions[0].title, "新名称");
+        assert_eq!(
+            app.storage.list_sessions(&app.workspace).unwrap()[0]
+                .title
+                .clone(),
+            "新名称"
+        );
+        assert_eq!(app.current.status, "会话已重命名为 新名称");
+    }
+
+    #[test]
+    fn export_session_defaults_to_a_visible_workspace_file() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.current.conversation.push(ConversationItem::Message {
+            role: Role::User,
+            content: "export me".into(),
+        });
+        let session_id = app.current.session_id.clone();
+
+        export_session(&mut app, None).unwrap();
+
+        let target = app.workspace.join(format!("1h-agent-{session_id}.md"));
+        assert!(target.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "## You\n\nexport me\n\n"
+        );
+        assert!(app.current.status.contains("工作区"));
+        assert!(
+            app.current
+                .status
+                .contains(&format!("1h-agent-{session_id}.md"))
+        );
+    }
+
+    #[test]
+    fn export_session_accepts_a_workspace_relative_path() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+
+        export_session(&mut app, Some("conversation.md".into())).unwrap();
+
+        let target = app.workspace.join("conversation.md");
+        assert!(target.is_file());
+        assert!(app.current.status.contains("conversation.md"));
+    }
+
+    #[tokio::test]
+    async fn undo_and_redo_reload_the_active_session_history() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let session_id = app.current.session_id.clone();
+        app.storage
+            .append_message(&session_id, Role::User, "hello")
+            .unwrap();
+        app.storage
+            .append_message(&session_id, Role::Assistant, "hi")
+            .unwrap();
+        app.storage
+            .save_response_id(&session_id, "response")
+            .unwrap();
+
+        execute_command(&mut app, Command::Undo).unwrap();
+
+        assert_eq!(app.current.status, "已撤销上一轮");
+        assert!(app.current.conversation.is_empty());
+        assert_eq!(app.current.entries.len(), 1);
+        assert!(app.storage.response_id(&session_id).unwrap().is_none());
+
+        execute_command(&mut app, Command::Redo).unwrap();
+
+        assert_eq!(app.current.status, "已重做上一轮");
+        assert_eq!(app.current.conversation.len(), 2);
+        assert_eq!(app.current.entries.len(), 2);
     }
 
     #[test]

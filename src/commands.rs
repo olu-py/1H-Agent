@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 pub enum Command {
     Help,
     NewSession,
-    Sessions,
     Rename(Option<String>),
     Delete,
     Fork,
@@ -71,7 +70,6 @@ pub fn parse(input: &str) -> Option<Command> {
     Some(match name.as_str() {
         "help" | "h" => Command::Help,
         "new" | "n" => Command::NewSession,
-        "sessions" | "session" | "ls" => Command::Sessions,
         "rename" => Command::Rename(argument.map(str::to_owned)),
         "delete" | "rm" => Command::Delete,
         "fork" => Command::Fork,
@@ -155,13 +153,6 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
         action: PaletteAction::Command("/new"),
     },
     PaletteItem {
-        label: "会话列表",
-        command: Some("/sessions"),
-        shortcut: None,
-        description: "显示当前 workspace 中的会话",
-        action: PaletteAction::Command("/sessions"),
-    },
-    PaletteItem {
         label: "重命名会话",
         command: Some("/rename"),
         shortcut: None,
@@ -214,7 +205,7 @@ pub const PALETTE_ITEMS: &[PaletteItem] = &[
         label: "导出会话",
         command: Some("/export"),
         shortcut: None,
-        description: "将当前会话导出为 Markdown 文件",
+        description: "将当前会话导出为工作区内 Markdown；参数为工作区内路径",
         action: PaletteAction::Command("/export"),
     },
     PaletteItem {
@@ -323,6 +314,7 @@ mod tests {
     #[test]
     fn parses_core_commands() {
         assert_eq!(parse("/new"), Some(Command::NewSession));
+        assert_eq!(parse("/sessions"), None);
         assert_eq!(
             parse("/rename my session"),
             Some(Command::Rename(Some("my session".into())))
@@ -335,10 +327,18 @@ mod tests {
 
     #[test]
     fn fuzzy_matching_is_bounded() {
-        let matches = matches("ses", 100);
+        let matches = matches("ren", 100);
         assert!(!matches.is_empty());
         assert!(matches.len() <= 10);
-        assert_eq!(PALETTE_ITEMS[matches[0].index].command, Some("/sessions"));
+        assert_eq!(PALETTE_ITEMS[matches[0].index].command, Some("/rename"));
+        assert!(
+            !PALETTE_ITEMS
+                .iter()
+                .any(|item| item.command == Some("/sessions"))
+        );
+        assert!(PALETTE_ITEMS.iter().any(|item| {
+            item.command == Some("/export") && item.description.contains("工作区")
+        }));
     }
 
     #[test]
