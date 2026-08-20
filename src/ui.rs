@@ -22,7 +22,7 @@ use crate::{
     agent::ChildSessionStatus,
     app::{
         App, CommandPaletteState, DisplayContent, DisplayKind, ThinkingDisplay, TodoDisplay,
-        TodoStatus, ToolDisplay, ToolDisplayStatus,
+        TodoStatus, TodoTask, ToolDisplay, ToolDisplayStatus,
     },
     commands::{self, AgentMode},
     input::input_cursor_viewport,
@@ -336,13 +336,17 @@ fn draw_messages(
 
 pub(crate) const TODO_WINDOW_MAX_WIDTH: u16 = 44;
 
-pub(crate) fn todo_window_rect(viewport: Rect, task_count: usize) -> Option<Rect> {
-    let minimum_height = if task_count == 1 { 3 } else { 4 };
+pub(crate) fn todo_window_rect(viewport: Rect, task_count: usize, collapsed: bool) -> Option<Rect> {
+    let minimum_height = if collapsed || task_count == 1 { 3 } else { 4 };
     if task_count == 0 || viewport.width < 4 || viewport.height < minimum_height {
         return None;
     }
     let width = TODO_WINDOW_MAX_WIDTH.min(viewport.width);
-    let desired_height = task_count.saturating_add(2).min(usize::from(u16::MAX));
+    let desired_height = if collapsed {
+        3
+    } else {
+        task_count.saturating_add(2).min(usize::from(u16::MAX))
+    };
     let height = desired_height.min(usize::from(viewport.height)) as u16;
     if height < minimum_height {
         return None;
@@ -356,11 +360,15 @@ pub(crate) fn todo_window_rect(viewport: Rect, task_count: usize) -> Option<Rect
 }
 
 fn draw_todo_window(frame: &mut Frame<'_>, viewport: Rect, app: &mut App, theme: &UiTheme) {
-    if app.current.todos.is_empty() {
+    if app.current.todos.is_empty() || app.current.todo_hidden {
         app.todo_window_rect = None;
         return;
     }
-    let Some(rect) = todo_window_rect(viewport, app.current.todos.len()) else {
+    let Some(rect) = todo_window_rect(
+        viewport,
+        app.current.todos.len(),
+        app.current.todo_collapsed,
+    ) else {
         app.todo_window_rect = None;
         return;
     };
@@ -372,6 +380,7 @@ fn draw_todo_window(frame: &mut Frame<'_>, viewport: Rect, app: &mut App, theme:
         &todo,
         usize::from(rect.width.saturating_sub(2)),
         usize::from(rect.height.saturating_sub(2)),
+        app.current.todo_collapsed,
     );
     let (done, total) = todo.progress();
     frame.render_widget(Clear, rect);
@@ -384,6 +393,25 @@ fn draw_todo_window(frame: &mut Frame<'_>, viewport: Rect, app: &mut App, theme:
         ),
         rect,
     );
+    if let Some((toggle_column, _)) = todo_control_columns(rect) {
+        let controls = if app.current.todo_collapsed {
+            "▾  ×"
+        } else {
+            "▴  ×"
+        };
+        frame.render_widget(
+            Paragraph::new(controls).style(theme.focus_border),
+            Rect::new(toggle_column, rect.y, 4, 1),
+        );
+    }
+}
+
+pub(crate) fn todo_control_columns(rect: Rect) -> Option<(u16, u16)> {
+    if rect.width < 7 {
+        return None;
+    }
+    let toggle = rect.right().saturating_sub(6);
+    Some((toggle, toggle + 3))
 }
 
 pub(crate) fn todo_visible_task_count(task_count: usize, visible_rows: usize) -> usize {
@@ -394,7 +422,55 @@ pub(crate) fn todo_visible_task_count(task_count: usize, visible_rows: usize) ->
     }
 }
 
-fn todo_window_lines(todo: &TodoDisplay, width: usize, visible_rows: usize) -> Vec<Line<'static>> {
+pub(crate) fn todo_task_index_at_row(
+    tasks: &[TodoTask],
+    visible_rows: usize,
+    content_row: usize,
+    collapsed: bool,
+) -> Option<usize> {
+    if collapsed {
+        return (content_row == 0)
+            .then(|| todo_preview_task_index(tasks))
+            .flatten();
+    }
+    let task_row = if tasks.len() > visible_rows {
+        content_row.checked_sub(1)?
+    } else {
+        content_row
+    };
+    (task_row < todo_visible_task_count(tasks.len(), visible_rows)).then_some(task_row)
+}
+
+fn todo_preview_task_index(tasks: &[TodoTask]) -> Option<usize> {
+    tasks
+        .iter()
+        .position(|task| task.status == TodoStatus::InProgress)
+        .or_else(|| {
+            tasks
+                .iter()
+                .position(|task| task.status == TodoStatus::Pending)
+        })
+        .or_else(|| tasks.len().checked_sub(1))
+}
+
+fn todo_window_lines(
+    todo: &TodoDisplay,
+    width: usize,
+    visible_rows: usize,
+    collapsed: bool,
+) -> Vec<Line<'static>> {
+    if collapsed {
+        let Some(index) = todo_preview_task_index(&todo.tasks) else {
+            return Vec::new();
+        };
+        let task = &todo.tasks[index];
+        let (marker, color) = todo_status_marker(task.status);
+        return vec![Line::from(vec![
+            Span::styled(marker.to_owned(), Style::default().fg(color)),
+            Span::raw(" "),
+            Span::raw(fit_text(&task.title, width.saturating_sub(2))),
+        ])];
+    }
     let visible_tasks = todo_visible_task_count(todo.tasks.len(), visible_rows);
     let tasks = &todo.tasks[..visible_tasks];
     let mut lines = Vec::new();
@@ -411,11 +487,7 @@ fn todo_window_lines(todo: &TodoDisplay, width: usize, visible_rows: usize) -> V
         let number = (index + 1).to_string();
         let prefix_width = number.width() + 4;
         let title = fit_text(&task.title, width.saturating_sub(prefix_width));
-        let (marker, color) = match task.status {
-            TodoStatus::Pending => ("○", Color::DarkGray),
-            TodoStatus::InProgress => ("◐", Color::Yellow),
-            TodoStatus::Done => ("●", Color::Green),
-        };
+        let (marker, color) = todo_status_marker(task.status);
         lines.push(Line::from(vec![
             Span::styled(marker.to_owned(), Style::default().fg(color)),
             Span::raw(format!(" {number}. ")),
@@ -423,6 +495,14 @@ fn todo_window_lines(todo: &TodoDisplay, width: usize, visible_rows: usize) -> V
         ]));
     }
     lines
+}
+
+fn todo_status_marker(status: TodoStatus) -> (&'static str, Color) {
+    match status {
+        TodoStatus::Pending => ("○", Color::DarkGray),
+        TodoStatus::InProgress => ("◐", Color::Yellow),
+        TodoStatus::Done => ("●", Color::Green),
+    }
 }
 
 pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {

@@ -30,6 +30,8 @@ pub enum InteractionTarget {
     Thinking,
     ThinkingSummary(String),
     Todo(String),
+    TodoToggle,
+    TodoClose,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,7 +351,9 @@ fn wrap_line(logical_line: usize, line: &LayoutLine, width: usize) -> Vec<Visual
         Some(
             InteractionTarget::Tool(_)
                 | InteractionTarget::ThinkingSummary(_)
-                | InteractionTarget::Todo(_),
+                | InteractionTarget::Todo(_)
+                | InteractionTarget::TodoToggle
+                | InteractionTarget::TodoClose,
         )
     ) {
         let mut used = 0usize;

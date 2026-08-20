@@ -13,7 +13,8 @@ use crate::{
     commands::AgentMode,
     model::{
         AgentPhase, ApprovalAction, DisplayContent, DisplayEntry, DisplayKind, ModelPhase,
-        PendingApproval, ThinkingDisplay, ThinkingResult, TodoTask, ToolDisplay, ToolDisplayStatus,
+        PendingApproval, ThinkingDisplay, ThinkingResult, TodoStatus, TodoTask, ToolDisplay,
+        ToolDisplayStatus,
     },
     output::{CachedMarkdown, EdgeScroll, MessageLayout, OutputSelection},
     provider::{ConversationItem, Role, Usage},
@@ -66,6 +67,8 @@ pub struct SessionRuntime {
     pub status: String,
     pub entries: Vec<DisplayEntry>,
     pub todos: Vec<TodoTask>,
+    pub todo_collapsed: bool,
+    pub todo_hidden: bool,
     pub busy: bool,
     pub agent_phase: AgentPhase,
     pub model_phase: ModelPhase,
@@ -111,6 +114,13 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    pub(crate) fn set_todos(&mut self, tasks: Vec<TodoTask>) {
+        self.todo_hidden = false;
+        self.todo_collapsed =
+            !tasks.is_empty() && tasks.iter().all(|task| task.status == TodoStatus::Done);
+        self.todos = tasks;
+    }
+
     /// Fully stops this runtime: aborts its in-flight agent task (which also
     /// tears down any nested child-agent futures) and rejects any approval
     /// still waiting on it. Used when deleting a session and when evicting or
@@ -149,7 +159,7 @@ impl SessionRuntime {
                 self.status = "等待模型流式响应".into();
             }
             AgentEvent::TodoUpdated { tasks } => {
-                self.todos = tasks;
+                self.set_todos(tasks);
             }
             AgentEvent::CompactionStarted => {
                 self.status = "正在压缩上下文…… | Esc 取消".into();

@@ -1263,15 +1263,27 @@ fn handle_navigation_mouse(
 
 fn todo_interaction_at(app: &App, column: u16, row: u16) -> Option<InteractionTarget> {
     let rect = app.todo_window_rect?;
+    if row == rect.y
+        && let Some((toggle_column, close_column)) = ui::todo_control_columns(rect)
+    {
+        if column == toggle_column {
+            return Some(InteractionTarget::TodoToggle);
+        }
+        if column == close_column {
+            return Some(InteractionTarget::TodoClose);
+        }
+    }
     if row <= rect.y || row >= rect.bottom() || column != rect.x + 1 {
         return None;
     }
-    let index = usize::from(row - rect.y - 1);
+    let content_row = usize::from(row - rect.y - 1);
     let visible_rows = usize::from(rect.height.saturating_sub(2));
-    let visible_tasks = ui::todo_visible_task_count(app.current.todos.len(), visible_rows);
-    if index >= visible_tasks {
-        return None;
-    }
+    let index = ui::todo_task_index_at_row(
+        &app.current.todos,
+        visible_rows,
+        content_row,
+        app.current.todo_collapsed,
+    )?;
     app.current
         .todos
         .get(index)
@@ -1374,7 +1386,12 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                             .and_then(|layout| layout.interaction_at(mouse.column, mouse.row))
                     });
                 if !app.mouse_dragged && released_target.as_ref() == Some(&target) {
-                    let todo_target = matches!(&target, InteractionTarget::Todo(_));
+                    let todo_target = matches!(
+                        &target,
+                        InteractionTarget::Todo(_)
+                            | InteractionTarget::TodoToggle
+                            | InteractionTarget::TodoClose
+                    );
                     if !app.current.follow_output && !todo_target {
                         app.layout_restore_anchor =
                             app.current.message_layout.as_ref().and_then(|layout| {
@@ -1409,13 +1426,20 @@ fn handle_output_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> Ev
                                 task.updated_at = chrono::Utc::now().to_rfc3339();
                                 match app.storage.replace_tasks(&app.current.session_id, &tasks) {
                                     Ok(()) => {
-                                        app.current.todos = tasks;
+                                        app.current.set_todos(tasks);
                                     }
                                     Err(error) => {
                                         app.current.status = format!("任务更新失败：{error}");
                                     }
                                 }
                             }
+                        }
+                        InteractionTarget::TodoToggle => {
+                            app.current.todo_collapsed = !app.current.todo_collapsed;
+                        }
+                        InteractionTarget::TodoClose => {
+                            app.current.todo_hidden = true;
+                            app.todo_window_rect = None;
                         }
                     }
                     if !live_thinking_target && !todo_target {
@@ -2157,6 +2181,8 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
 fn handle_todo_command(app: &mut App, action: TodoCommand) -> Result<()> {
     match action {
         TodoCommand::Show => {
+            app.current.todo_hidden = false;
+            app.current.todo_collapsed = false;
             let (done, total) = todo_progress(&app.current.todos);
             let mut content = format!("## 任务清单 {done}/{total}\n");
             for (index, task) in app.current.todos.iter().enumerate() {
@@ -2251,7 +2277,7 @@ fn update_todo_status(
 
 fn apply_todo_tasks(app: &mut App, tasks: Vec<TodoTask>) -> Result<()> {
     app.storage.replace_tasks(&app.current.session_id, &tasks)?;
-    app.current.todos = tasks;
+    app.current.set_todos(tasks);
     Ok(())
 }
 
@@ -2856,6 +2882,8 @@ fn build_runtime(
     let mut conversation = storage.load_messages(session_id).unwrap_or_default();
     trim_conversation(&mut conversation);
     let todos = storage.list_tasks(session_id).unwrap_or_default();
+    let todo_collapsed =
+        !todos.is_empty() && todos.iter().all(|task| task.status == TodoStatus::Done);
     let entries = display_entries(&conversation);
     let mode = storage
         .session_mode(session_id)
@@ -2915,6 +2943,8 @@ fn build_runtime(
         status: String::new(),
         entries,
         todos,
+        todo_collapsed,
+        todo_hidden: false,
         busy: false,
         agent_phase: AgentPhase::Idle,
         model_phase: ModelPhase::Idle,
@@ -4036,6 +4066,8 @@ mod tests {
                 content: DisplayContent::Markdown("first line\n\n中文 🙂 long output".into()),
             }],
             todos: Vec::new(),
+            todo_collapsed: false,
+            todo_hidden: false,
             busy: false,
             agent_phase: AgentPhase::Idle,
             model_phase: ModelPhase::Idle,
@@ -5710,5 +5742,111 @@ mod tests {
             TodoStatus::InProgress
         );
         assert_eq!(app.current.output_layout_rebuild_count, rebuilds);
+    }
+
+    #[test]
+    fn todo_window_overflow_summary_is_not_clickable_and_task_rows_stay_aligned() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.current.todos = (0..5)
+            .map(|index| TodoTask::new(format!("task {index}"), TodoStatus::Pending))
+            .collect();
+        app.todo_window_rect = Some(Rect::new(10, 20, 30, 5));
+
+        assert_eq!(todo_interaction_at(&app, 11, 21), None);
+        assert_eq!(
+            todo_interaction_at(&app, 11, 22),
+            Some(InteractionTarget::Todo(app.current.todos[0].id.clone()))
+        );
+        assert_eq!(
+            todo_interaction_at(&app, 11, 23),
+            Some(InteractionTarget::Todo(app.current.todos[1].id.clone()))
+        );
+    }
+
+    #[test]
+    fn todo_window_collapses_when_complete_and_close_only_hides_it() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        app.current.set_todos(vec![
+            TodoTask::new("first", TodoStatus::Done),
+            TodoTask::new("last", TodoStatus::Done),
+        ]);
+
+        let collapsed_screen = render_screen(&mut app, 80, 20);
+        assert!(app.current.todo_collapsed);
+        let collapsed_rect = app.todo_window_rect.expect("collapsed todo window");
+        assert_eq!(collapsed_rect.height, 3);
+        let collapsed_title: String = collapsed_screen[usize::from(collapsed_rect.y)]
+            .chars()
+            .skip(usize::from(collapsed_rect.x))
+            .take(usize::from(collapsed_rect.width))
+            .collect();
+        assert!(collapsed_title.contains("▾"));
+        assert!(collapsed_title.contains("×"));
+        let (toggle, _) = crate::ui::todo_control_columns(collapsed_rect).unwrap();
+
+        let mouse = |column, row, kind| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_output_mouse(
+            &mut app,
+            mouse(
+                toggle,
+                collapsed_rect.y,
+                MouseEventKind::Down(MouseButton::Left),
+            ),
+        );
+        handle_output_mouse(
+            &mut app,
+            mouse(
+                toggle,
+                collapsed_rect.y,
+                MouseEventKind::Up(MouseButton::Left),
+            ),
+        );
+        assert!(!app.current.todo_collapsed);
+
+        let expanded_screen = render_screen(&mut app, 80, 20);
+        let expanded_rect = app.todo_window_rect.expect("expanded todo window");
+        let expanded_title: String = expanded_screen[usize::from(expanded_rect.y)]
+            .chars()
+            .skip(usize::from(expanded_rect.x))
+            .take(usize::from(expanded_rect.width))
+            .collect();
+        assert!(expanded_title.contains("▴"));
+        assert!(expanded_title.contains("×"));
+        let (_, close) = crate::ui::todo_control_columns(expanded_rect).unwrap();
+        handle_output_mouse(
+            &mut app,
+            mouse(
+                close,
+                expanded_rect.y,
+                MouseEventKind::Down(MouseButton::Left),
+            ),
+        );
+        handle_output_mouse(
+            &mut app,
+            mouse(
+                close,
+                expanded_rect.y,
+                MouseEventKind::Up(MouseButton::Left),
+            ),
+        );
+        assert!(app.current.todo_hidden);
+        assert_eq!(app.current.todos.len(), 2);
+
+        render_screen(&mut app, 80, 20);
+        assert!(app.todo_window_rect.is_none());
+        execute_command(
+            &mut app,
+            Command::Todo(TodoCommand::Add("new pending".into())),
+        )
+        .unwrap();
+        assert!(!app.current.todo_hidden);
+        assert!(!app.current.todo_collapsed);
     }
 }
