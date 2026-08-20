@@ -43,6 +43,15 @@ struct WriteArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EditArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+    replace_all: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransferArgs {
     source: String,
     destination: String,
@@ -188,6 +197,40 @@ pub fn write(workspace: &Workspace, value: &Value) -> Result<String, ToolError> 
     ))
 }
 
+pub fn edit(workspace: &Workspace, value: &Value) -> Result<String, ToolError> {
+    let args: EditArgs = serde_json::from_value(value.clone())?;
+    let path = workspace
+        .resolve_existing(args.path)
+        .map_err(security_error)?;
+    if args.old_string.is_empty() {
+        return Err(ToolError::Execution("old_string must not be empty".into()));
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|_| ToolError::Execution("file is not valid UTF-8".into()))?;
+    let count = content.matches(&args.old_string).count();
+    if count == 0 {
+        return Err(ToolError::Execution(
+            "no match found; read the file first to confirm its content".into(),
+        ));
+    }
+    if count > 1 && args.replace_all != Some(true) {
+        return Err(ToolError::Execution(format!(
+            "old_string matched {count} times; widen its context or set replace_all=true"
+        )));
+    }
+    let replacement_count = if args.replace_all == Some(true) {
+        content.matches(&args.old_string).count()
+    } else {
+        1
+    };
+    let updated = content.replace(&args.old_string, &args.new_string);
+    fs::write(&path, updated.as_bytes()).map_err(execution_error)?;
+    Ok(format!(
+        "edited {}: {replacement_count} replacement(s)",
+        display_relative(workspace, &path)
+    ))
+}
+
 pub fn copy(workspace: &Workspace, value: &Value) -> Result<String, ToolError> {
     let args: TransferArgs = serde_json::from_value(value.clone())?;
     let source = workspace
@@ -288,5 +331,109 @@ mod tests {
             .unwrap(),
             "45\n[output truncated]"
         );
+    }
+
+    #[test]
+    fn edit_replaces_unique_match_and_persists() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(
+            &workspace,
+            &json!({"path":"a.txt","content":"line one\nline two\nline three"}),
+        )
+        .unwrap();
+        let result = edit(
+            &workspace,
+            &json!({"path":"a.txt","old_string":"line two","new_string":"line 2"}),
+        )
+        .unwrap();
+        assert_eq!(result, "edited a.txt: 1 replacement(s)");
+        assert_eq!(
+            read(&workspace, &json!({"path":"a.txt"}), 100).unwrap(),
+            "line one\nline 2\nline three"
+        );
+    }
+
+    #[test]
+    fn edit_rejects_zero_matches() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(&workspace, &json!({"path":"a.txt","content":"line one"})).unwrap();
+        let error = edit(
+            &workspace,
+            &json!({"path":"a.txt","old_string":"missing","new_string":"x"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no match found"));
+        assert_eq!(
+            read(&workspace, &json!({"path":"a.txt"}), 100).unwrap(),
+            "line one"
+        );
+    }
+
+    #[test]
+    fn edit_requires_unique_match_unless_replace_all() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(
+            &workspace,
+            &json!({"path":"a.txt","content":"one two one three"}),
+        )
+        .unwrap();
+        let error = edit(
+            &workspace,
+            &json!({"path":"a.txt","old_string":"one","new_string":"1"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("2 times"));
+
+        let result = edit(
+            &workspace,
+            &json!({"path":"a.txt","old_string":"one","new_string":"1","replace_all":true}),
+        )
+        .unwrap();
+        assert_eq!(result, "edited a.txt: 2 replacement(s)");
+        assert_eq!(
+            read(&workspace, &json!({"path":"a.txt"}), 100).unwrap(),
+            "1 two 1 three"
+        );
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_string() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(&workspace, &json!({"path":"a.txt","content":"content"})).unwrap();
+        let error = edit(
+            &workspace,
+            &json!({"path":"a.txt","old_string":"","new_string":"x"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn edit_rejects_path_escape() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(&workspace, &json!({"path":"a.txt","content":"content"})).unwrap();
+        let error = edit(
+            &workspace,
+            &json!({"path":"../outside.txt","old_string":"x","new_string":"y"}),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Security(_)));
+    }
+
+    #[test]
+    fn edit_requires_existing_file() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let error = edit(
+            &workspace,
+            &json!({"path":"missing.txt","old_string":"x","new_string":"y"}),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Security(_)));
     }
 }

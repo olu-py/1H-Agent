@@ -158,6 +158,15 @@ impl SessionRuntime {
                 self.model_phase = ModelPhase::Streaming;
                 self.status = "等待模型流式响应".into();
             }
+            AgentEvent::ProviderRetry {
+                attempt,
+                reason,
+                delay_ms,
+            } => {
+                let delay_seconds = delay_ms.div_ceil(1000);
+                self.status =
+                    format!("请求失败，{delay_seconds} 秒后第 {attempt} 次重试（{reason}）");
+            }
             AgentEvent::TodoUpdated { tasks } => {
                 self.set_todos(tasks);
             }

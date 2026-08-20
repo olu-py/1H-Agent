@@ -81,6 +81,10 @@ pub struct ProviderConfig {
     pub thinking: ThinkingCapability,
     pub thinking_level: ThinkingLevel,
     pub thinking_budget_tokens: Option<u32>,
+    /// Max HTTP-level retry attempts before giving up. 0 disables retries.
+    pub retry_max_attempts: u32,
+    pub retry_initial_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -476,6 +480,9 @@ impl Default for ProviderConfig {
             thinking: ThinkingCapability::Auto,
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
+            retry_max_attempts: 3,
+            retry_initial_backoff_ms: 500,
+            retry_max_backoff_ms: 8000,
         }
     }
 }
@@ -530,6 +537,11 @@ impl Config {
 
         config.provider.validate()?;
         config.provider.normalize_thinking();
+        config.provider.retry_max_attempts = config.provider.retry_max_attempts.clamp(0, 5);
+        config.provider.retry_initial_backoff_ms =
+            config.provider.retry_initial_backoff_ms.clamp(100, 2000);
+        config.provider.retry_max_backoff_ms =
+            config.provider.retry_max_backoff_ms.clamp(1000, 30000);
         if let Some(limit) = config.provider.context_window_tokens {
             if limit < 4096 {
                 anyhow::bail!("provider.context_window_tokens must be at least 4096");
@@ -767,6 +779,9 @@ impl ProviderPreset {
             thinking: ThinkingCapability::Auto,
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
+            retry_max_attempts: 3,
+            retry_initial_backoff_ms: 500,
+            retry_max_backoff_ms: 8000,
         };
         config.normalize_thinking();
         config
@@ -1253,6 +1268,9 @@ mod tests {
         assert_eq!(config.cluster.child_active_timeout_seconds, 300);
         assert!(config.compaction.enabled);
         assert_eq!(config.compaction.auto_threshold, 0.80);
+        assert_eq!(config.provider.retry_max_attempts, 3);
+        assert_eq!(config.provider.retry_initial_backoff_ms, 500);
+        assert_eq!(config.provider.retry_max_backoff_ms, 8000);
     }
 
     #[test]
@@ -1266,6 +1284,25 @@ mod tests {
         fs::write(&path, "[runtime]\nmax_background_sessions = 1000\n").unwrap();
         let high = Config::load(Some(&path), temp.path()).unwrap();
         assert_eq!(high.runtime.max_background_sessions, 64);
+    }
+
+    #[test]
+    fn provider_retry_limits_are_normalized() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[provider]\nretry_max_attempts = 99\nretry_initial_backoff_ms = 1\nretry_max_backoff_ms = 999999\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(config.provider.retry_max_attempts, 5);
+        assert_eq!(config.provider.retry_initial_backoff_ms, 100);
+        assert_eq!(config.provider.retry_max_backoff_ms, 30000);
+
+        fs::write(&path, "[provider]\nretry_max_attempts = 0\n").unwrap();
+        let disabled = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(disabled.provider.retry_max_attempts, 0);
     }
 
     #[test]

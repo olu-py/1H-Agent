@@ -83,7 +83,13 @@ fn child_tool_name_allowed(tool: &str, role: Option<&str>, allowed_tools: &[Stri
         "web_fetch",
         "git_diff",
     ];
-    const WRITE_TOOLS: &[&str] = &["file_write", "file_mkdir", "file_copy", "file_move"];
+    const WRITE_TOOLS: &[&str] = &[
+        "file_write",
+        "file_edit",
+        "file_mkdir",
+        "file_copy",
+        "file_move",
+    ];
 
     if READ_TOOLS.contains(&tool) {
         return true;
@@ -472,6 +478,11 @@ impl Drop for ChildCancellationGuard {
 #[derive(Debug)]
 pub enum AgentEvent {
     ReasoningDelta(String),
+    ProviderRetry {
+        attempt: u32,
+        reason: String,
+        delay_ms: u64,
+    },
     ModelStreaming,
     WebSearchStarted {
         query: String,
@@ -867,8 +878,14 @@ impl AgentRunner {
             provider_config.normalize_thinking();
             let api_key =
                 secrets::api_key_cached_only(preset).map_err(|error| error.to_string())?;
-            let provider = OpenAiClient::new(provider_config.base_url.clone(), api_key)
-                .map_err(|error| error.to_string())?;
+            let provider = OpenAiClient::new_with_retry(
+                provider_config.base_url.clone(),
+                api_key,
+                provider_config.retry_max_attempts,
+                provider_config.retry_initial_backoff_ms,
+                provider_config.retry_max_backoff_ms,
+            )
+            .map_err(|error| error.to_string())?;
             (provider, provider_config)
         };
         if let Some(model) = model {
@@ -1192,6 +1209,15 @@ impl AgentRunner {
                     ModelEvent::ReasoningDelta(delta) => {
                         Ok(Forwarded::Send(AgentEvent::ReasoningDelta(delta)))
                     }
+                    ModelEvent::Retrying {
+                        attempt,
+                        reason,
+                        delay_ms,
+                    } => Ok(Forwarded::SendIgnore(AgentEvent::ProviderRetry {
+                        attempt,
+                        reason,
+                        delay_ms,
+                    })),
                     ModelEvent::TextDelta(delta) => {
                         Ok(Forwarded::Send(AgentEvent::TextDelta(delta)))
                     }
@@ -1669,6 +1695,7 @@ impl AgentRunner {
             Some(role) => Some(role),
             None if allowed_tools.iter().any(|tool| {
                 tool == "file_write"
+                    || tool == "file_edit"
                     || tool == "file_mkdir"
                     || tool == "file_copy"
                     || tool == "file_move"
@@ -2322,6 +2349,66 @@ mod tests {
         task.await.unwrap();
         assert!(completed);
         assert!(failed.is_none(), "unexpected failure: {failed:?}");
+    }
+
+    #[tokio::test]
+    async fn provider_retry_event_reaches_the_ui_channel() {
+        use crate::provider::OpenAiClient as ScriptedOpenAi;
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "retry")
+            .unwrap();
+        let mut provider_config = ProviderPreset::Custom.defaults();
+        provider_config.model = "fixture".into();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = ScriptedOpenAi::scripted_with_failures(
+            vec![vec![ModelEvent::TextDelta("ok".into()), ModelEvent::Done]],
+            vec![crate::provider::ProviderError::Status {
+                status: 429,
+                message: "rate limited".into(),
+                retry_after_ms: Some(1),
+            }],
+        )
+        .unwrap();
+        let runner = AgentRunner::new(provider, provider_config, tools, storage, session_id);
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "retry".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+
+        let mut saw_retry = false;
+        let mut completed = false;
+        while let Some(event) = receiver.recv().await {
+            if matches!(
+                &event,
+                AgentEvent::ProviderRetry { attempt: 1, reason, .. } if reason.contains("429")
+            ) {
+                saw_retry = true;
+            }
+            if matches!(event, AgentEvent::Completed { .. }) {
+                completed = true;
+            }
+        }
+        task.await.unwrap();
+        assert!(
+            saw_retry,
+            "expected AgentEvent::ProviderRetry on the UI channel"
+        );
+        assert!(completed, "retry should recover and complete");
     }
 
     #[tokio::test]

@@ -2341,7 +2341,13 @@ fn rebuild_runner(app: &mut App) -> Result<()> {
         app.current.runner = None;
         return Ok(());
     };
-    let provider = OpenAiClient::new(app.config.provider.base_url.clone(), api_key.clone())?;
+    let provider = OpenAiClient::new_with_retry(
+        app.config.provider.base_url.clone(),
+        api_key.clone(),
+        app.config.provider.retry_max_attempts,
+        app.config.provider.retry_initial_backoff_ms,
+        app.config.provider.retry_max_backoff_ms,
+    )?;
     let child_role = app.current.child_role.clone();
     let child_provider_resolver = provider_config_resolver(&app.config);
     app.current.runner = Some(
@@ -2902,23 +2908,29 @@ fn build_runtime(
         .map(|(_, api_key)| api_key.clone())
         .or_else(|| secrets::api_key_cached_only(provider_config.preset).ok());
     let runner = runtime_key.as_ref().and_then(|api_key| {
-        OpenAiClient::new(provider_config.base_url.clone(), api_key.clone())
-            .ok()
-            .map(|provider| {
-                AgentRunner::new(
-                    provider,
-                    provider_config.clone(),
-                    registry.clone(),
-                    storage.clone(),
-                    session_id.to_owned(),
-                )
-                .with_cluster_config(config.cluster.clone())
-                .with_approval_lock(approval_lock.clone())
-                .with_configured_agents(config.agents.clone())
-                .with_compaction_config(config.compaction.clone())
-                .with_child_role(child_role.clone())
-                .with_child_provider_resolver(child_provider_resolver)
-            })
+        OpenAiClient::new_with_retry(
+            provider_config.base_url.clone(),
+            api_key.clone(),
+            provider_config.retry_max_attempts,
+            provider_config.retry_initial_backoff_ms,
+            provider_config.retry_max_backoff_ms,
+        )
+        .ok()
+        .map(|provider| {
+            AgentRunner::new(
+                provider,
+                provider_config.clone(),
+                registry.clone(),
+                storage.clone(),
+                session_id.to_owned(),
+            )
+            .with_cluster_config(config.cluster.clone())
+            .with_approval_lock(approval_lock.clone())
+            .with_configured_agents(config.agents.clone())
+            .with_compaction_config(config.compaction.clone())
+            .with_child_role(child_role.clone())
+            .with_child_provider_resolver(child_provider_resolver)
+        })
     });
     let (agent_tx, agent_rx) = mpsc::channel(128);
     let router = router_tx.clone();

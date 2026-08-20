@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use serde_json::{Value, json};
 #[cfg(test)]
 use tokio::sync::Mutex;
@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::{
     ConversationItem, ModelEvent, ModelRequest, ProviderError, Role, ThinkingMode, ToolCall,
-    ToolDefinition, Usage,
+    ToolDefinition, Usage, retry_delay,
 };
 use crate::config::{ProviderKind, ThinkingLevel, ThinkingProfileKind};
 
@@ -19,12 +19,36 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: String,
     client: reqwest::Client,
+    retry_max_attempts: u32,
+    retry_initial_backoff_ms: u64,
+    retry_max_backoff_ms: u64,
     #[cfg(test)]
-    scripted_events: Option<std::sync::Arc<Mutex<std::collections::VecDeque<Vec<ModelEvent>>>>>,
+    scripted_steps: Option<std::sync::Arc<Mutex<std::collections::VecDeque<ScriptedStep>>>>,
+}
+
+#[cfg(test)]
+enum ScriptedStep {
+    /// Fail before emitting any event.
+    Fail(ProviderError),
+    /// Emit a full event sequence then succeed.
+    Events(Vec<ModelEvent>),
+    /// Emit events then fail; used to prove mid-stream failures are never
+    /// retried even when the error itself is retryable.
+    EventsThenFail(Vec<ModelEvent>, ProviderError),
 }
 
 impl OpenAiClient {
     pub fn new(base_url: String, api_key: String) -> Result<Self, ProviderError> {
+        Self::new_with_retry(base_url, api_key, 3, 500, 8000)
+    }
+
+    pub fn new_with_retry(
+        base_url: String,
+        api_key: String,
+        retry_max_attempts: u32,
+        retry_initial_backoff_ms: u64,
+        retry_max_backoff_ms: u64,
+    ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(10 * 60))
@@ -34,15 +58,35 @@ impl OpenAiClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key,
             client,
+            retry_max_attempts,
+            retry_initial_backoff_ms,
+            retry_max_backoff_ms,
             #[cfg(test)]
-            scripted_events: None,
+            scripted_steps: None,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn scripted(responses: Vec<Vec<ModelEvent>>) -> Result<Self, ProviderError> {
         let mut client = Self::new("http://127.0.0.1".into(), "test".into())?;
-        client.scripted_events = Some(std::sync::Arc::new(Mutex::new(responses.into())));
+        client.scripted_steps = Some(std::sync::Arc::new(Mutex::new(
+            responses.into_iter().map(ScriptedStep::Events).collect(),
+        )));
+        Ok(client)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_with_failures(
+        responses: Vec<Vec<ModelEvent>>,
+        failures: Vec<ProviderError>,
+    ) -> Result<Self, ProviderError> {
+        let mut client = Self::new("http://127.0.0.1".into(), "test".into())?;
+        let mut steps = failures
+            .into_iter()
+            .map(ScriptedStep::Fail)
+            .collect::<Vec<_>>();
+        steps.extend(responses.into_iter().map(ScriptedStep::Events));
+        client.scripted_steps = Some(std::sync::Arc::new(Mutex::new(steps.into())));
         Ok(client)
     }
 
@@ -51,19 +95,58 @@ impl OpenAiClient {
         request: ModelRequest,
         events: mpsc::Sender<ModelEvent>,
     ) -> Result<(), ProviderError> {
-        #[cfg(test)]
-        if let Some(scripted) = &self.scripted_events {
-            let response =
-                scripted.lock().await.pop_front().ok_or_else(|| {
-                    ProviderError::Protocol("scripted provider exhausted".to_owned())
-                })?;
-            for event in response {
-                events
-                    .send(event)
-                    .await
-                    .map_err(|_| ProviderError::ReceiverClosed)?;
+        let mut attempt = 1u32;
+        let mut emitted = false;
+        loop {
+            let attempt_events = events.clone();
+            match self.stream_attempt(request.clone(), &attempt_events).await {
+                Ok(()) => return Ok(()),
+                Err((attempt_emitted, error)) => {
+                    emitted |= attempt_emitted;
+                    let delay = if !emitted && attempt < self.retry_max_attempts {
+                        retry_delay(
+                            &error,
+                            attempt,
+                            self.retry_initial_backoff_ms,
+                            self.retry_max_backoff_ms,
+                        )
+                    } else {
+                        None
+                    };
+                    let Some(delay) = delay else {
+                        return Err(error);
+                    };
+                    let delay_ms = delay.as_millis() as u64;
+                    let reason = retry_reason(&error);
+                    tracing::warn!(
+                        status = %reason,
+                        attempt,
+                        "provider request failed; retrying after {delay_ms}ms"
+                    );
+                    let _ = events
+                        .send(ModelEvent::Retrying {
+                            attempt,
+                            reason,
+                            delay_ms,
+                        })
+                        .await;
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
             }
-            return Ok(());
+        }
+    }
+
+    /// Sends one request and streams its events. Returns `true` in the error
+    /// tuple when any event was delivered before the failure (never retried).
+    async fn stream_attempt(
+        &self,
+        request: ModelRequest,
+        events: &mpsc::Sender<ModelEvent>,
+    ) -> Result<(), (bool, ProviderError)> {
+        #[cfg(test)]
+        if self.scripted_steps.is_some() {
+            return self.stream_scripted(events).await;
         }
         let (path, body) = match request.kind {
             ProviderKind::ChatCompletions => ("chat/completions", chat_body(&request)),
@@ -77,36 +160,51 @@ impl OpenAiClient {
             .header(CONTENT_TYPE, "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|error| (false, ProviderError::Http(error)))?;
 
         let status = response.status();
         if !status.is_success() {
-            let bytes = response.bytes().await?;
+            let retry_after_ms = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after);
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| (false, ProviderError::Http(error)))?;
             let message =
                 String::from_utf8_lossy(&bytes[..bytes.len().min(16 * 1024)]).into_owned();
-            return Err(ProviderError::Status {
-                status: status.as_u16(),
-                message,
-            });
+            return Err((
+                false,
+                ProviderError::Status {
+                    status: status.as_u16(),
+                    message,
+                    retry_after_ms,
+                },
+            ));
         }
 
         let mut decoder = SseDecoder::default();
         let mut stream = response.bytes_stream();
         let mut saw_done = false;
         while let Some(chunk) = stream.next().await {
-            for event in decoder.push(&chunk?) {
+            let chunk = chunk.map_err(|error| (true, ProviderError::Http(error)))?;
+            for event in decoder.push(&chunk) {
                 if event.data.trim() == "[DONE]" {
                     saw_done = true;
                     continue;
                 }
                 let value: Value = serde_json::from_str(&event.data)
-                    .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+                    .map_err(|error| (true, ProviderError::Protocol(error.to_string())))?;
                 let parsed = match request.kind {
                     ProviderKind::ChatCompletions => parse_chat_event(&value),
                     ProviderKind::Responses => {
                         parse_responses_event_for_mode(&value, request.thinking_mode)
                     }
-                }?;
+                }
+                .map_err(|error| (true, error))?;
                 for model_event in parsed {
                     if matches!(model_event, ModelEvent::Done) {
                         saw_done = true;
@@ -114,7 +212,7 @@ impl OpenAiClient {
                     events
                         .send(model_event)
                         .await
-                        .map_err(|_| ProviderError::ReceiverClosed)?;
+                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
                 }
             }
         }
@@ -122,14 +220,86 @@ impl OpenAiClient {
             events
                 .send(ModelEvent::Done)
                 .await
-                .map_err(|_| ProviderError::ReceiverClosed)?;
+                .map_err(|_| (true, ProviderError::ReceiverClosed))?;
         } else if request.kind == ProviderKind::ChatCompletions {
             events
                 .send(ModelEvent::Done)
                 .await
-                .map_err(|_| ProviderError::ReceiverClosed)?;
+                .map_err(|_| (true, ProviderError::ReceiverClosed))?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn stream_scripted(
+        &self,
+        events: &mpsc::Sender<ModelEvent>,
+    ) -> Result<(), (bool, ProviderError)> {
+        let step = self
+            .scripted_steps
+            .as_ref()
+            .expect("scripted_steps set")
+            .lock()
+            .await
+            .pop_front()
+            .ok_or_else(|| {
+                (
+                    false,
+                    ProviderError::Protocol("scripted provider exhausted".to_owned()),
+                )
+            })?;
+        match step {
+            ScriptedStep::Fail(error) => Err((false, error)),
+            ScriptedStep::Events(response) => {
+                for event in response {
+                    events
+                        .send(event)
+                        .await
+                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                }
+                Ok(())
+            }
+            ScriptedStep::EventsThenFail(events_before, error) => {
+                for event in events_before {
+                    events
+                        .send(event)
+                        .await
+                        .map_err(|_| (true, ProviderError::ReceiverClosed))?;
+                }
+                Err((true, error))
+            }
+        }
+    }
+}
+
+/// Parses a `Retry-After` header value (delta seconds or HTTP-date) into
+/// milliseconds. Unparseable values yield `None`.
+fn parse_retry_after(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delay_ms = (date.timestamp_millis() - chrono::Utc::now().timestamp_millis()).max(0);
+    Some(delay_ms as u64)
+}
+
+fn retry_reason(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Http(http) => format!("http request failed: {}", http),
+        ProviderError::Status {
+            status, message, ..
+        } => {
+            format!(
+                "HTTP {status}: {}",
+                message.lines().next().unwrap_or_default()
+            )
+        }
+        ProviderError::Protocol(message) => format!("protocol error: {message}"),
+        ProviderError::ReceiverClosed => "model event receiver closed".into(),
     }
 }
 
@@ -830,6 +1000,12 @@ fn parse_sse_frame(frame: &[u8]) -> Option<SseEvent> {
 mod tests {
     use super::*;
 
+    fn scripted_steps(steps: Vec<ScriptedStep>) -> Result<OpenAiClient, ProviderError> {
+        let mut client = OpenAiClient::new("http://127.0.0.1".into(), "test".into())?;
+        client.scripted_steps = Some(std::sync::Arc::new(Mutex::new(steps.into())));
+        Ok(client)
+    }
+
     #[test]
     fn decodes_fragmented_sse() {
         let mut decoder = SseDecoder::default();
@@ -1293,5 +1469,128 @@ mod tests {
             .push(ConversationItem::ProviderItem { item: item.clone() });
         let body = responses_body(&request);
         assert_eq!(body.pointer("/input/0"), Some(&item));
+    }
+
+    #[test]
+    fn parses_retry_after_seconds_and_http_date() {
+        assert_eq!(parse_retry_after("2"), Some(2000));
+        assert_eq!(parse_retry_after("0"), Some(0));
+        assert_eq!(parse_retry_after(" 5 "), Some(5000));
+        assert_eq!(parse_retry_after("garbage"), None);
+        assert_eq!(parse_retry_after(""), None);
+        let future = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let header = future.to_rfc2822();
+        let parsed = parse_retry_after(&header).unwrap();
+        assert!((25_000..=35_000).contains(&parsed));
+    }
+
+    #[tokio::test]
+    async fn stream_retries_429_before_success_without_replaying_events() {
+        let client = OpenAiClient::scripted_with_failures(
+            vec![vec![
+                ModelEvent::TextDelta("final".into()),
+                ModelEvent::Done,
+            ]],
+            vec![ProviderError::Status {
+                status: 429,
+                message: "rate limited".into(),
+                retry_after_ms: Some(1),
+            }],
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let request = empty_request(ProviderKind::Responses, ThinkingMode::Disabled);
+        let result = client.stream(request, tx).await;
+        assert!(result.is_ok());
+        let mut collected = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let is_done = matches!(event, ModelEvent::Done);
+            collected.push(event);
+            if is_done {
+                break;
+            }
+        }
+        assert!(matches!(
+            collected.first(),
+            Some(ModelEvent::Retrying { attempt: 1, .. })
+        ));
+        assert_eq!(
+            collected
+                .iter()
+                .filter(|event| matches!(event, ModelEvent::TextDelta(_)))
+                .count(),
+            1
+        );
+        assert!(matches!(collected.last(), Some(ModelEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_retry_after_any_event_was_emitted() {
+        let client = scripted_steps(vec![ScriptedStep::EventsThenFail(
+            vec![ModelEvent::TextDelta("partial".into())],
+            ProviderError::Status {
+                status: 429,
+                message: "late".into(),
+                retry_after_ms: Some(1),
+            },
+        )])
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let request = empty_request(ProviderKind::Responses, ThinkingMode::Disabled);
+        let result = client.stream(request, tx).await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::Status { status: 429, .. })
+        ));
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let is_done = matches!(event, ModelEvent::Done);
+            events.push(event);
+            if is_done {
+                break;
+            }
+        }
+        // One delta was emitted; the failure must surface immediately with no
+        // Retrying event and no second attempt.
+        assert_eq!(events, vec![ModelEvent::TextDelta("partial".into())]);
+    }
+
+    #[tokio::test]
+    async fn stream_stops_after_exhausting_attempts() {
+        let client = OpenAiClient::scripted_with_failures(
+            vec![],
+            vec![
+                ProviderError::Status {
+                    status: 500,
+                    message: "flaky".into(),
+                    retry_after_ms: None,
+                },
+                ProviderError::Status {
+                    status: 500,
+                    message: "flaky".into(),
+                    retry_after_ms: None,
+                },
+                ProviderError::Status {
+                    status: 500,
+                    message: "flaky".into(),
+                    retry_after_ms: None,
+                },
+            ],
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let request = empty_request(ProviderKind::Responses, ThinkingMode::Disabled);
+        let result = client.stream(request, tx).await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::Status { status: 500, .. })
+        ));
+        let mut retries = 0;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, ModelEvent::Retrying { .. }) {
+                retries += 1;
+            }
+        }
+        assert_eq!(retries, 2);
     }
 }

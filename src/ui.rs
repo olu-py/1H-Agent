@@ -1606,6 +1606,7 @@ pub(crate) fn tool_display_name(name: &str) -> String {
         "file_search" => Some("文件搜索"),
         "file_mkdir" => Some("新建目录"),
         "file_write" => Some("文件修改"),
+        "file_edit" => Some("文件编辑"),
         "file_copy" => Some("文件复制"),
         "file_move" => Some("文件移动"),
         "file_delete" => Some("文件删除"),
@@ -1640,9 +1641,8 @@ fn tool_compact_summary(name: &str, arguments: &Value, width: usize) -> String {
             .unwrap_or_default()
     };
     let raw = match name {
-        "file_read" | "file_write" | "file_stat" | "file_list" | "file_mkdir" | "file_delete" => {
-            get(&["path"]).to_owned()
-        }
+        "file_read" | "file_write" | "file_edit" | "file_stat" | "file_list" | "file_mkdir"
+        | "file_delete" => get(&["path"]).to_owned(),
         "file_search" => [get(&["path"]), get(&["query", "pattern"])]
             .into_iter()
             .filter(|value| !value.is_empty())
@@ -2201,7 +2201,7 @@ fn tool_risk(name: &str) -> &'static str {
     match name {
         "file_delete" => "HIGH - removes workspace data",
         "terminal_shell" | "terminal_exec" | "git" => "HIGH - can change workspace state",
-        "file_write" | "file_move" | "file_copy" | "file_mkdir" => {
+        "file_write" | "file_edit" | "file_move" | "file_copy" | "file_mkdir" => {
             "MEDIUM - changes workspace files"
         }
         value if value.starts_with("browser_") || value.starts_with("mcp:") => {
@@ -2214,6 +2214,8 @@ fn tool_risk(name: &str) -> &'static str {
 fn argument_label(key: &str) -> &'static str {
     match key {
         "path" => "路径",
+        "old_string" => "原文本",
+        "new_string" => "新文本",
         "source" | "from" => "来源",
         "destination" | "to" => "目标",
         "command" => "命令",
@@ -3400,6 +3402,7 @@ mod tests {
             ("file_search", "文件搜索"),
             ("file_mkdir", "新建目录"),
             ("file_write", "文件修改"),
+            ("file_edit", "文件编辑"),
             ("file_copy", "文件复制"),
             ("file_move", "文件移动"),
             ("file_delete", "文件删除"),

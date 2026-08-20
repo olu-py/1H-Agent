@@ -31,7 +31,7 @@ excluded: Web UI、内置浏览器、远程 MCP、动态插件、图片和语音
 | Provider、模型、密钥、协议、压缩恢复 | `src/config.rs`、`src/agent.rs`、`src/provider/openai.rs` | [Provider](.agents/guides/provider.md) |
 | 子 Agent、审批、取消、集群停滞 | `src/agent.rs`、`src/app.rs` | [Cluster](.agents/guides/cluster.md) |
 | 首页、渲染、长文本、滚动、鼠标交互 | `src/home.rs`、`src/app.rs`、`src/ui.rs`、`src/output.rs` | [TUI](.agents/guides/tui.md) |
-| 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | 无；遵守全局安全规则 |
+| 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | [Tools](.agents/guides/tools.md) |
 | 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | 涉及 Provider 状态时再读 Provider |
 | 配置上限、容量归一化、新增配置键 | `src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | 无；同步默认值与 `defaults_are_bounded` 类测试 |
 | CI、版本、安装包、tag | `.github/workflows/`、`Cargo.toml` | [Release](.agents/guides/release.md) |

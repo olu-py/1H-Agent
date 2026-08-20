@@ -67,6 +67,7 @@ impl ToolRegistry {
             && matches!(
                 call.name.as_str(),
                 "file_write"
+                    | "file_edit"
                     | "file_mkdir"
                     | "file_copy"
                     | "file_move"
@@ -191,6 +192,13 @@ impl ToolRegistry {
                 "Write a UTF-8 text file in the workspace",
                 json!({
                     "type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false
+                }),
+            ),
+            definition(
+                "file_edit",
+                "Replace exact text in an existing UTF-8 file. old_string must match exactly once unless replace_all is true",
+                json!({
+                    "type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"],"additionalProperties":false
                 }),
             ),
             definition(
@@ -338,6 +346,7 @@ impl ToolRegistry {
             ),
             "file_mkdir" => filesystem::mkdir(&self.workspace, &call.arguments),
             "file_write" => filesystem::write(&self.workspace, &call.arguments),
+            "file_edit" => filesystem::edit(&self.workspace, &call.arguments),
             "file_copy" => filesystem::copy(&self.workspace, &call.arguments),
             "file_move" => filesystem::move_path(&self.workspace, &call.arguments),
             "file_delete" => filesystem::delete(&self.workspace, &call.arguments),

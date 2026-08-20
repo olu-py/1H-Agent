@@ -23,6 +23,7 @@ Provider 档案、设置、密钥、请求协议、reasoning、`response_id`、�
 - DeepSeek Responses 不用 previous ID；原生搜索与同名本地 tool 互斥。
 - Reasoning 事件按增量语义处理：空 content 不结束思考，done 的完整文本不重复追加；Qwen 3.7/3.8 字段按各协议隔离。
 - 私有 JSON/SSE 必须先规范化为公共事件；诊断输出始终脱敏。
+- HTTP 层指数退避重试仅在"未发出任何事件"的失败上生效（连接/发送阶段错误与 408/429/500/502/503/504）；流中断不重试，由 agent 层空输出重放兜底；`Retry-After` 优先并被 clamp 到 `retry_max_backoff_ms`。重试上限与退避参数来自 `ProviderConfig`（0 关闭）并 clamp。
 
 ## 诊断
 
@@ -32,9 +33,11 @@ Provider 档案、设置、密钥、请求协议、reasoning、`response_id`、�
 | 切换后配置回退 | profile -> active 副本 -> session provider/model -> runner rebuild |
 | 重复钥匙串弹窗 | 热路径 key 查询 -> cache-only -> 缓存错误是否被错误重试 |
 | 请求/SSE 400 | `ProviderKind` -> body/tool/thinking 字段 -> SSE 终态 |
+| 请求失败但无重试 | `retry_max_attempts`/clamp -> 错误分类（`retry_delay`）-> 是否已发事件 |
 
 ## 验证
 
-- 迭代过滤器：`config::tests`、`settings::tests`、`secrets::tests`、`provider::openai::tests`。
-- Agent 状态过滤器：`incremental_cursor_keeps_latest_user_message_and_following_context`、`stateless_replay_keeps_only_complete_ordered_tool_pairs`。
+- 迭代过滤器：`config::tests`、`settings::tests`、`secrets::tests`、`provider::openai::tests`、`provider::tests`（重试决策）。
+- Agent 状态过滤器：`incremental_cursor_keeps_latest_user_message_and_following_context`、`stateless_replay_keeps_only_complete_ordered_tool_pairs`、`provider_retry_event_reaches_the_ui_channel`。
 - 完成阶段按根文档运行一次 lib 测试；涉及存储恢复时升级到完整测试。
+- 重试测试用 `OpenAiClient::scripted_with_failures`/`scripted_steps`（`Fail`/`Events`/`EventsThenFail`）模拟"发出事件后再失败"的流中断，验证不重试防 delta 重放；集成测用 1ms 退避避免 flaky。
