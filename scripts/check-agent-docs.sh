@@ -22,7 +22,7 @@ test ! -e "$legacy_doc" || fail "legacy singular agent document must not exist"
 grep -Fq '[AGENTS.md](AGENTS.md)' "$repo_root/README.md" || fail "README.md does not link AGENTS.md"
 test "$(line_count "$root_doc")" -le "$root_line_limit" || fail "AGENTS.md exceeds $root_line_limit lines"
 
-guides=(provider cluster tui release)
+guides=(provider cluster runtime tui release)
 sections=("## 适用范围" "## 入口" "## 不变量" "## 诊断" "## 验证")
 for guide in "${guides[@]}"; do
     relative=".agents/guides/${guide}.md"

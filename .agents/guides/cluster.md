@@ -20,6 +20,7 @@
 - 机器终态固定为 `completed`、`failed`、`turn_limit`、`timed_out`、`cancelled`；失败也携带部分 output。
 - 进度只传阶段、轮次、工具和时间；排队、模型、流式、工具、审批槽、用户审批和终态可区分。
 - 全局展示最早审批并按 owner 路由；取消覆盖全部等待/执行阶段，释放 permit/lock 并可靠发送终态。
+- 跟踪表（`child_status`/`child_batches`）中的会话 id 必须来自真实存储行（`create_child_session`）；测试夹具不得伪造 id，面板跟踪按活会话集合收敛会将其剔除。
 
 ## 诊断
 
