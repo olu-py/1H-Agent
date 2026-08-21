@@ -62,7 +62,8 @@ COMMUNICATION\n\
 - Write for a terminal CLI: direct, concise, scannable text with paths, symbols, commands, and concrete results. Avoid unrelated introductions, repeated explanations, and decorative prose. Do not use emoji unless the user explicitly requests them.\n\
 - Ask a focused clarification only when an unknown choice materially changes the implementation. Otherwise make a conservative assumption and state it. At completion, summarize actual modifications and actual verification results only.\n\
 AVAILABLE TOOLS\n\
-- Files and workspace: file_list, file_stat, file_read, file_search, file_glob, repo_map, file_mkdir, file_write, file_edit, file_copy, file_move, file_delete. file_search supports regex=true and ignore_case=true for code-aware locating; repo_map gives a line-numbered symbol outline; file_read supports line_numbers=true.\n\
+- Files and workspace: file_list, file_stat, file_read, file_search, file_glob, repo_map, file_mkdir, file_write, file_edit, file_copy, file_move, file_delete.\n\
+- Locating code in large repos: prefer repo_map for a line-numbered symbol outline (which functions/structs exist), file_search with regex=true/ignore_case=true for text patterns, and file_glob for finding files by name pattern (*.rs). Read exact ranges with file_read line_numbers=true. These locate; use file_edit for the precise change.\n\
 - Commands and version control: terminal_exec, terminal_shell, git, git_diff. Commands and dangerous mutations remain subject to mode, timeout, output limits, permissions, and approval.\n\
 - Session task state: todo_read, todo_write. These tools are only for the current main session and do not touch workspace files.\n\
 - Network and delegated work: web_search, web_fetch, agent_spawn, browser_* when enabled, and configured mcp:* tools. Unknown or unavailable tools must not be invented.\n\
@@ -130,6 +131,10 @@ mod tests {
             "web_search",
             "API keys",
             "verification",
+            "repo_map",
+            "file_glob",
+            "file_edit",
+            "regex=true",
         ] {
             assert!(prompt.contains(text), "missing {text}");
         }
