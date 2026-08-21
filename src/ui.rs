@@ -1604,6 +1604,8 @@ pub(crate) fn tool_display_name(name: &str) -> String {
         "file_stat" => Some("文件信息"),
         "file_read" => Some("文件读取"),
         "file_search" => Some("文件搜索"),
+        "file_glob" => Some("文件查找"),
+        "repo_map" => Some("符号大纲"),
         "file_mkdir" => Some("新建目录"),
         "file_write" => Some("文件修改"),
         "file_edit" => Some("文件编辑"),
@@ -1642,8 +1644,13 @@ fn tool_compact_summary(name: &str, arguments: &Value, width: usize) -> String {
     };
     let raw = match name {
         "file_read" | "file_write" | "file_edit" | "file_stat" | "file_list" | "file_mkdir"
-        | "file_delete" => get(&["path"]).to_owned(),
+        | "file_delete" | "repo_map" => get(&["path"]).to_owned(),
         "file_search" => [get(&["path"]), get(&["query", "pattern"])]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("  "),
+        "file_glob" => [get(&["path"]), get(&["pattern"])]
             .into_iter()
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>()
@@ -2120,6 +2127,12 @@ fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) 
     let popup = centered_rect(76, 18, area);
     let approval = app.pending_approval().expect("approval exists");
     let mut lines = approval_lines(&approval.call, &approval.reason);
+    if let Some(prefix) = session_allow_preview(&approval.call) {
+        lines.push(Line::from(Span::styled(
+            format!("放行  本会话将自动允许：{prefix}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     if let Some(title) = approval.source_title.as_deref() {
         lines.insert(
             0,
@@ -2136,7 +2149,7 @@ fn draw_approval(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &UiTheme) 
     )));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        "Y 批准    N 拒绝    Esc 拒绝",
+        "Y 批准    N 拒绝    A 本会话总是允许    Esc 拒绝",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -2208,6 +2221,50 @@ fn tool_risk(name: &str) -> &'static str {
             "MEDIUM - external side effect"
         }
         _ => "LOW - review parameters",
+    }
+}
+
+/// Human-readable "will always allow" preview shown on approval cards. Only
+/// terminal_exec/git/terminal_shell show a command prefix; other tools allow
+/// by exact name.
+fn session_allow_preview(call: &crate::provider::ToolCall) -> Option<String> {
+    match call.name.as_str() {
+        "terminal_shell" => call
+            .arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| format!("terminal_shell {command}")),
+        "terminal_exec" => {
+            let program = call
+                .arguments
+                .get("program")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if program.is_empty() {
+                return None;
+            }
+            let mut parts = vec![program.to_owned()];
+            if let Some(args) = call.arguments.get("args").and_then(Value::as_array) {
+                parts.extend(
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .take(8)
+                        .map(str::to_owned),
+                );
+            }
+            Some(format!("terminal_exec {}", parts.join(" ")))
+        }
+        "git" => {
+            let subcommand = call
+                .arguments
+                .get("args")
+                .and_then(Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(format!("git {subcommand}"))
+        }
+        _ => None,
     }
 }
 
@@ -3400,6 +3457,8 @@ mod tests {
             ("file_stat", "文件信息"),
             ("file_read", "文件读取"),
             ("file_search", "文件搜索"),
+            ("file_glob", "文件查找"),
+            ("repo_map", "符号大纲"),
             ("file_mkdir", "新建目录"),
             ("file_write", "文件修改"),
             ("file_edit", "文件编辑"),

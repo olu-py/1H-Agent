@@ -6,6 +6,7 @@ use std::{
 };
 
 use ignore::WalkBuilder;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -24,6 +25,7 @@ struct ReadArgs {
     path: String,
     max_bytes: Option<usize>,
     offset: Option<usize>,
+    line_numbers: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +34,8 @@ struct SearchArgs {
     path: String,
     query: String,
     max_results: Option<usize>,
+    regex: Option<bool>,
+    ignore_case: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +59,21 @@ struct EditArgs {
 struct TransferArgs {
     source: String,
     destination: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobArgs {
+    path: String,
+    pattern: String,
+    max_results: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutlineArgs {
+    path: String,
+    max_results: Option<usize>,
 }
 
 pub fn list(workspace: &Workspace, value: &Value) -> Result<String, ToolError> {
@@ -119,7 +138,19 @@ pub fn read(workspace: &Workspace, value: &Value, limit: usize) -> Result<String
         bytes.truncate(limit);
         bytes.extend_from_slice(b"\n[output truncated]");
     }
-    String::from_utf8(bytes).map_err(|_| ToolError::Execution("file is not valid UTF-8".into()))
+    let text = String::from_utf8(bytes)
+        .map_err(|_| ToolError::Execution("file is not valid UTF-8".into()))?;
+    if args.line_numbers.unwrap_or(false) {
+        let numbered = text
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{:>4}\t{line}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(numbered)
+    } else {
+        Ok(text)
+    }
 }
 
 pub fn search(
@@ -137,6 +168,26 @@ pub fn search(
         .resolve_existing(args.path)
         .map_err(security_error)?;
     let max_results = args.max_results.unwrap_or(200).min(1000);
+    let regex_enabled = args.regex.unwrap_or(false);
+    let ignore_case = args.ignore_case.unwrap_or(false);
+    let matcher: SearchMatcher = if regex_enabled {
+        let pattern = if ignore_case {
+            format!("(?i){}", args.query)
+        } else {
+            args.query.clone()
+        };
+        let regex = Regex::new(&pattern).map_err(|error| {
+            ToolError::InvalidArguments(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid regex: {error}"),
+            )))
+        })?;
+        SearchMatcher::Regex(regex)
+    } else if ignore_case {
+        SearchMatcher::ContainsCaseInsensitive(args.query)
+    } else {
+        SearchMatcher::Contains(args.query)
+    };
     let mut matches = Vec::new();
     let mut encoded_size = 0usize;
 
@@ -158,7 +209,7 @@ pub fn search(
             continue;
         };
         for (index, line) in content.lines().enumerate() {
-            if line.contains(&args.query) {
+            if matcher.matches(line) {
                 let item = json!({
                     "path": display_relative(workspace, entry.path()),
                     "line": index + 1,
@@ -173,6 +224,26 @@ pub fn search(
         }
     }
     serde_json::to_string_pretty(&matches).map_err(ToolError::from)
+}
+
+/// Line matcher for `file_search`, unifying the substring fast path with the
+/// case-insensitive and regex variants.
+enum SearchMatcher {
+    Contains(String),
+    ContainsCaseInsensitive(String),
+    Regex(Regex),
+}
+
+impl SearchMatcher {
+    fn matches(&self, line: &str) -> bool {
+        match self {
+            Self::Contains(query) => line.contains(query.as_str()),
+            Self::ContainsCaseInsensitive(query) => line
+                .to_ascii_lowercase()
+                .contains(&query.to_ascii_lowercase()),
+            Self::Regex(regex) => regex.is_match(line),
+        }
+    }
 }
 
 pub fn mkdir(workspace: &Workspace, value: &Value) -> Result<String, ToolError> {
@@ -229,6 +300,164 @@ pub fn edit(workspace: &Workspace, value: &Value) -> Result<String, ToolError> {
         "edited {}: {replacement_count} replacement(s)",
         display_relative(workspace, &path)
     ))
+}
+
+pub fn glob(
+    workspace: &Workspace,
+    value: &Value,
+    output_limit: usize,
+) -> Result<String, ToolError> {
+    let args: GlobArgs = serde_json::from_value(value.clone())?;
+    if args.pattern.is_empty() {
+        return Err(ToolError::Execution("pattern must not be empty".into()));
+    }
+    let root = workspace
+        .resolve_existing(args.path)
+        .map_err(security_error)?;
+    let matcher = globset::GlobBuilder::new(&args.pattern)
+        .literal_separator(false)
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|error| {
+            ToolError::InvalidArguments(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid glob pattern: {error}"),
+            )))
+        })?;
+    let max_results = args.max_results.unwrap_or(200).min(1000);
+    let mut entries = Vec::new();
+    let mut encoded_size = 0usize;
+
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .max_depth(Some(16))
+        .build()
+        .filter_map(Result::ok)
+    {
+        if entries.len() >= max_results || encoded_size >= output_limit {
+            break;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let file_name = entry.file_name().to_string_lossy();
+        if !matcher.is_match(file_name.as_ref()) {
+            continue;
+        }
+        let item = json!({
+            "path": display_relative(workspace, entry.path()),
+            "type": if metadata.is_dir() { "directory" } else if metadata.is_file() { "file" } else { "other" },
+            "bytes": metadata.len(),
+        });
+        encoded_size += item.to_string().len();
+        entries.push(item);
+    }
+    serde_json::to_string_pretty(&entries).map_err(ToolError::from)
+}
+
+/// Line-start heuristic outline (repo map): extracts symbols like `fn`,
+/// `struct`, `impl`, `trait`, `enum`, `mod`, `class`, `def`, `function`, `func`
+/// with their 1-based line numbers. Pure regex; intentionally no tree-sitter or
+/// LSP.
+pub fn repo_map(
+    workspace: &Workspace,
+    value: &Value,
+    output_limit: usize,
+) -> Result<String, ToolError> {
+    let args: OutlineArgs = serde_json::from_value(value.clone())?;
+    let root = workspace
+        .resolve_existing(args.path)
+        .map_err(security_error)?;
+    let max_results = args.max_results.unwrap_or(500).min(2000);
+    let mut symbols = Vec::new();
+    let mut encoded_size = 0usize;
+
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .max_depth(Some(16))
+        .build()
+        .filter_map(Result::ok)
+    {
+        if symbols.len() >= max_results || encoded_size >= output_limit {
+            break;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            continue;
+        }
+        let Ok(content) = fs::read(entry.path()) else {
+            continue;
+        };
+        // Skip binary files quickly: NUL byte in the first 1 KiB.
+        if content.get(..1024).is_some_and(|head| head.contains(&0)) {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(content) else {
+            continue;
+        };
+        let relative = display_relative(workspace, entry.path());
+        for (index, line) in text.lines().enumerate() {
+            let Some(kind) = outline_kind(line) else {
+                continue;
+            };
+            let symbol = line.trim();
+            let symbol = if symbol.len() > 120 {
+                let end = char_boundary(symbol, 120);
+                &symbol[..end]
+            } else {
+                symbol
+            };
+            let item = json!({
+                "path": relative,
+                "line": index + 1,
+                "symbol": symbol,
+                "kind": kind,
+            });
+            encoded_size += item.to_string().len();
+            symbols.push(item);
+            if symbols.len() >= max_results || encoded_size >= output_limit {
+                break;
+            }
+        }
+    }
+    symbols.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    serde_json::to_string_pretty(&symbols).map_err(ToolError::from)
+}
+
+/// Detects a line-start symbol declaration and returns its kind, or `None`.
+fn outline_kind(line: &str) -> Option<&'static str> {
+    let line = line.trim_start();
+    for (prefix, kind) in [
+        ("fn ", "fn"),
+        ("pub fn ", "fn"),
+        ("struct ", "struct"),
+        ("impl ", "impl"),
+        ("trait ", "trait"),
+        ("enum ", "enum"),
+        ("mod ", "mod"),
+        ("class ", "class"),
+        ("def ", "def"),
+        ("function ", "function"),
+        ("func ", "func"),
+    ] {
+        if line.starts_with(prefix) {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// Largest byte index at or below `limit` that is a UTF-8 char boundary. Avoids
+/// depending on the recent `floor_char_boundary` stable API so the MSRV (1.85)
+/// is preserved.
+fn char_boundary(value: &str, limit: usize) -> usize {
+    let mut end = limit.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 pub fn copy(workspace: &Workspace, value: &Value) -> Result<String, ToolError> {
@@ -435,5 +664,113 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ToolError::Security(_)));
+    }
+
+    #[test]
+    fn search_supports_regex_ignore_case_and_falls_back_to_substring() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(
+            &workspace,
+            &json!({"path":"a.txt","content":"Foo bar\nfoo baz"}),
+        )
+        .unwrap();
+        // Substring fast path (default).
+        let sub = search(&workspace, &json!({"path":".","query":"bar"}), 4096).unwrap();
+        assert!(sub.contains("Foo bar"));
+        // ignore_case matches both lines.
+        let ci = search(
+            &workspace,
+            &json!({"path":".","query":"foo","ignore_case":true}),
+            4096,
+        )
+        .unwrap();
+        assert!(ci.contains("Foo bar"));
+        assert!(ci.contains("foo baz"));
+        // regex matches only "baz" (bar does not end in 'z').
+        let regex = search(
+            &workspace,
+            &json!({"path":".","query":"ba[z]$","regex":true}),
+            4096,
+        )
+        .unwrap();
+        assert!(regex.contains("foo baz"));
+        assert!(!regex.contains("Foo bar"));
+    }
+
+    #[test]
+    fn search_reports_invalid_regex_as_invalid_arguments() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(&workspace, &json!({"path":"a.txt","content":"x"})).unwrap();
+        let error = search(
+            &workspace,
+            &json!({"path":".","query":"[unclosed","regex":true}),
+            4096,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn glob_finds_files_by_pattern() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(&workspace, &json!({"path":"a.rs","content":"fn a() {}"})).unwrap();
+        write(&workspace, &json!({"path":"b.ts","content":"let b = 1;"})).unwrap();
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        write(
+            &workspace,
+            &json!({"path":"sub/c.rs","content":"fn c() {}"}),
+        )
+        .unwrap();
+        let rs = glob(&workspace, &json!({"path":".","pattern":"*.rs"}), 4096).unwrap();
+        assert!(rs.contains("a.rs"));
+        assert!(!rs.contains("b.ts"));
+        assert!(rs.contains("c.rs"));
+    }
+
+    #[test]
+    fn repo_map_extracts_symbols_and_skips_binary() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(
+            &workspace,
+            &json!({"path":"lib.rs","content":"use std;\n\npub fn run() {}\nstruct Config {}\nimpl Config {}\n"}),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("blob.bin"), vec![0u8, 1, 2, 3]).unwrap();
+        let outline = repo_map(&workspace, &json!({"path":"."}), 4096).unwrap();
+        assert!(outline.contains("\"fn\""));
+        assert!(outline.contains("pub fn run()"));
+        assert!(outline.contains("\"struct\""));
+        assert!(outline.contains("\"impl\""));
+        assert!(!outline.contains("blob.bin"));
+        // Line numbers are 1-based and present.
+        assert!(outline.contains("\"line\": 3"));
+    }
+
+    #[test]
+    fn read_supports_line_numbers() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        write(
+            &workspace,
+            &json!({"path":"a.txt","content":"one\ntwo\nthree"}),
+        )
+        .unwrap();
+        let numbered = read(
+            &workspace,
+            &json!({"path":"a.txt","line_numbers":true}),
+            100,
+        )
+        .unwrap();
+        assert!(numbered.contains("\tone"));
+        assert!(numbered.contains("1\tone"));
+        assert!(numbered.contains("2\ttwo"));
+        assert!(numbered.contains("3\tthree"));
+        // Plain read unchanged.
+        let plain = read(&workspace, &json!({"path":"a.txt"}), 100).unwrap();
+        assert_eq!(plain, "one\ntwo\nthree");
     }
 }

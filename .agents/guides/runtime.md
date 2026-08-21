@@ -19,6 +19,7 @@
 - 后台总量硬上限 `runtime.max_background_sessions`（clamp 2..=64，默认 8）：超限优先 LRU 淘汰空闲项，全忙时关停最旧项；当前会话不计入。淘汰后切回走 `build_runtime` 从存储重建。
 - `/delete` 软删整个子树（含后代）并按返回 id 关停全部对应 runtime、拒绝其审批、清理跟踪表；删除最后一个会话时新建替代会话。
 - `refresh_sessions` 将 `child_status`/`child_batches`/`expanded_sessions` 收敛到存储中的活会话集合，吸收迟到事件造成的再污染。
+- undo/redo 移动 head 后按 `file_snapshots` 回滚/前滚目标文件（undo 写 pre_image、redo 写 post_image；无快照的路径跳过不误伤）。快照上限：单文件 `checkpoint_max_file_bytes`（clamp 4KB..=8MB，超限记 marker 提示"未回滚"）、单会话 `checkpoint_max_session_bytes`（clamp 1MB..=256MB，超限丢最旧）；回滚 IO 失败不阻断会话恢复，只在 status 提示。
 
 ## 诊断
 
@@ -34,3 +35,5 @@
 
 - 迭代过滤器：`delete_`、`background_capacity`、`switching_session`、`handle_routed_event`。
 - 生命周期、容量或取消协议变更升级到完整测试和 Clippy。
+- 新增 `AgentEvent` 变体需一次接通：agent 内 forward 闭包（`Forwarded::Send`/`SendIgnore`/`Ignore` 语义按需选）→ `session.rs handle_event` 穷尽 match → `app.rs` 路由/`should_coalesce_stream_redraw` 是否合并；压缩与子 agent 的 `|_| Ignore` 闭包自动忽略但行为要确认。
+- app 层测试注意：`test_app` 构造的 `SessionRuntime` 含 tokio 组件，涉及审批/undo 的测试必须 `#[tokio::test]`；改 `resolve_approval` 等被测试直接调用的签名会连带旧调用点编译失败，改动时一并扫 `grep resolve_approval(`。

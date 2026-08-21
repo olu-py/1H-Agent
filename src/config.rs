@@ -329,6 +329,12 @@ pub struct RuntimeConfig {
     /// not counted). Overflow prefers the least-recently-parked idle runtime,
     /// then shuts down the oldest busy runtime if necessary.
     pub max_background_sessions: usize,
+    /// Per-file snapshot byte cap for undo/redo checkpointing. Files above
+    /// this are recorded as skipped markers instead of snapshotted.
+    pub checkpoint_max_file_bytes: usize,
+    /// Per-session total snapshot byte cap; exceeding it drops the oldest
+    /// snapshots for that session.
+    pub checkpoint_max_session_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -494,6 +500,8 @@ impl Default for RuntimeConfig {
             max_tool_output_bytes: 1024 * 1024,
             max_fetch_bytes: 10 * 1024 * 1024,
             max_background_sessions: 8,
+            checkpoint_max_file_bytes: 1024 * 1024,
+            checkpoint_max_session_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -555,6 +563,14 @@ impl Config {
         config.browser.keep_alive_seconds = config.browser.keep_alive_seconds.min(300);
         config.runtime.max_background_sessions =
             config.runtime.max_background_sessions.clamp(2, 64);
+        config.runtime.checkpoint_max_file_bytes = config
+            .runtime
+            .checkpoint_max_file_bytes
+            .clamp(4 * 1024, 8 * 1024 * 1024);
+        config.runtime.checkpoint_max_session_bytes = config
+            .runtime
+            .checkpoint_max_session_bytes
+            .clamp(1024 * 1024, 256 * 1024 * 1024);
         config.cluster.child_max_output_bytes = config
             .cluster
             .child_max_output_bytes
@@ -1271,6 +1287,11 @@ mod tests {
         assert_eq!(config.provider.retry_max_attempts, 3);
         assert_eq!(config.provider.retry_initial_backoff_ms, 500);
         assert_eq!(config.provider.retry_max_backoff_ms, 8000);
+        assert_eq!(config.runtime.checkpoint_max_file_bytes, 1024 * 1024);
+        assert_eq!(
+            config.runtime.checkpoint_max_session_bytes,
+            16 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -1284,6 +1305,29 @@ mod tests {
         fs::write(&path, "[runtime]\nmax_background_sessions = 1000\n").unwrap();
         let high = Config::load(Some(&path), temp.path()).unwrap();
         assert_eq!(high.runtime.max_background_sessions, 64);
+    }
+
+    #[test]
+    fn checkpoint_limits_are_normalized() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[runtime]\ncheckpoint_max_file_bytes = 1\ncheckpoint_max_session_bytes = 1\n",
+        )
+        .unwrap();
+        let low = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(low.runtime.checkpoint_max_file_bytes, 4 * 1024);
+        assert_eq!(low.runtime.checkpoint_max_session_bytes, 1024 * 1024);
+
+        fs::write(
+            &path,
+            "[runtime]\ncheckpoint_max_file_bytes = 999999999\ncheckpoint_max_session_bytes = 999999999\n",
+        )
+        .unwrap();
+        let high = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(high.runtime.checkpoint_max_file_bytes, 8 * 1024 * 1024);
+        assert_eq!(high.runtime.checkpoint_max_session_bytes, 256 * 1024 * 1024);
     }
 
     #[test]

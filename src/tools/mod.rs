@@ -26,9 +26,20 @@ pub struct ToolRegistry {
     allow_private_networks: bool,
     mode: Arc<RwLock<AgentMode>>,
     permissions: Arc<RwLock<BTreeMap<String, String>>>,
+    /// Session-scoped, in-process "always allow" rules. Never persisted; the
+    /// process exiting clears them. `prefix` is `Some` only for terminal_exec /
+    /// git so the user can allow a command family (e.g. `terminal_exec:cargo
+    /// test`) rather than every invocation.
+    session_allows: Arc<RwLock<Vec<SessionAllowRule>>>,
     browser: Arc<RwLock<Option<BrowserConfig>>>,
     mcp_servers: Arc<RwLock<Vec<McpServerConfig>>>,
     external_tools: Arc<RwLock<Vec<external::ExternalTool>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAllowRule {
+    pub tool: String,
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -51,6 +62,7 @@ impl ToolRegistry {
             allow_private_networks,
             mode: Arc::new(RwLock::new(AgentMode::Build)),
             permissions: Arc::new(RwLock::new(BTreeMap::new())),
+            session_allows: Arc::new(RwLock::new(Vec::new())),
             browser: Arc::new(RwLock::new(None)),
             mcp_servers: Arc::new(RwLock::new(Vec::new())),
             external_tools: Arc::new(RwLock::new(Vec::new())),
@@ -59,6 +71,13 @@ impl ToolRegistry {
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    pub fn checkpoint_limits(&self) -> (usize, usize) {
+        (
+            self.runtime.checkpoint_max_file_bytes,
+            self.runtime.checkpoint_max_session_bytes,
+        )
     }
 
     pub fn policy(&self, call: &ToolCall) -> PolicyDecision {
@@ -102,6 +121,13 @@ impl ToolRegistry {
             }
             (_, decision) => decision,
         };
+        // Session-scoped "always allow" (A key) lifts a RequireApproval decision
+        // to Allow. Config deny above always wins; read-only modes still block
+        // before reaching here.
+        if matches!(decision, PolicyDecision::RequireApproval(_)) && self.session_rule_matches(call)
+        {
+            return PolicyDecision::Allow;
+        }
         if !matches!(mode, AgentMode::Build | AgentMode::Cluster)
             && call.name == "git"
             && matches!(decision, PolicyDecision::RequireApproval(_))
@@ -112,6 +138,51 @@ impl ToolRegistry {
             ));
         }
         decision
+    }
+
+    /// Adds a session-scoped allow rule for `tool`. When `prefix` is set the
+    /// rule only matches calls whose normalized command starts with it
+    /// (terminal_exec / git families); otherwise it matches the tool name
+    /// exactly.
+    pub fn allow_for_session(&self, tool: &str, prefix: Option<&str>) {
+        let rule = SessionAllowRule {
+            tool: tool.to_owned(),
+            prefix: prefix.map(str::to_owned),
+        };
+        if let Ok(mut rules) = self.session_allows.write() {
+            rules.retain(|existing| existing.tool != rule.tool || existing.prefix != rule.prefix);
+            rules.push(rule);
+        }
+    }
+
+    fn session_rule_matches(&self, call: &ToolCall) -> bool {
+        let Some(rules) = self.session_allows.read().ok() else {
+            return false;
+        };
+        rules.iter().any(|rule| {
+            if rule.tool != call.name {
+                return false;
+            }
+            match &rule.prefix {
+                Some(prefix) => normalized_command_prefix(call)
+                    .is_some_and(|command| command.starts_with(prefix.as_str())),
+                None => true,
+            }
+        })
+    }
+
+    /// Returns the normalized command string for tools that support prefix
+    /// matching (terminal_exec: program + args, git: subcommand), `None` for
+    /// everything else.
+    pub fn command_prefix_for(call: &ToolCall) -> Option<String> {
+        let normalized = normalized_command_prefix(call)?;
+        Some(normalized)
+    }
+
+    /// Whether `call` matches a session-scoped always-allow rule. Used to audit
+    /// `session-allowed` decisions distinctly from ordinary approvals.
+    pub fn is_session_allowed(&self, call: &ToolCall) -> bool {
+        self.session_rule_matches(call)
     }
 
     pub fn set_mode(&self, mode: AgentMode) {
@@ -174,16 +245,30 @@ impl ToolRegistry {
             ),
             definition(
                 "file_read",
-                "Read a UTF-8 text file from the workspace",
+                "Read a UTF-8 text file from the workspace; set line_numbers=true to prefix each line with its 1-based number",
                 json!({
-                    "type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}},"required":["path"],"additionalProperties":false
+                    "type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},"line_numbers":{"type":"boolean"}},"required":["path"],"additionalProperties":false
                 }),
             ),
             definition(
                 "file_search",
-                "Search text files under a workspace directory",
+                "Search text files under a workspace directory; set regex=true for regular expression matching and ignore_case=true for case-insensitive matching",
                 json!({
-                    "type":"object","properties":{"path":{"type":"string"},"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":1000}},"required":["path","query"],"additionalProperties":false
+                    "type":"object","properties":{"path":{"type":"string"},"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":1000},"regex":{"type":"boolean"},"ignore_case":{"type":"boolean"}},"required":["path","query"],"additionalProperties":false
+                }),
+            ),
+            definition(
+                "file_glob",
+                "Find files by glob pattern under a workspace directory",
+                json!({
+                    "type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":1000}},"required":["path","pattern"],"additionalProperties":false
+                }),
+            ),
+            definition(
+                "repo_map",
+                "Extract a line-numbered symbol outline (fn/struct/impl/trait/enum/class/def) from text files under a workspace directory",
+                json!({
+                    "type":"object","properties":{"path":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":2000}},"required":["path"],"additionalProperties":false
                 }),
             ),
             definition("file_mkdir", "Create a workspace directory", path_schema()),
@@ -344,6 +429,16 @@ impl ToolRegistry {
                 &call.arguments,
                 self.runtime.max_tool_output_bytes,
             ),
+            "file_glob" => filesystem::glob(
+                &self.workspace,
+                &call.arguments,
+                self.runtime.max_tool_output_bytes,
+            ),
+            "repo_map" => filesystem::repo_map(
+                &self.workspace,
+                &call.arguments,
+                self.runtime.max_tool_output_bytes,
+            ),
             "file_mkdir" => filesystem::mkdir(&self.workspace, &call.arguments),
             "file_write" => filesystem::write(&self.workspace, &call.arguments),
             "file_edit" => filesystem::edit(&self.workspace, &call.arguments),
@@ -422,4 +517,131 @@ fn source_destination_schema() -> Value {
     json!({
         "type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"],"additionalProperties":false
     })
+}
+
+/// Builds the normalized command prefix used for session always-allow prefix
+/// matching: `terminal_exec` = program + args, `git` = subcommand,
+/// `terminal_shell` = command string. Other tools return `None` (exact
+/// tool-name matching only).
+fn normalized_command_prefix(call: &ToolCall) -> Option<String> {
+    match call.name.as_str() {
+        "terminal_shell" => call
+            .arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| !command.is_empty())
+            .map(str::to_owned),
+        "terminal_exec" => {
+            let program = call
+                .arguments
+                .get("program")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if program.is_empty() {
+                return None;
+            }
+            let mut parts = vec![program.to_owned()];
+            if let Some(args) = call.arguments.get("args").and_then(Value::as_array) {
+                parts.extend(
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .take(8)
+                        .map(str::to_owned),
+                );
+            }
+            Some(parts.join(" "))
+        }
+        "git" => call
+            .arguments
+            .get("args")
+            .and_then(Value::as_array)
+            .and_then(|args| args.first())
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RuntimeConfig;
+    use crate::security::Workspace;
+    use tempfile::tempdir;
+
+    fn registry() -> ToolRegistry {
+        let root = tempdir().unwrap();
+        ToolRegistry::new(
+            Workspace::new(root.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        )
+    }
+
+    fn call(name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn session_allow_matches_exact_tool_name() {
+        let registry = registry();
+        let edit = call("file_edit", json!({"path":"a.txt"}));
+        assert!(matches!(
+            registry.policy(&edit),
+            PolicyDecision::RequireApproval(_)
+        ));
+        registry.allow_for_session("file_edit", None);
+        assert_eq!(registry.policy(&edit), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn session_allow_terminal_exec_prefix_matches_family() {
+        let registry = registry();
+        registry.allow_for_session("terminal_exec", Some("cargo test"));
+        let matching = call(
+            "terminal_exec",
+            json!({"program":"cargo","args":["test","--lib"]}),
+        );
+        assert_eq!(registry.policy(&matching), PolicyDecision::Allow);
+        let other = call("terminal_exec", json!({"program":"cargo","args":["build"]}));
+        assert!(matches!(
+            registry.policy(&other),
+            PolicyDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn session_allow_git_subcommand_matches() {
+        let registry = registry();
+        registry.allow_for_session("git", Some("add"));
+        let add = call("git", json!({"args":["add","src/lib.rs"]}));
+        assert_eq!(registry.policy(&add), PolicyDecision::Allow);
+        let commit = call("git", json!({"args":["commit","-m","x"]}));
+        assert!(matches!(
+            registry.policy(&commit),
+            PolicyDecision::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn config_deny_overrides_session_allow() {
+        let registry = registry();
+        registry.set_permission_rules(BTreeMap::from([("file_edit".into(), "deny".into())]));
+        registry.allow_for_session("file_edit", None);
+        let edit = call("file_edit", json!({"path":"a.txt"}));
+        assert!(matches!(registry.policy(&edit), PolicyDecision::Deny(_)));
+    }
+
+    #[test]
+    fn read_only_mode_blocks_before_session_allow() {
+        let registry = registry();
+        registry.set_mode(crate::commands::AgentMode::Plan);
+        registry.allow_for_session("file_write", None);
+        let write = call("file_write", json!({"path":"a.txt","content":"x"}));
+        assert!(matches!(registry.policy(&write), PolicyDecision::Deny(_)));
+    }
 }

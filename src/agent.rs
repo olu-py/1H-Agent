@@ -79,6 +79,8 @@ fn child_tool_name_allowed(tool: &str, role: Option<&str>, allowed_tools: &[Stri
         "file_stat",
         "file_read",
         "file_search",
+        "file_glob",
+        "repo_map",
         "web_search",
         "web_fetch",
         "git_diff",
@@ -111,6 +113,23 @@ fn truncate_utf8_bounded(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}…[child output truncated]", &value[..end])
+}
+
+/// Returns the workspace-relative target path of a mutating file tool call, or
+/// `None` for tools that do not target a single file (file_mkdir) or non-file
+/// tools.
+fn snapshot_target_path(name: &str, arguments: &Value) -> Option<String> {
+    match name {
+        "file_write" | "file_edit" | "file_delete" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "file_copy" | "file_move" => arguments
+            .get("destination")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
 }
 
 /// Maps a model id prefix to its canonical provider preset. Used both to infer
@@ -1354,6 +1373,8 @@ impl AgentRunner {
                     continue;
                 }
                 let decision = self.tools.policy(&call);
+                let session_allowed = matches!(decision, PolicyDecision::Allow)
+                    && self.tools.is_session_allowed(&call);
                 let approved = match decision {
                     PolicyDecision::Allow => true,
                     PolicyDecision::Deny(reason) => {
@@ -1388,7 +1409,13 @@ impl AgentRunner {
                             .map_err(|_| "cancelled: approval channel closed".to_owned())?
                     }
                 };
-                let decision_name = if approved { "approved" } else { "rejected" };
+                let decision_name = if session_allowed {
+                    "session-allowed"
+                } else if approved {
+                    "approved"
+                } else {
+                    "rejected"
+                };
                 self.storage
                     .begin_tool(&self.session_id, &call, decision_name)
                     .map_err(|error| error.to_string())?;
@@ -1421,11 +1448,13 @@ impl AgentRunner {
                         spawn_tasks.push(call);
                     }
                 } else {
+                    let _ = self.snapshot_tool_pre(&call);
                     let result = self
                         .tools
                         .execute(&call)
                         .await
                         .unwrap_or_else(|error| error.to_string());
+                    let _ = self.snapshot_tool_post(&call);
                     self.complete_tool(&call, &result, ui_events, items, &mut executed_tool_calls)
                         .await?;
                 }
@@ -1512,6 +1541,62 @@ impl AgentRunner {
         Ok((todo_tool_response(&tasks)?, tasks))
     }
 
+    /// Captures the pre-execution image of the file a mutating tool is about to
+    /// write, so undo/redo can roll it back. Returns `true` when a snapshot was
+    /// recorded for the current head turn.
+    fn snapshot_tool_pre(&self, call: &ToolCall) -> Result<bool, String> {
+        let Some(path) = snapshot_target_path(&call.name, &call.arguments) else {
+            return Ok(false);
+        };
+        let Some(turn_id) = self
+            .storage
+            .head_turn_id(&self.session_id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let path_buf = self
+            .tools
+            .workspace()
+            .resolve_existing(&path)
+            .map_err(|error| error.to_string())?;
+        let (pre_image, existed) = match std::fs::read(&path_buf) {
+            Ok(bytes) => (Some(bytes), true),
+            Err(_) => (None, false),
+        };
+        let (max_file, max_session) = self.tools.checkpoint_limits();
+        self.storage
+            .snapshot_file(
+                &self.session_id,
+                &turn_id,
+                &call.id,
+                &path,
+                pre_image.as_deref(),
+                existed,
+                max_file,
+                max_session,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Backfills the post-execution image for a snapshotted tool call.
+    fn snapshot_tool_post(&self, call: &ToolCall) -> Result<(), String> {
+        let Some(path) = snapshot_target_path(&call.name, &call.arguments) else {
+            return Ok(());
+        };
+        let path_buf = self
+            .tools
+            .workspace()
+            .resolve_existing(&path)
+            .map_err(|error| error.to_string())?;
+        let post_image = std::fs::read(&path_buf).ok();
+        self.storage
+            .save_post_image(&call.id, post_image.as_deref())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Finishes an already-started tool call: persists the result, emits the
     /// `ToolFinished` event, and appends the tool output to the conversation.
     async fn complete_tool(
@@ -1554,7 +1639,12 @@ impl AgentRunner {
     ) -> Option<String> {
         match self.tools.policy(call) {
             PolicyDecision::Allow => {
-                let _ = self.storage.begin_tool(context.child_id, call, "allowed");
+                let decision = if self.tools.is_session_allowed(call) {
+                    "session-allowed"
+                } else {
+                    "allowed"
+                };
+                let _ = self.storage.begin_tool(context.child_id, call, decision);
                 emit_child_progress(
                     context.ui_events,
                     context.child_id,
@@ -2409,6 +2499,144 @@ mod tests {
             "expected AgentEvent::ProviderRetry on the UI channel"
         );
         assert!(completed, "retry should recover and complete");
+    }
+
+    #[tokio::test]
+    async fn main_agent_snapshots_file_write_pre_and_post_images() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "before").unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "edit file")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![
+            vec![
+                ModelEvent::ToolCallComplete(ToolCall {
+                    id: "c1".into(),
+                    name: "file_write".into(),
+                    arguments: serde_json::json!({"path":"a.txt","content":"after"}),
+                }),
+                ModelEvent::Done,
+            ],
+            vec![ModelEvent::TextDelta("done".into()), ModelEvent::Done],
+        ])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage.clone(),
+            session_id.clone(),
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "edit file".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::Approval { reply, .. } => {
+                    let _ = reply.send(true);
+                }
+                AgentEvent::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+            "after"
+        );
+
+        let turn = storage.head_turn_id(&session_id).unwrap().unwrap();
+        let snapshots = storage.restore_turn_files(&session_id, &turn).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].path, "a.txt");
+        assert_eq!(
+            snapshots[0].pre_image.as_deref(),
+            Some(b"before".as_slice())
+        );
+        assert_eq!(
+            snapshots[0].post_image.as_deref(),
+            Some(b"after".as_slice())
+        );
+        assert!(snapshots[0].existed);
+    }
+
+    #[tokio::test]
+    async fn session_allowed_tool_is_audited_as_session_allowed() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "edit")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        // Pre-grant a session allow for file_edit before the agent runs.
+        tools.allow_for_session("file_edit", None);
+        std::fs::write(temp.path().join("a.txt"), "before").unwrap();
+        let provider = OpenAiClient::scripted(vec![
+            vec![
+                ModelEvent::ToolCallComplete(ToolCall {
+                    id: "c1".into(),
+                    name: "file_edit".into(),
+                    arguments: serde_json::json!({"path":"a.txt","old_string":"before","new_string":"after"}),
+                }),
+                ModelEvent::Done,
+            ],
+            vec![ModelEvent::TextDelta("done".into()), ModelEvent::Done],
+        ])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage.clone(),
+            session_id.clone(),
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "edit".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+        while let Some(event) = receiver.recv().await {
+            if matches!(event, AgentEvent::Completed { .. }) {
+                break;
+            }
+        }
+        task.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+            "after"
+        );
+        // No Approval event should have been raised; the call was audited as
+        // session-allowed rather than approved.
+        let decision = storage.tool_decision("c1").unwrap().unwrap();
+        assert_eq!(decision, "session-allowed");
     }
 
     #[tokio::test]

@@ -25,6 +25,17 @@ pub struct SessionSummary {
     pub parent_id: Option<String>,
 }
 
+/// A single file snapshot captured around a mutating file tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSnapshot {
+    pub path: String,
+    pub pre_image: Option<Vec<u8>>,
+    pub post_image: Option<Vec<u8>>,
+    /// Whether the file existed before the tool ran. `false` also marks a
+    /// snapshot that exceeded the per-file limit and was skipped.
+    pub existed: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -122,12 +133,25 @@ impl Storage {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS file_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                turn_id TEXT,
+                tool_call_id TEXT,
+                path TEXT NOT NULL,
+                pre_image BLOB,
+                post_image BLOB,
+                existed INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (1, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (2, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (3, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (4, CURRENT_TIMESTAMP);
             ",
         )?;
         // These checks keep databases created by the first release compatible
@@ -255,6 +279,18 @@ impl Storage {
                 [session_id],
                 |row| row.get(0),
             )
+            .map_err(StorageError::from)
+    }
+
+    /// Returns the current head turn id for a session, if any.
+    pub fn head_turn_id(&self, session_id: &str) -> Result<Option<String>, StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(StorageError::from)
     }
 
@@ -750,6 +786,161 @@ impl Storage {
         Ok(true)
     }
 
+    /// The maximum bytes of a single file snapshot. Files larger than this are
+    /// recorded as a marker row (pre/post images NULL, existed=0) so undo/redo
+    /// can tell the user the file was not snapshot rather than silently
+    /// skipping it.
+    pub fn snapshot_file_limit(&self, max_file_bytes: usize) -> usize {
+        max_file_bytes
+    }
+
+    /// Records a pre-execution snapshot for `path` under `turn_id`. `pre_image`
+    /// is `None` when the file did not exist before the tool ran (`existed=0`).
+    /// Snapshots at or above the per-file limit are stored as markers so the
+    /// undo path can report "exceeds snapshot limit". Per-session total bytes
+    /// are enforced here (oldest rows are dropped first) in the same write
+    /// transaction as the insert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_file(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+        path: &str,
+        pre_image: Option<&[u8]>,
+        existed: bool,
+        max_file_bytes: usize,
+        max_session_bytes: usize,
+    ) -> Result<(), StorageError> {
+        let connection = self.lock()?;
+        let tx = connection.unchecked_transaction()?;
+        if let Some(pre_image) = pre_image {
+            if pre_image.len() > max_file_bytes {
+                // Marker row: too large to snapshot, existed=0 signals "skip".
+                tx.execute(
+                    "INSERT INTO file_snapshots(session_id, turn_id, tool_call_id, path, pre_image, post_image, existed, created_at) VALUES (?1, ?2, ?3, ?4, NULL, NULL, 0, ?5)",
+                    params![session_id, turn_id, tool_call_id, path, Utc::now().to_rfc3339()],
+                )?;
+                tx.commit()?;
+                return Ok(());
+            }
+        }
+        tx.execute(
+            "INSERT INTO file_snapshots(session_id, turn_id, tool_call_id, path, pre_image, post_image, existed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+            params![
+                session_id,
+                turn_id,
+                tool_call_id,
+                path,
+                pre_image.map(<[u8]>::to_vec),
+                existed as i64,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        // Enforce the per-session total byte cap: drop the oldest rows until
+        // the sum of pre_image bytes fits. Rows are small; the cap is on
+        // pre_image bytes which dominate, so deleting one row at a time keeps
+        // the accounting exact.
+        loop {
+            let total: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(LENGTH(pre_image)), 0) FROM file_snapshots WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            if total as usize <= max_session_bytes {
+                break;
+            }
+            let removed = tx.execute(
+                "DELETE FROM file_snapshots WHERE session_id = ?1 AND id = (SELECT MIN(id) FROM file_snapshots WHERE session_id = ?1)",
+                [session_id],
+            )?;
+            if removed == 0 {
+                break;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Backfills the post-execution image for a snapshot recorded by
+    /// `snapshot_file`. `post_image` is `None` when the file no longer exists
+    /// after the tool ran (deleted).
+    pub fn save_post_image(
+        &self,
+        tool_call_id: &str,
+        post_image: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
+        self.lock()?.execute(
+            "UPDATE file_snapshots SET post_image = ?2 WHERE tool_call_id = ?1",
+            params![tool_call_id, post_image.map(<[u8]>::to_vec)],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the snapshots recorded for a single turn, keyed by path. Used by
+    /// undo/redo to roll files back or forward.
+    pub fn restore_turn_files(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<FileSnapshot>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT path, pre_image, post_image, existed FROM file_snapshots WHERE session_id = ?1 AND turn_id = ?2 ORDER BY id ASC",
+        )?;
+        let rows = statement
+            .query_map(params![session_id, turn_id], |row| {
+                Ok(FileSnapshot {
+                    path: row.get(0)?,
+                    pre_image: row.get(1)?,
+                    post_image: row.get(2)?,
+                    existed: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Returns the chain of turn ids strictly after `from_turn` and up to and
+    /// including `to_turn` following parent links. Order is from oldest to
+    /// newest. Used by undo/redo to enumerate the snapshot turns being
+    /// detached/reattached.
+    pub fn turns_between(
+        &self,
+        session_id: &str,
+        from_turn: &str,
+        to_turn: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let connection = self.lock()?;
+        let mut turns = Vec::new();
+        let mut cursor = Some(to_turn.to_owned());
+        while let Some(current) = cursor {
+            let (parent,): (Option<String>,) = connection.query_row(
+                "SELECT parent_id FROM turns WHERE session_id = ?1 AND id = ?2",
+                params![session_id, current],
+                |row| Ok((row.get(0)?,)),
+            )?;
+            if parent.as_deref() == Some(from_turn) {
+                turns.push(current);
+                break;
+            }
+            turns.push(current);
+            cursor = parent;
+        }
+        turns.reverse();
+        Ok(turns)
+    }
+
+    /// Deletes snapshot rows for sessions that were soft-deleted. Called lazily
+    /// after `delete_session`; keeps the global snapshot footprint bounded.
+    pub fn purge_soft_deleted_snapshots(&self) -> Result<usize, StorageError> {
+        self.lock()?.execute(
+            "DELETE FROM file_snapshots WHERE session_id IN (SELECT id FROM sessions WHERE deleted_at IS NOT NULL)",
+            [],
+        )?;
+        Ok(0)
+    }
+
     pub fn compact_session(&self, session_id: &str, keep: usize) -> Result<usize, StorageError> {
         let connection = self.lock()?;
         let ids = {
@@ -868,6 +1059,18 @@ impl Storage {
             params![call_id, result, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// Returns the recorded policy decision for a tool call, if any.
+    pub fn tool_decision(&self, call_id: &str) -> Result<Option<String>, StorageError> {
+        self.lock()?
+            .query_row(
+                "SELECT decision FROM tool_calls WHERE id = ?1",
+                [call_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn save_response_id(
@@ -1341,5 +1544,145 @@ mod tests {
             .replace_tasks(&session, &[TodoTask::new(long, TodoStatus::Pending)])
             .unwrap_err();
         assert!(error.to_string().contains("1 to 240 characters"));
+    }
+
+    #[test]
+    fn file_snapshots_round_trip_and_restore_by_turn() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let turn = storage.head_turn_id(&session).unwrap().unwrap();
+        storage
+            .snapshot_file(
+                &session,
+                &turn,
+                "call_1",
+                "src/a.txt",
+                Some(b"before"),
+                true,
+                1024 * 1024,
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+        storage.save_post_image("call_1", Some(b"after")).unwrap();
+
+        let snapshots = storage.restore_turn_files(&session, &turn).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].path, "src/a.txt");
+        assert_eq!(
+            snapshots[0].pre_image.as_deref(),
+            Some(b"before".as_slice())
+        );
+        assert_eq!(
+            snapshots[0].post_image.as_deref(),
+            Some(b"after".as_slice())
+        );
+        assert!(snapshots[0].existed);
+    }
+
+    #[test]
+    fn file_snapshot_over_limit_is_stored_as_marker() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let turn = storage.head_turn_id(&session).unwrap().unwrap();
+        storage
+            .snapshot_file(
+                &session,
+                &turn,
+                "call_big",
+                "big.bin",
+                Some(&vec![0u8; 1000]),
+                true,
+                100, // tiny per-file cap
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+        let snapshots = storage.restore_turn_files(&session, &turn).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert!(!snapshots[0].existed);
+        assert!(snapshots[0].pre_image.is_none());
+    }
+
+    #[test]
+    fn file_snapshot_session_total_drops_oldest() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let turn = storage.head_turn_id(&session).unwrap().unwrap();
+        storage
+            .snapshot_file(
+                &session,
+                &turn,
+                "call_1",
+                "a.txt",
+                Some(&[0u8; 60]),
+                true,
+                1024 * 1024,
+                100, // tiny session cap: only one 60-byte row fits
+            )
+            .unwrap();
+        storage
+            .snapshot_file(
+                &session,
+                &turn,
+                "call_2",
+                "b.txt",
+                Some(&[0u8; 60]),
+                true,
+                1024 * 1024,
+                100,
+            )
+            .unwrap();
+        let snapshots = storage.restore_turn_files(&session, &turn).unwrap();
+        // First snapshot dropped by the session cap, second remains.
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].path, "b.txt");
+    }
+
+    #[test]
+    fn turns_between_returns_ordered_chain() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let root_turn = storage.head_turn_id(&session).unwrap().unwrap();
+        storage.append_message(&session, Role::User, "one").unwrap();
+        let turn1 = storage.head_turn_id(&session).unwrap().unwrap();
+        storage.append_message(&session, Role::User, "two").unwrap();
+        let turn2 = storage.head_turn_id(&session).unwrap().unwrap();
+        let chain = storage.turns_between(&session, &root_turn, &turn2).unwrap();
+        assert_eq!(chain, vec![turn1, turn2]);
+    }
+
+    #[test]
+    fn purge_soft_deleted_snapshots_cleans_sessions() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        let turn = storage.head_turn_id(&session).unwrap().unwrap();
+        storage
+            .snapshot_file(
+                &session,
+                &turn,
+                "call_1",
+                "a.txt",
+                Some(b"x"),
+                true,
+                1024 * 1024,
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+        storage.delete_session(&session).unwrap();
+        storage.purge_soft_deleted_snapshots().unwrap();
+        let count: i64 = storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM file_snapshots WHERE session_id = ?1",
+                [&session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

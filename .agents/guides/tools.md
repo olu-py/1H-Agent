@@ -17,7 +17,8 @@
   `definitions()` schema（`deny_unknown_fields` + `additionalProperties:false`）→ `execute()` 分发 → `policy()` 只读 Deny 名单 → `classify_tool`（mutating 归 RequireApproval）→ agent 的 `WRITE_TOOLS`/角色 infer → prompt 三处清单 → ui 的 `tool_display_name`/`tool_compact_summary`/`tool_risk`/`argument_label` → ui 翻译测试清单。
 - `Workspace::resolve_*` 是唯一合法路径解析点：拒绝 `..`、绝对路径逃逸与符号链接逃逸；新目标验证 canonical parent；不要在工具实现里自行拼路径。
 - 参数对象一律 `#[serde(deny_unknown_fields)]`，未知键直接报 `InvalidArguments`，不给模型静默传错的空间。
-- 危险操作保持"默认 Deny、mutating 需审批、Plan/Explore 只读拦截、`permissions.tools` 可覆盖"四层语义；`classify_tool` 返回 `Deny(unknown tool)`，未知工具不落入 Allow。
+- 危险操作保持"默认 Deny、mutating 需审批、Plan/Explore 只读拦截、`permissions.tools` 可覆盖"四层语义；`classify_tool` 返回 `Deny(unknown tool)`，未知工具不落入 Allow。审批可"本会话放行"（`A` 键，进程内 `session_allows` 不落盘）：config deny 仍压过会话放行；`terminal_exec`/`git`/`terminal_shell` 按命令前缀匹配，其余按工具名精确匹配，审计记 `session-allowed`。
+- 只读搜索工具（`file_search`/`file_glob`/`repo_map`）属 Allow 且进子 Agent READ_TOOLS；`file_search` 支持 `regex`/`ignore_case`（正则编译失败报 InvalidArguments），`file_glob` 用 globset 匹配文件名，`repo_map` 纯行首启发式提取符号（`fn`/`struct`/`impl`/`trait`/`enum`/`mod`/`class`/`def`/`function`/`func`）并跳过二进制，均沿用 1MB/UTF-8/max_results/output_limit 边界。
 - 外部进程工具必须带超时、输出截断、取消与进程树清理；`web` 每次重定向校验 HTTP/HTTPS 与公网地址。
 
 ## 诊断
@@ -32,6 +33,6 @@
 
 ## 验证
 
-- 迭代过滤器按改动选择：`tools::filesystem::tests`、`security::tests`、`tools::process::tests`；UI 翻译改动加 `ui::tests`。
-- 新增工具至少覆盖：成功路径 + 读回验证、失败/拒绝路径、路径逃逸拒绝；mutating 工具加 `security::tests` 审批断言。
+- 迭代过滤器按改动选择：`tools::filesystem::tests`、`tools::tests`（会话放行 policy）、`security::tests`、`tools::process::tests`；UI 翻译改动加 `ui::tests`。
+- 新增工具至少覆盖：成功路径 + 读回验证、失败/拒绝路径、路径逃逸拒绝；mutating 工具加 `security::tests` 审批断言；只读搜索工具加 `tests/integration.rs` 端到端。
 - 完成阶段按根文档运行一次 lib 测试；工具/存储/安全/进程跨模块升级到完整测试和 Clippy。

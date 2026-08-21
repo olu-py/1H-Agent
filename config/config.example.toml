@@ -44,6 +44,11 @@ max_fetch_bytes = 10485760
 # Overflow evicts the least-recently-used idle runtime first, then stops the
 # oldest busy runtime if needed. Evicted sessions rebuild from storage.
 max_background_sessions = 8
+# Undo/redo file checkpointing. Files larger than checkpoint_max_file_bytes are
+# skipped (reported, not restored). checkpoints per session exceeding
+# checkpoint_max_session_bytes drop the oldest snapshots.
+checkpoint_max_file_bytes = 1048576
+checkpoint_max_session_bytes = 16777216
 
 [compaction]
 enabled = true

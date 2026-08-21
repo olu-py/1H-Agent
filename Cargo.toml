@@ -21,12 +21,14 @@ clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6"
 futures-util = "0.3"
+globset = "0.4"
 html2text = "0.15"
 ignore = "0.4"
 keyring = { version = "3", default-features = false }
 libc = "0.2"
 pulldown-cmark = "0.13"
 ratatui = "0.29"
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

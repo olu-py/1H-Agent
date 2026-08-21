@@ -32,7 +32,7 @@ excluded: Web UI、内置浏览器、远程 MCP、动态插件、图片和语音
 | 子 Agent、审批、取消、集群停滞 | `src/agent.rs`、`src/app.rs` | [Cluster](.agents/guides/cluster.md) |
 | 首页、渲染、长文本、滚动、鼠标交互 | `src/home.rs`、`src/app.rs`、`src/ui.rs`、`src/output.rs` | [TUI](.agents/guides/tui.md) |
 | 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | [Tools](.agents/guides/tools.md) |
-| 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | 涉及 Provider 状态时再读 Provider |
+| 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | [Storage](.agents/guides/storage.md)；涉及 Provider 状态时再读 Provider |
 | 配置上限、容量归一化、新增配置键 | `src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | 无；同步默认值与 `defaults_are_bounded` 类测试 |
 | CI、版本、安装包、tag | `.github/workflows/`、`Cargo.toml` | [Release](.agents/guides/release.md) |
 
@@ -48,9 +48,9 @@ terminal event -> App -> SessionRuntime -> AgentRunner -> OpenAiClient / ToolReg
 
 - `App` 管全局 UI、当前/后台 runtime 和路由；`SessionRuntime` 独占单会话状态，切换不停止后台任务；后台容量与删除关停契约见 Runtime 专题。
 - Provider 私有协议先规范化为 `ModelEvent`；UI、存储和工具层不解析私有 JSON。
-- 恢复沿 `head_turn_id` 父链；fork 不复制 Provider 服务端状态；undo/redo 只移动 head。
+- 恢复沿 `head_turn_id` 父链；fork 不复制 Provider 服务端状态；undo/redo 移动 head 并按 `file_snapshots` 回滚/前滚文件（无快照的路径跳过）。
 - workspace 必须 canonicalize；拒绝绝对路径、`..`、符号链接逃逸；新目标验证 canonical parent。
-- Web 每次重定向都校验 HTTP/HTTPS 和公网地址；危险操作始终经过 mode、安全分类与审批。
+- Web 每次重定向都校验 HTTP/HTTPS 和公网地址；危险操作始终经过 mode、安全分类与审批；审批可"本会话放行"（进程内不落盘，config deny 仍压过它）。
 - API Key 只来自环境变量或系统钥匙串，不进入 TOML、SQLite、日志、导出或模型上下文。
 - 外部进程必须支持超时、输出截断、取消和进程树清理；`Esc` 产生可观察终态。
 - 新增容量或并发前定义硬上限、截断、取消与释放；未知模型使用显式窗口或 Provider 感知注册表。

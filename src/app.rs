@@ -588,11 +588,20 @@ async fn handle_terminal_event(app: &mut App, event: Event) -> Result<EventOutco
                 | KeyCode::Char('Y')
                 | KeyCode::Char('n')
                 | KeyCode::Char('N')
+                | KeyCode::Char('a')
+                | KeyCode::Char('A')
                 | KeyCode::Esc
         );
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => resolve_approval(app, true),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => resolve_approval(app, false),
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                resolve_approval(app, ApprovalChoice::Approve)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                resolve_approval(app, ApprovalChoice::Reject)
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                resolve_approval(app, ApprovalChoice::AlwaysSession)
+            }
             _ => {}
         }
         return Ok(EventOutcome {
@@ -2104,6 +2113,7 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
                 children.retain(|child_id| !deleted_ids.contains(child_id));
                 !children.is_empty()
             });
+            let _ = app.storage.purge_soft_deleted_snapshots();
             refresh_sessions(app)?;
             app.current.status = "会话已删除".into();
         }
@@ -2114,21 +2124,39 @@ fn execute_command(app: &mut App, command: Command) -> Result<()> {
             app.current.status = "会话已创建分支".into();
         }
         Command::Undo => {
+            let detached = app.storage.head_turn_id(&app.current.session_id)?;
             if app.storage.undo(&app.current.session_id)? {
                 app.storage.clear_response_id(&app.current.session_id)?;
+                let rollback_message = if let Some(turn_id) = detached {
+                    restore_snapshots(app, &turn_id, SnapshotDirection::Backward)
+                } else {
+                    None
+                };
                 reload_current_session(app)?;
                 refresh_sessions(app)?;
-                app.current.status = "已撤销上一轮".into();
+                app.current.status = match rollback_message {
+                    Some(message) => format!("已撤销上一轮；{message}"),
+                    None => "已撤销上一轮".into(),
+                };
             } else {
                 app.current.status = "没有可撤销的内容".into();
             }
         }
         Command::Redo => {
             if app.storage.redo(&app.current.session_id)? {
+                let advanced = app.storage.head_turn_id(&app.current.session_id)?;
                 app.storage.clear_response_id(&app.current.session_id)?;
+                let rollback_message = if let Some(turn_id) = advanced {
+                    restore_snapshots(app, &turn_id, SnapshotDirection::Forward)
+                } else {
+                    None
+                };
                 reload_current_session(app)?;
                 refresh_sessions(app)?;
-                app.current.status = "已重做上一轮".into();
+                app.current.status = match rollback_message {
+                    Some(message) => format!("已重做上一轮；{message}"),
+                    None => "已重做上一轮".into(),
+                };
             } else {
                 app.current.status = "没有可重做的内容".into();
             }
@@ -2687,9 +2715,38 @@ pub(crate) fn braille_spinner_supported() -> bool {
         })
 }
 
-fn resolve_approval(app: &mut App, approved: bool) {
+/// How a pending approval prompt was answered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    Approve,
+    Reject,
+    /// Grant a session-scoped, in-process always-allow for this call's tool
+    /// (and, for terminal_exec/git, its command prefix).
+    AlwaysSession,
+}
+
+fn resolve_approval(app: &mut App, choice: ApprovalChoice) {
     if let Some((owner, approval)) = app.take_pending_approval_global() {
         app.force_full_redraw = true;
+        let approved = !matches!(choice, ApprovalChoice::Reject);
+        if matches!(choice, ApprovalChoice::AlwaysSession) {
+            let (tool, prefix, label) = match &approval.action {
+                ApprovalAction::Agent(_) => session_allow_for_call(&approval.call),
+                ApprovalAction::Shell(command) => (
+                    "terminal_shell".to_owned(),
+                    Some(command.clone()),
+                    command.clone(),
+                ),
+            };
+            app.registry.allow_for_session(&tool, prefix.as_deref());
+            if let Some(runtime) = app.runtime_mut(&owner) {
+                runtime.push_entry(DisplayEntry {
+                    kind: DisplayKind::System,
+                    content: DisplayContent::Markdown(format!("本会话放行：{label}")),
+                });
+                runtime.status = format!("本会话已放行 {label}");
+            }
+        }
         match approval.action {
             ApprovalAction::Agent(reply) => {
                 let _ = reply.send(approved);
@@ -2737,6 +2794,19 @@ fn resolve_approval(app: &mut App, approved: bool) {
                 }
             }
         }
+    }
+}
+
+/// Computes the session always-allow key (tool + optional command prefix) for
+/// an agent approval prompt, plus a human-readable label for the audit entry.
+fn session_allow_for_call(call: &ToolCall) -> (String, Option<String>, String) {
+    let prefix = ToolRegistry::command_prefix_for(call);
+    match prefix {
+        Some(command) => {
+            let label = format!("{} {}", call.name, command);
+            (call.name.clone(), Some(command), label)
+        }
+        None => (call.name.clone(), None, call.name.clone()),
     }
 }
 
@@ -3020,6 +3090,69 @@ fn reload_current_session(app: &mut App) -> Result<()> {
     app.todo_window_rect = None;
     app.current.invalidate_output_layout();
     Ok(())
+}
+
+/// Direction for `restore_snapshots`: `Backward` (undo) writes each file's
+/// pre-image (deleting files that did not exist), `Forward` (redo) writes the
+/// post-image.
+#[derive(Clone, Copy)]
+enum SnapshotDirection {
+    Backward,
+    Forward,
+}
+
+/// Rolls the file snapshots recorded on `turn_id` back to disk for undo or
+/// forward for redo. Returns a human-readable summary of any files that could
+/// not be restored, or `None` when every snapshot applied cleanly.
+fn restore_snapshots(app: &mut App, turn_id: &str, direction: SnapshotDirection) -> Option<String> {
+    let snapshots = app
+        .storage
+        .restore_turn_files(&app.current.session_id, turn_id)
+        .ok()?;
+    let mut problems = Vec::new();
+    let mut ordered = snapshots;
+    match direction {
+        SnapshotDirection::Backward => ordered.reverse(),
+        SnapshotDirection::Forward => {}
+    }
+    for snapshot in ordered {
+        let relative = PathBuf::from(&snapshot.path);
+        let resolved = app.workspace.join(&relative);
+        let (image, existed) = match direction {
+            SnapshotDirection::Backward => (
+                snapshot.pre_image.as_ref(),
+                snapshot.existed && snapshot.pre_image.is_some(),
+            ),
+            SnapshotDirection::Forward => {
+                (snapshot.post_image.as_ref(), snapshot.post_image.is_some())
+            }
+        };
+        let Some(image) = image else {
+            if !snapshot.existed {
+                // Marker: file exceeded the snapshot limit and was skipped.
+                problems.push(format!("{} 超出快照上限，未回滚", snapshot.path));
+            }
+            continue;
+        };
+        let write_result = if existed {
+            if let Some(parent) = resolved.parent() {
+                std::fs::create_dir_all(parent).and_then(|_| std::fs::write(&resolved, image))
+            } else {
+                std::fs::write(&resolved, image)
+            }
+        } else {
+            let _ = std::fs::remove_file(&resolved);
+            Ok(())
+        };
+        if let Err(error) = write_result {
+            problems.push(format!("{}: {error}", snapshot.path));
+        }
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("；"))
+    }
 }
 
 fn activate_session(app: &mut App, session_id: String) -> Result<()> {
@@ -3393,6 +3526,59 @@ mod tests {
         assert_eq!(app.current.status, "已重做上一轮");
         assert_eq!(app.current.conversation.len(), 2);
         assert_eq!(app.current.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn undo_rolls_back_snapshotted_file_and_redo_restores_it() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let session_id = app.current.session_id.clone();
+        // New head turn that undo will detach.
+        app.storage
+            .append_message(&session_id, Role::User, "write")
+            .unwrap();
+        let turn = app.storage.head_turn_id(&session_id).unwrap().unwrap();
+
+        let file = temp.path().join("a.txt");
+        std::fs::write(&file, b"after").unwrap();
+        app.storage
+            .snapshot_file(
+                &session_id,
+                &turn,
+                "call_1",
+                "a.txt",
+                Some(b"before"),
+                true,
+                1024 * 1024,
+                16 * 1024 * 1024,
+            )
+            .unwrap();
+        app.storage
+            .save_post_image("call_1", Some(b"after"))
+            .unwrap();
+
+        execute_command(&mut app, Command::Undo).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"before");
+
+        execute_command(&mut app, Command::Redo).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"after");
+    }
+
+    #[tokio::test]
+    async fn undo_without_snapshot_keeps_file_untouched() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let session_id = app.current.session_id.clone();
+        app.storage
+            .append_message(&session_id, Role::User, "write")
+            .unwrap();
+        let file = temp.path().join("a.txt");
+        std::fs::write(&file, b"content").unwrap();
+
+        execute_command(&mut app, Command::Undo).unwrap();
+        // No snapshot was recorded; the file must be left exactly as it was.
+        assert_eq!(std::fs::read(&file).unwrap(), b"content");
+        assert_eq!(app.current.status, "已撤销上一轮");
     }
 
     #[test]
@@ -3820,7 +4006,7 @@ mod tests {
         );
         let screen = render_screen(&mut app, 80, 24);
         assert!(screen.iter().any(|line| line.contains("background-child")));
-        resolve_approval(&mut app, true);
+        resolve_approval(&mut app, ApprovalChoice::Approve);
         assert!(answer.await.unwrap());
         assert!(!app.has_pending_approval());
         assert_eq!(
@@ -4344,7 +4530,7 @@ mod tests {
 
     #[test]
     fn approval_closure_paths_request_one_full_redraw() {
-        for approved in [true, false] {
+        for choice in [ApprovalChoice::Approve, ApprovalChoice::Reject] {
             let temp = TempDir::new().unwrap();
             let mut app = test_app(&temp);
             let (reply, _receiver) = oneshot::channel();
@@ -4360,7 +4546,7 @@ mod tests {
                 action: ApprovalAction::Agent(reply),
                 created_at: Instant::now(),
             });
-            resolve_approval(&mut app, approved);
+            resolve_approval(&mut app, choice);
             assert!(app.current.pending_approval.is_none());
             assert!(app.force_full_redraw);
         }
@@ -4368,7 +4554,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
         request_shell_approval(&mut app, "echo ok".into()).unwrap();
-        resolve_approval(&mut app, false);
+        resolve_approval(&mut app, ApprovalChoice::Reject);
         assert!(app.force_full_redraw);
 
         let temp = TempDir::new().unwrap();
@@ -4408,6 +4594,51 @@ mod tests {
     }
 
     #[test]
+    fn always_session_approval_grants_and_records_allowance() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let (reply, mut answer) = oneshot::channel();
+        app.current.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: "approval".into(),
+                name: "terminal_exec".into(),
+                arguments: serde_json::json!({"program":"cargo","args":["test","--lib"]}),
+            },
+            reason: "risk text".into(),
+            source_session_id: None,
+            source_title: None,
+            action: ApprovalAction::Agent(reply),
+            created_at: Instant::now(),
+        });
+
+        resolve_approval(&mut app, ApprovalChoice::AlwaysSession);
+
+        assert!(answer.try_recv().unwrap());
+        assert!(!app.has_pending_approval());
+        assert!(app.registry.is_session_allowed(&ToolCall {
+            id: "next".into(),
+            name: "terminal_exec".into(),
+            arguments: serde_json::json!({"program":"cargo","args":["test","--lib","--foo"]}),
+        }));
+        assert!(app.current.entries.iter().any(|entry| {
+            matches!(&entry.content, DisplayContent::Markdown(text) if text.contains("本会话放行"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn always_session_approval_on_shell_command_allows_terminal_shell() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        request_shell_approval(&mut app, "cargo fmt".into()).unwrap();
+        resolve_approval(&mut app, ApprovalChoice::AlwaysSession);
+        assert!(app.registry.is_session_allowed(&ToolCall {
+            id: "next".into(),
+            name: "terminal_shell".into(),
+            arguments: serde_json::json!({"command":"cargo fmt"}),
+        }));
+    }
+
+    #[test]
     fn approval_overlay_clear_restores_underlying_frame() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
@@ -4429,7 +4660,7 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
-        resolve_approval(&mut app, false);
+        resolve_approval(&mut app, ApprovalChoice::Reject);
         assert!(app.force_full_redraw);
         terminal.clear().unwrap();
         app.force_full_redraw = false;
