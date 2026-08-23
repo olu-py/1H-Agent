@@ -20,6 +20,7 @@ pub struct Config {
     /// intentionally removed every saved connection in the new UI.
     pub provider_profiles_initialized: bool,
     pub ui: UiConfig,
+    pub server: ServerConfig,
     pub runtime: RuntimeConfig,
     pub compaction: CompactionConfig,
     pub security: SecurityConfig,
@@ -300,6 +301,40 @@ impl Default for UiConfig {
     }
 }
 
+/// HTTP/SSE service binding. The server deliberately defaults to a loopback
+/// address so it is never exposed to the network without explicit opt-in; a
+/// non-loopback `bind` additionally requires token auth (see
+/// `server::auth`). `port` is clamped to the dynamic/registered range so a
+/// hostile or accidental config cannot redirect the UI onto a privileged port.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Bind address. Defaults to loopback.
+    pub bind: String,
+    /// TCP port. Clamped to `1024..=65535` at load.
+    pub port: u32,
+    /// Maximum number of events retained in the SSE replay ring (clamped
+    /// `16..=4096` at load).
+    pub event_buffer: usize,
+    /// Maximum total bytes retained in the SSE replay ring (clamped
+    /// `1 MiB..=16 MiB` at load).
+    pub event_max_bytes: usize,
+    /// How long a pending approval waits before it is rejected automatically.
+    pub approval_timeout_seconds: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1".into(),
+            port: 7788,
+            event_buffer: 512,
+            event_max_bytes: 4 * 1024 * 1024,
+            approval_timeout_seconds: 300,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderPreset {
@@ -458,6 +493,7 @@ impl Default for Config {
             providers: Vec::new(),
             provider_profiles_initialized: false,
             ui: UiConfig::default(),
+            server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
             compaction: CompactionConfig::default(),
             security: SecurityConfig::default(),
@@ -561,6 +597,14 @@ impl Config {
         }
         config.browser.max_output_bytes = config.browser.max_output_bytes.min(8 * 1024 * 1024);
         config.browser.keep_alive_seconds = config.browser.keep_alive_seconds.min(300);
+        config.server.port = config.server.port.clamp(1024, 65535);
+        config.server.event_buffer = config.server.event_buffer.clamp(16, 4096);
+        config.server.event_max_bytes = config
+            .server
+            .event_max_bytes
+            .clamp(1024 * 1024, 16 * 1024 * 1024);
+        config.server.approval_timeout_seconds =
+            config.server.approval_timeout_seconds.clamp(10, 3600);
         config.runtime.max_background_sessions =
             config.runtime.max_background_sessions.clamp(2, 64);
         config.runtime.checkpoint_max_file_bytes = config
@@ -1347,6 +1391,40 @@ mod tests {
         fs::write(&path, "[provider]\nretry_max_attempts = 0\n").unwrap();
         let disabled = Config::load(Some(&path), temp.path()).unwrap();
         assert_eq!(disabled.provider.retry_max_attempts, 0);
+    }
+
+    #[test]
+    fn server_limits_are_normalized() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[server]\nport = 1\nevent_buffer = 1\napproval_timeout_seconds = 1\n",
+        )
+        .unwrap();
+        let low = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(low.server.port, 1024);
+        assert_eq!(low.server.event_buffer, 16);
+        assert_eq!(low.server.approval_timeout_seconds, 10);
+
+        fs::write(
+            &path,
+            "[server]\nport = 99999\nevent_buffer = 99999\napproval_timeout_seconds = 99999\n",
+        )
+        .unwrap();
+        let high = Config::load(Some(&path), temp.path()).unwrap();
+        assert_eq!(high.server.port, 65535);
+        assert_eq!(high.server.event_buffer, 4096);
+        assert_eq!(high.server.approval_timeout_seconds, 3600);
+    }
+
+    #[test]
+    fn server_defaults_are_bounded_and_loopback() {
+        let config = Config::default();
+        assert_eq!(config.server.bind, "127.0.0.1");
+        assert_eq!(config.server.port, 7788);
+        assert_eq!(config.server.event_buffer, 512);
+        assert_eq!(config.server.approval_timeout_seconds, 300);
     }
 
     #[test]

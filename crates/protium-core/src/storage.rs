@@ -36,6 +36,17 @@ pub struct FileSnapshot {
     pub existed: bool,
 }
 
+/// A raw message row returned by cursor pagination. `id` is the opaque cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredMessage {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub kind: String,
+    pub metadata: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -144,6 +155,10 @@ impl Storage {
                 existed INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
+            -- Cursor pagination reads messages newest-first along the head
+            -- chain; the session_id+hidden+id index keeps that query index-only.
+            CREATE INDEX IF NOT EXISTS idx_messages_session_hidden_id
+                ON messages(session_id, hidden, id);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (1, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -152,6 +167,8 @@ impl Storage {
             VALUES (3, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (4, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (5, CURRENT_TIMESTAMP);
             ",
         )?;
         // These checks keep databases created by the first release compatible
@@ -311,27 +328,6 @@ impl Storage {
             "SELECT id, title, parent_id FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC",
         )?;
         let rows = statement.query_map([workspace.display().to_string()], |row| {
-            Ok(SessionSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                parent_id: row.get(2)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
-    }
-
-    pub(crate) fn list_recent_sessions(
-        &self,
-        workspace: &Path,
-        limit: usize,
-    ) -> Result<Vec<SessionSummary>, StorageError> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT id, title, parent_id FROM sessions WHERE workspace = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC LIMIT ?2",
-        )?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = statement.query_map(params![workspace.display().to_string(), limit], |row| {
             Ok(SessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -1033,6 +1029,49 @@ impl Storage {
             .collect()
     }
 
+    /// Returns one page of raw message rows along the current head chain,
+    /// newest-first (the caller reverses for display order).
+    ///
+    /// `before` is an opaque cursor (a message `id`): only rows strictly older
+    /// than it are returned. Pass `limit + 1` to detect `has_more` without a
+    /// separate count query. The `session_id + hidden + id` index makes this
+    /// index-only.
+    pub fn load_message_page(
+        &self,
+        session_id: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "WITH RECURSIVE chain(id) AS (
+                 SELECT head_turn_id FROM sessions WHERE id = ?1
+                 UNION ALL
+                 SELECT turns.parent_id FROM turns JOIN chain ON turns.id = chain.id
+                 WHERE turns.parent_id IS NOT NULL
+             )
+             SELECT id, role, content, kind, metadata, created_at FROM messages
+             WHERE session_id = ?1 AND hidden = 0
+               AND (turn_id IN (SELECT id FROM chain) OR turn_id IS NULL)
+               AND (?2 IS NULL OR id < ?2)
+             ORDER BY id DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![session_id, before, limit as i64], |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    kind: row.get(3)?,
+                    metadata: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn begin_tool(
         &self,
         session_id: &str,
@@ -1335,51 +1374,6 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session);
         assert_eq!(sessions[0].title, "hello");
-    }
-
-    #[test]
-    fn recent_sessions_are_bounded_ordered_and_workspace_scoped() {
-        let storage = Storage::in_memory().unwrap();
-        let root = tempdir().unwrap();
-        let other = tempdir().unwrap();
-        let mut ids = Vec::new();
-        for index in 0..7 {
-            let session = storage.create_session(root.path()).unwrap();
-            storage
-                .append_message(&session, Role::User, &format!("session {index}"))
-                .unwrap();
-            storage
-                .lock()
-                .unwrap()
-                .execute(
-                    "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-                    params![session, format!("2026-01-01T00:00:{index:02}Z")],
-                )
-                .unwrap();
-            ids.push(session);
-        }
-        let other_session = storage.create_session(other.path()).unwrap();
-        storage
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE sessions SET updated_at = '2099-01-01T00:00:00Z' WHERE id = ?1",
-                [&other_session],
-            )
-            .unwrap();
-        storage.delete_session(&ids[6]).unwrap();
-
-        let recent = storage.list_recent_sessions(root.path(), 5).unwrap();
-        assert_eq!(recent.len(), 5);
-        assert_eq!(recent[0].id, ids[5]);
-        assert_eq!(recent[4].id, ids[1]);
-        assert!(recent.iter().all(|session| session.id != other_session));
-        assert!(
-            storage
-                .list_recent_sessions(root.path(), 0)
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 [package]
-name = "protium-agent"
+name = "protium-tui"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
@@ -8,18 +8,56 @@ authors = ["olu"]
 license-file = "LICENSE"
 
 [[bin]]
+name = "1h-agent-tui"
+path = "src/main.rs"
+
+# Compatibility alias for the historical binary name.
+[[bin]]
 name = "1h-agent"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
+protium-core = { path = "crates/protium-core" }
+anyhow = { workspace = true }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 base64 = "0.22"
+clap = { workspace = true }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = { workspace = true }
+ignore = { workspace = true }
+pulldown-cmark = { workspace = true }
+ratatui = "0.29"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+unicode-width = "0.2"
+unicode-segmentation = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[workspace]
+resolver = "2"
+members = ["crates/protium-core"]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A lightweight, permission-aware multi-interface agent for Linux, macOS, and Windows"
+authors = ["olu"]
+license-file = "LICENSE"
+
+[workspace.dependencies]
+anyhow = "1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6"
+fs2 = "0.4"
 futures-util = "0.3"
 globset = "0.4"
 html2text = "0.15"
@@ -27,7 +65,6 @@ ignore = "0.4"
 keyring = { version = "3", default-features = false }
 libc = "0.2"
 pulldown-cmark = "0.13"
-ratatui = "0.29"
 regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -38,22 +75,12 @@ tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "si
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
-unicode-width = "0.2"
-unicode-segmentation = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
-
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", default-features = false, features = ["apple-native"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", default-features = false, features = ["windows-native"] }
-
-[dev-dependencies]
+ts-rs = { version = "12", features = ["serde-json-impl"] }
 tempfile = "3"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.release]
 opt-level = "s"

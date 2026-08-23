@@ -2736,11 +2736,6 @@ fn fit_text(value: &str, width: usize) -> String {
     output + "..."
 }
 
-#[cfg(test)]
-pub(crate) fn live_thinking_line_with_braille(app: &App, braille: bool) -> String {
-    live_thinking_lines_with_braille(app, usize::MAX, braille).join("\n")
-}
-
 struct LiveThinkingUpdate {
     title: String,
     lines: Option<Vec<String>>,
@@ -2856,7 +2851,7 @@ fn live_thinking_lines_cached(
 }
 
 fn append_wrapped_thinking(
-    cache: &mut crate::session::LiveThinkingLayoutCache,
+    cache: &mut crate::projection::LiveThinkingLayoutCache,
     value: &str,
     width: usize,
 ) {

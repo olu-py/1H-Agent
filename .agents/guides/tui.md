@@ -6,7 +6,7 @@
 
 ## 入口
 
-- `src/app.rs`：事件循环、`deferred_redraw_timer`、输入/菜单；`session.rs`：revision、锚点和缓存失效。
+- `src/app.rs`：事件循环、`deferred_redraw_timer`、输入/菜单；`src/projection.rs`：`TuiSessionProjection` 的 revision、锚点和缓存失效。
 - `src/home.rs`：启动首页状态、响应式布局、有限最近会话、选择菜单和命中矩形。
 - `src/output.rs`：`LayoutLine`、`StyleRun`、visual line、选区和 hit-test。
 - `src/ui.rs`：`render_visual_line`、Markdown、实时思考缓存和 footer 控件矩形。
@@ -24,7 +24,7 @@
 - 首页菜单捕获键鼠和粘贴，支持 `Up`/`Down`/`Enter`/`Esc`；popup、模型列表和最近会话均受屏幕或固定上限约束。
 - 选择和复制保持 UTF-8/字素、滚动锚点与逻辑换行；复制受 `MAX_CLIPBOARD_BYTES` 限制。
 - 边缘滚动 timer 只在拖选且方向非零时存在，松开或离开边缘立即释放。
-- 启动首页不构造 `SessionRuntime`、工具注册表或 router，不启动 timer；最近会话必须使用带硬上限的查询，确认新建或恢复后才初始化主界面资源。
+- 启动首页不启动引擎 timer；核心引擎在 `AppService::start` 一次拉起，最近会话必须使用带硬上限的快照查询，确认新建或恢复后才初始化主界面资源。
 
 ## 诊断
 

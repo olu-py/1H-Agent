@@ -6,8 +6,8 @@
 
 ## 入口
 
-- `src/storage.rs`：`from_connection`（建表 + `ensure_column` 兼容旧库 + `backfill_turns`）、全部读写方法。
-- `src/app.rs`：undo/redo/delete/fork 命令与 `reload_current_session` 的存储交互。
+- `crates/protium-core/src/storage.rs`：`from_connection`（建表 + `ensure_column` 兼容旧库 + `backfill_turns`）、全部读写方法。
+- `crates/protium-core/src/service.rs`/`session.rs`：undo/redo/delete/fork 命令与文件回滚交互；TUI 只经 `AppHandle` 提交命令。
 
 ## 不变量
 

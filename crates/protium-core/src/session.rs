@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    time::Instant,
-};
+use std::{collections::HashMap, path::Path, time::Instant};
 
 use serde_json::Value;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -13,15 +9,52 @@ use crate::{
     commands::AgentMode,
     model::{
         AgentPhase, ApprovalAction, DisplayContent, DisplayEntry, DisplayKind, ModelPhase,
-        PendingApproval, ThinkingDisplay, ThinkingResult, TodoStatus, TodoTask, ToolDisplay,
-        ToolDisplayStatus,
+        PendingApproval, ThinkingDisplay, ThinkingResult, TodoTask, ToolDisplay, ToolDisplayStatus,
     },
-    output::{CachedMarkdown, EdgeScroll, MessageLayout, OutputSelection},
     provider::{ConversationItem, Role, Usage},
     secrets,
     storage::Storage,
-    ui,
 };
+
+/// Localized display name for a tool, used in status lines. UI-independent;
+/// the TUI-specific display code no longer exists.
+pub(crate) fn tool_display_name(name: &str) -> String {
+    let translated = match name {
+        "file_list" => Some("文件列表"),
+        "file_stat" => Some("文件信息"),
+        "file_read" => Some("文件读取"),
+        "file_search" => Some("文件搜索"),
+        "file_glob" => Some("文件查找"),
+        "repo_map" => Some("符号大纲"),
+        "file_mkdir" => Some("新建目录"),
+        "file_write" => Some("文件修改"),
+        "file_edit" => Some("文件编辑"),
+        "file_copy" => Some("文件复制"),
+        "file_move" => Some("文件移动"),
+        "file_delete" => Some("文件删除"),
+        "web_search" => Some("网络搜索"),
+        "web_fetch" | "webfetch" => Some("网页读取"),
+        "terminal_exec" => Some("命令执行"),
+        "terminal_shell" => Some("Shell 命令"),
+        "agent_spawn" => Some("子 Agent"),
+        "git" => Some("Git 操作"),
+        "git_diff" => Some("差异查看"),
+        "browser_open" => Some("打开网页"),
+        "browser_snapshot" => Some("页面快照"),
+        "browser_click" => Some("页面点击"),
+        "browser_type" => Some("页面输入"),
+        "browser_press" => Some("页面按键"),
+        _ => None,
+    };
+    if let Some(translated) = translated {
+        return translated.to_owned();
+    }
+    if let Some(external) = name.strip_prefix("mcp:") {
+        let tool = external.rsplit([':', '/']).next().unwrap_or(external);
+        return format!("外部工具：{}", tool.replace('_', " "));
+    }
+    name.replace('_', " ")
+}
 
 /// Read-only context available while handling a per-session agent event.
 pub struct EventCtx<'a> {
@@ -34,29 +67,6 @@ pub struct EventCtx<'a> {
 pub struct SessionOutcome {
     /// The session list may have changed; the caller should refresh it.
     pub sessions_dirty: bool,
-    /// An approval overlay was dismissed and the frame needs a full redraw.
-    pub force_redraw: bool,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct LiveThinkingLayoutCache {
-    pub width: usize,
-    pub source_start: usize,
-    pub processed_len: usize,
-    pub buffer_epoch: u64,
-    pub rows: Vec<String>,
-    pub current_row: String,
-    pub current_width: usize,
-    #[cfg(test)]
-    pub full_rebuilds: usize,
-    #[cfg(test)]
-    pub processed_bytes: usize,
-}
-
-impl LiveThinkingLayoutCache {
-    pub fn clear(&mut self) {
-        *self = Self::default();
-    }
 }
 
 /// Per-session runtime state. Each open session owns its own conversation,
@@ -67,8 +77,6 @@ pub struct SessionRuntime {
     pub status: String,
     pub entries: Vec<DisplayEntry>,
     pub todos: Vec<TodoTask>,
-    pub todo_collapsed: bool,
-    pub todo_hidden: bool,
     pub busy: bool,
     pub agent_phase: AgentPhase,
     pub model_phase: ModelPhase,
@@ -77,9 +85,6 @@ pub struct SessionRuntime {
     pub thinking_buffer: String,
     pub thinking_buffer_truncated: bool,
     pub(crate) thinking_buffer_epoch: u64,
-    pub(crate) live_thinking_layout_cache: LiveThinkingLayoutCache,
-    pub thinking_animation_frame: usize,
-    pub thinking_anchor: Option<usize>,
     pub(crate) thinking_result: ThinkingResult,
     pub usage: Usage,
     pub context_used_tokens: u64,
@@ -87,23 +92,6 @@ pub struct SessionRuntime {
     pub pending_approval: Option<PendingApproval>,
     pub mode: AgentMode,
     pub child_role: Option<String>,
-    pub expanded_tools: HashSet<String>,
-    pub expanded_thinking: HashSet<String>,
-    pub thinking_expanded: bool,
-    pub message_scroll: usize,
-    pub follow_output: bool,
-    pub output_scroll_top: Option<usize>,
-    pub output_selection: Option<OutputSelection>,
-    pub message_layout: Option<MessageLayout>,
-    pub markdown_render_cache: HashMap<usize, CachedMarkdown>,
-    pub output_layout_dirty: bool,
-    #[cfg(test)]
-    pub output_layout_rebuild_count: usize,
-    #[cfg(test)]
-    pub markdown_parse_count: usize,
-    #[cfg(test)]
-    pub footer_rebuild_count: usize,
-    pub edge_scroll: EdgeScroll,
     pub conversation: Vec<ConversationItem>,
     pub runner: Option<AgentRunner>,
     pub agent_tx: mpsc::Sender<AgentEvent>,
@@ -115,9 +103,6 @@ pub struct SessionRuntime {
 
 impl SessionRuntime {
     pub(crate) fn set_todos(&mut self, tasks: Vec<TodoTask>) {
-        self.todo_hidden = false;
-        self.todo_collapsed =
-            !tasks.is_empty() && tasks.iter().all(|task| task.status == TodoStatus::Done);
         self.todos = tasks;
     }
 
@@ -250,7 +235,6 @@ impl SessionRuntime {
                     })
                 {
                     tool.status = ToolDisplayStatus::Completed;
-                    self.invalidate_output_layout();
                 }
                 self.agent_phase = AgentPhase::Thinking;
                 self.status = if count == 0 {
@@ -264,7 +248,6 @@ impl SessionRuntime {
                 self.busy = false;
                 self.active_task = None;
                 if let Some(approval) = self.take_pending_approval() {
-                    outcome.force_redraw = true;
                     if let ApprovalAction::Agent(reply) = approval.action {
                         let _ = reply.send(false);
                     }
@@ -281,7 +264,6 @@ impl SessionRuntime {
                 self.finish_thinking("思考完成");
                 self.agent_phase = AgentPhase::StreamingText;
                 self.model_phase = ModelPhase::Streaming;
-                self.invalidate_output_layout();
                 if let Some(entry) = self.entries.last_mut()
                     && matches!(entry.kind, DisplayKind::Assistant)
                     && let DisplayContent::Markdown(text) = &mut entry.content
@@ -319,7 +301,7 @@ impl SessionRuntime {
                 self.finish_thinking("思考完成");
                 self.agent_phase = AgentPhase::ToolRunning;
                 self.model_phase = ModelPhase::Idle;
-                self.status = format!("正在执行 {}……", ui::tool_display_name(&call.name));
+                self.status = format!("正在执行 {}……", tool_display_name(&call.name));
                 self.push_entry(DisplayEntry {
                     kind: DisplayKind::Tool,
                     content: DisplayContent::Tool(ToolDisplay {
@@ -345,7 +327,6 @@ impl SessionRuntime {
                 {
                     tool.status = status;
                     tool.result = Some(result);
-                    self.invalidate_output_layout();
                 } else {
                     self.push_entry(DisplayEntry {
                         kind: DisplayKind::Tool,
@@ -375,7 +356,6 @@ impl SessionRuntime {
                 trim_conversation(&mut self.conversation);
                 if compacted {
                     self.entries = display_entries(&self.conversation);
-                    self.invalidate_output_layout();
                 }
                 self.busy = false;
                 self.active_task = None;
@@ -453,21 +433,15 @@ impl SessionRuntime {
     fn begin_thinking(&mut self) {
         // Anchor the single live row before the next entry. TextDelta will append
         // that assistant entry at the same index, so the row never moves.
-        self.invalidate_output_layout();
         self.thinking_active = true;
         self.thinking_last_line = "模型正在思考".into();
         self.thinking_buffer.clear();
         self.thinking_buffer_truncated = false;
         self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
-        self.live_thinking_layout_cache.clear();
-        self.thinking_animation_frame = 0;
-        self.thinking_anchor = Some(self.entries.len());
-        self.thinking_expanded = false;
     }
 
     pub fn finish_thinking(&mut self, line: &str) {
         self.thinking_active = false;
-        self.thinking_animation_frame = 0;
         self.persist_thinking_summary();
         match line {
             "思考失败" => self.thinking_result = ThinkingResult::Failed,
@@ -478,16 +452,14 @@ impl SessionRuntime {
 
     /// Turns the buffered reasoning into a persistent "思考摘要" entry so every
     /// thinking round is kept in the task stream instead of being overwritten by
-    /// the next round. The live row is then retired (anchor cleared).
+    /// the next round.
     fn persist_thinking_summary(&mut self) {
         let truncated = self.thinking_buffer_truncated;
         let reasoning = self.thinking_buffer.trim().to_owned();
         self.thinking_buffer.clear();
         self.thinking_last_line.clear();
-        self.thinking_anchor = None;
         self.thinking_buffer_truncated = false;
         self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
-        self.live_thinking_layout_cache.clear();
         if reasoning.is_empty() {
             return;
         }
@@ -511,9 +483,6 @@ impl SessionRuntime {
         self.thinking_buffer.clear();
         self.thinking_buffer_truncated = false;
         self.thinking_buffer_epoch = self.thinking_buffer_epoch.wrapping_add(1);
-        self.live_thinking_layout_cache.clear();
-        self.thinking_animation_frame = 0;
-        self.thinking_anchor = None;
         self.thinking_result = ThinkingResult::Completed;
     }
 
@@ -549,19 +518,7 @@ impl SessionRuntime {
     }
 
     pub fn push_entry(&mut self, entry: DisplayEntry) {
-        self.clear_output_selection();
-        self.invalidate_output_layout();
         self.entries.push(entry);
-    }
-
-    pub fn clear_output_selection(&mut self) {
-        self.output_selection = None;
-        self.edge_scroll = EdgeScroll::default();
-    }
-
-    pub fn invalidate_output_layout(&mut self) {
-        self.message_layout.take();
-        self.output_layout_dirty = true;
     }
 
     pub fn trim_entries(&mut self) {
@@ -570,64 +527,7 @@ impl SessionRuntime {
         if self.entries.len() <= MAX_ENTRIES && display_entry_bytes(&self.entries) <= MAX_BYTES {
             return;
         }
-        self.invalidate_output_layout();
-        let removed = trim_entries(&mut self.entries);
-        self.markdown_render_cache.clear();
-        self.thinking_anchor = self
-            .thinking_anchor
-            .map(|anchor| anchor.saturating_sub(removed));
-        self.clear_output_selection();
-    }
-    pub fn scroll_messages(&mut self, delta: isize) -> bool {
-        let previous = (
-            self.message_scroll,
-            self.follow_output,
-            self.output_scroll_top,
-        );
-        let Some(layout) = &self.message_layout else {
-            if delta > 0 {
-                self.message_scroll = self.message_scroll.saturating_add(delta as usize);
-                self.follow_output = false;
-            } else {
-                self.message_scroll = self.message_scroll.saturating_sub(delta.unsigned_abs());
-                if self.message_scroll == 0 {
-                    self.follow_output = true;
-                }
-            }
-            return previous
-                != (
-                    self.message_scroll,
-                    self.follow_output,
-                    self.output_scroll_top,
-                );
-        };
-        let max_scroll = layout.max_scroll();
-        let current = self
-            .output_scroll_top
-            .unwrap_or(layout.scroll)
-            .min(max_scroll);
-        let next = next_output_scroll_top(current, max_scroll, delta);
-        if delta < 0 && next == max_scroll {
-            self.output_scroll_top = None;
-            self.follow_output = true;
-            self.message_scroll = 0;
-        } else {
-            self.output_scroll_top = Some(next);
-            self.follow_output = false;
-            self.message_scroll = max_scroll.saturating_sub(next);
-        }
-        previous
-            != (
-                self.message_scroll,
-                self.follow_output,
-                self.output_scroll_top,
-            )
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.message_scroll = 0;
-        self.follow_output = true;
-        self.output_scroll_top = None;
+        trim_entries(&mut self.entries);
     }
 }
 
@@ -752,15 +652,6 @@ fn display_entry_bytes(entries: &[DisplayEntry]) -> usize {
             DisplayContent::Thinking(thinking) => thinking.id.len() + thinking.content.len(),
         })
         .sum()
-}
-
-pub(crate) fn next_output_scroll_top(current: usize, max_scroll: usize, delta: isize) -> usize {
-    let current = current.min(max_scroll);
-    if delta > 0 {
-        current.saturating_sub(delta as usize)
-    } else {
-        current.saturating_add(delta.unsigned_abs()).min(max_scroll)
-    }
 }
 
 pub(crate) fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayEntry> {

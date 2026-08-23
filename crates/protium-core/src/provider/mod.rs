@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use ts_rs::TS;
 
 use crate::config::{ProviderKind, ThinkingLevel, ThinkingProfileKind};
 
@@ -30,10 +31,13 @@ pub enum Role {
     Assistant,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
+    /// Arbitrary tool arguments; the frontend treats them as opaque JSON.
+    #[ts(type = "any")]
     pub arguments: Value,
 }
 

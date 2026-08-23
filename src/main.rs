@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use protium_agent::{app, config::Config};
+use protium_tui::{app, config::Config};
 
 #[derive(Debug, Parser)]
-#[command(name = "1h-agent", version, about)]
+#[command(name = "1h-agent-tui", version, about)]
 struct Cli {
     /// Directory the agent is allowed to access.
     #[arg(long, default_value = ".")]
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "protium_agent=info".into()),
+                .unwrap_or_else(|_| "protium_tui=info,protium_core=info".into()),
         )
         .with_writer(std::io::stderr)
         .try_init()

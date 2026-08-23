@@ -6,9 +6,9 @@
 
 ## 入口
 
-- `src/agent.rs`：`AgentRunner`、`child_slots`、`ChildSessionStatus`、`ChildSessionProgress`、子循环与结果 JSON。
-- `src/config.rs`：`ClusterConfig` 和 Agent 模板；`src/app.rs`/`session.rs`：批次、审批 owner 与状态路由。
-- `src/prompt.rs`/`tools/mod.rs`：集群契约、spawn schema 和子工具过滤。
+- `crates/protium-core/src/agent.rs`：`AgentRunner`、`child_slots`、`ChildSessionStatus`、`ChildSessionProgress`、子循环与结果 JSON。
+- `crates/protium-core/src/config.rs`：`ClusterConfig` 和 Agent 模板；`service.rs`：审批 owner 与路由；`src/app.rs`：批次、进度展示与 `child_status` 跟踪。
+- `crates/protium-core/src/prompt.rs`/`tools/mod.rs`：集群契约、spawn schema 和子工具过滤。
 
 ## 不变量
 

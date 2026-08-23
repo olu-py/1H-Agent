@@ -19,7 +19,7 @@ excluded: Web UI、内置浏览器、远程 MCP、动态插件、图片和语音
 
 1. 先运行 `git status --short --branch`，识别并保护用户已有改动。
 2. 用 `rg` 定位定义、直接调用者、事件变体和相邻测试；只读任务命中的专题。
-3. 从 `src/main.rs -> app::run` 进入：全局状态在 `App`，单会话在 `SessionRuntime`，模型/工具循环在 `AgentRunner`。
+3. 从 `src/main.rs -> app::run` 进入：TUI 门面在 `src/app.rs`（`App` + `TuiSessionProjection`），核心状态机在 `crates/protium-core/src/service.rs`（`Engine`/`AppHandle`），单会话在 `session.rs`（`SessionRuntime`），模型/工具循环在 `agent.rs`（`AgentRunner`）。
 4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
 5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
 
@@ -27,13 +27,13 @@ excluded: Web UI、内置浏览器、远程 MCP、动态插件、图片和语音
 
 | 领域 | 首读入口 | 专题/读取条件 |
 | --- | --- | --- |
-| 启动、全局状态、会话路由 | `src/main.rs`、`src/app.rs`、`src/session.rs` | [Runtime](.agents/guides/runtime.md)；仅沿目标事件链读取 |
-| Provider、模型、密钥、协议、压缩恢复 | `src/config.rs`、`src/agent.rs`、`src/provider/openai.rs` | [Provider](.agents/guides/provider.md) |
-| 子 Agent、审批、取消、集群停滞 | `src/agent.rs`、`src/app.rs` | [Cluster](.agents/guides/cluster.md) |
+| 启动、全局状态、会话路由 | `src/main.rs`、`src/app.rs`、`crates/protium-core/src/service.rs` | [Runtime](.agents/guides/runtime.md)；仅沿目标事件链读取 |
+| Provider、模型、密钥、协议、压缩恢复 | `crates/protium-core/src/config.rs`、`agent.rs`、`provider/openai.rs` | [Provider](.agents/guides/provider.md) |
+| 子 Agent、审批、取消、集群停滞 | `crates/protium-core/src/agent.rs`、`src/app.rs` | [Cluster](.agents/guides/cluster.md) |
 | 首页、渲染、长文本、滚动、鼠标交互 | `src/home.rs`、`src/app.rs`、`src/ui.rs`、`src/output.rs` | [TUI](.agents/guides/tui.md) |
-| 工具、路径、SSRF、外部进程 | `src/tools/`、`src/security.rs` | [Tools](.agents/guides/tools.md) |
-| 会话、分支、迁移、持久化 | `src/storage.rs`、`src/session.rs` | [Storage](.agents/guides/storage.md)；涉及 Provider 状态时再读 Provider |
-| 配置上限、容量归一化、新增配置键 | `src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | 无；同步默认值与 `defaults_are_bounded` 类测试 |
+| 工具、路径、SSRF、外部进程 | `crates/protium-core/src/tools/`、`security.rs` | [Tools](.agents/guides/tools.md) |
+| 会话、分支、迁移、持久化 | `crates/protium-core/src/storage.rs`、`session.rs` | [Storage](.agents/guides/storage.md)；涉及 Provider 状态时再读 Provider |
+| 配置上限、容量归一化、新增配置键 | `crates/protium-core/src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | 无；同步默认值与 `defaults_are_bounded` 类测试 |
 | CI、版本、安装包、tag | `.github/workflows/`、`Cargo.toml` | [Release](.agents/guides/release.md) |
 
 指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。
@@ -41,12 +41,13 @@ excluded: Web UI、内置浏览器、远程 MCP、动态插件、图片和语音
 ## 架构与全局不变量
 
 ```text
-terminal event -> App -> SessionRuntime -> AgentRunner -> OpenAiClient / ToolRegistry
-                     |          |               |
-                     +-> UI     +-> Storage     +-> RoutedEvent(session_id) -> App
+terminal event -> App (TUI 门面) -> AppHandle -> Engine (core 单状态机任务)
+                   |                                            |
+                   +-> TuiSessionProjection <- Envelope <- EventBridge
+所有变更经 CoreCommand 队列串行；core 独占 SessionRuntime/AgentRunner/Storage/审批。
 ```
 
-- `App` 管全局 UI、当前/后台 runtime 和路由；`SessionRuntime` 独占单会话状态，切换不停止后台任务；后台容量与删除关停契约见 Runtime 专题。
+- `App` 是 TUI 门面：持有 `AppHandle` 与 `TuiSessionProjection`，经命令队列提交全部变更，不直接触碰核心 `SessionRuntime`/审批；核心引擎独占会话状态，切换不停止后台任务；后台容量与删除关停契约见 Runtime 专题。
 - Provider 私有协议先规范化为 `ModelEvent`；UI、存储和工具层不解析私有 JSON。
 - 恢复沿 `head_turn_id` 父链；fork 不复制 Provider 服务端状态；undo/redo 移动 head 并按 `file_snapshots` 回滚/前滚文件（无快照的路径跳过）。
 - workspace 必须 canonicalize；拒绝绝对路径、`..`、符号链接逃逸；新目标验证 canonical parent。
