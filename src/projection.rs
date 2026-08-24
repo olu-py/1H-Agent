@@ -451,16 +451,37 @@ impl TuiSessionProjection {
                 self.agent_phase = AgentPhase::ToolRunning;
                 self.model_phase = ModelPhase::Idle;
                 self.status = format!("正在执行 {}……", tool_display_name(&call.name));
-                self.push_entry(DisplayEntry {
-                    kind: DisplayKind::Tool,
-                    content: DisplayContent::Tool(ToolDisplay {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        status: ToolDisplayStatus::Running,
-                        result: None,
-                    }),
-                });
+                // A history rebuild (approval resolution or a resync replay) may
+                // already have materialized this call from the persisted
+                // transcript, so ToolStarted must be idempotent per call_id:
+                // reuse the existing card (refresh name/arguments, back to
+                // Running) instead of inserting a duplicate.
+                if let Some(tool) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find_map(|entry| match &mut entry.content {
+                        DisplayContent::Tool(tool) if tool.call_id == call.id => Some(tool),
+                        _ => None,
+                    })
+                {
+                    tool.name = call.name.clone();
+                    tool.arguments = call.arguments.clone();
+                    tool.status = ToolDisplayStatus::Running;
+                    tool.result = None;
+                    self.invalidate_output_layout();
+                } else {
+                    self.push_entry(DisplayEntry {
+                        kind: DisplayKind::Tool,
+                        content: DisplayContent::Tool(ToolDisplay {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            status: ToolDisplayStatus::Running,
+                            result: None,
+                        }),
+                    });
+                }
                 outcome.force_redraw = true;
             }
             Event::ToolFinished { call, result } => {
@@ -1425,6 +1446,61 @@ mod tests {
             &projection.entries[0].content,
             DisplayContent::Tool(tool) if tool.status == ToolDisplayStatus::Completed && tool.result.as_deref() == Some("ok")
         ));
+    }
+
+    #[test]
+    fn tool_started_is_idempotent_after_history_rebuild() {
+        fn tool_cards(projection: &TuiSessionProjection) -> Vec<&ToolDisplay> {
+            projection
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.content {
+                    DisplayContent::Tool(tool) => Some(tool),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        };
+        // A transcript rebuild (approval resolution or a resync replay)
+        // materializes the persisted tool call as a Running card.
+        projection.apply_message_page(
+            &MessagePage {
+                messages: vec![MessageDto::ToolCalls {
+                    id: 1,
+                    calls: vec![call.clone()],
+                    created_at: "t".into(),
+                }],
+                next_before: None,
+                has_more: false,
+            },
+            false,
+        );
+        assert_eq!(projection.entries.len(), 1);
+        // The runner re-emits ToolStarted after the rebuild: it must reuse the
+        // existing card, not insert a duplicate.
+        projection.handle_event(&Event::ToolStarted { call: call.clone() });
+        let cards = tool_cards(&projection);
+        assert_eq!(
+            cards.len(),
+            1,
+            "replayed ToolStarted must not duplicate the card"
+        );
+        assert_eq!(cards[0].call_id, "c1");
+        assert_eq!(cards[0].status, ToolDisplayStatus::Running);
+        // ToolFinished still lands on that single card.
+        projection.handle_event(&Event::ToolFinished {
+            call,
+            result: "ok".into(),
+        });
+        let cards = tool_cards(&projection);
+        assert_eq!(cards.len(), 1, "ToolFinished must not add a card either");
+        assert_eq!(cards[0].status, ToolDisplayStatus::Completed);
+        assert_eq!(cards[0].result.as_deref(), Some("ok"));
     }
 
     #[test]
