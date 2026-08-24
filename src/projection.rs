@@ -99,6 +99,11 @@ pub struct TuiSessionProjection {
     pub thinking_animation_frame: usize,
     pub thinking_anchor: Option<usize>,
     pub thinking_expanded: bool,
+    /// Active "generating tool call" live row: the localized display name and
+    /// the cumulative argument bytes received so far. `Some` only while the
+    /// model is streaming a tool call's arguments; any next-phase event clears
+    /// it. Rendered as a collapsed, non-clickable animated row.
+    pub generating_tool: Option<(String, u64)>,
     pub(crate) live_thinking_layout_cache: LiveThinkingLayoutCache,
     pub pending_approval: Option<ApprovalDisplay>,
     pub usage: Usage,
@@ -159,6 +164,7 @@ impl TuiSessionProjection {
             thinking_animation_frame: 0,
             thinking_anchor: None,
             thinking_expanded: false,
+            generating_tool: None,
             live_thinking_layout_cache: LiveThinkingLayoutCache::default(),
             pending_approval: None,
             usage: Usage::default(),
@@ -201,6 +207,21 @@ impl TuiSessionProjection {
             Event::ReasoningDelta { delta } => {
                 self.agent_phase = AgentPhase::Thinking;
                 self.model_phase = ModelPhase::Streaming;
+                // A mid-reasoning sync (replace_history via ApprovalResolved or
+                // a lag resync) drops the live anchor but preserves the buffer.
+                // Re-anchor so the live row is not lost forever: begin fresh
+                // when the buffer is empty, otherwise keep the buffered
+                // reasoning and just restore the anchor/active state.
+                if self.thinking_anchor.is_none()
+                    && (self.thinking_active || !self.thinking_buffer.is_empty())
+                {
+                    if self.thinking_buffer.is_empty() {
+                        self.begin_thinking();
+                    } else {
+                        self.thinking_active = true;
+                        self.thinking_anchor = Some(self.entries.len());
+                    }
+                }
                 self.update_thinking_line(delta);
                 outcome.force_redraw = true;
             }
@@ -363,6 +384,36 @@ impl TuiSessionProjection {
                     });
                 }
                 self.status = "正在输出正文…… | Esc 取消".into();
+                outcome.force_redraw = true;
+            }
+            Event::ToolCallStreaming {
+                name,
+                received_bytes,
+            } => {
+                // The model is streaming a tool call's arguments (a large
+                // file_write payload can take seconds). Collapse any still-live
+                // reasoning into its summary exactly once, then show an animated
+                // "generating tool call" row so the screen never freezes.
+                if self.thinking_active || !self.thinking_buffer.is_empty() {
+                    self.finish_thinking("思考完成");
+                }
+                self.thinking_active = true;
+                self.thinking_expanded = false;
+                self.thinking_anchor = self.thinking_anchor.or(Some(self.entries.len()));
+                self.agent_phase = AgentPhase::StreamingToolCall;
+                self.model_phase = ModelPhase::Streaming;
+                let display_name = name
+                    .as_deref()
+                    .map(tool_display_name)
+                    .or_else(|| self.generating_tool.as_ref().map(|(name, _)| name.clone()))
+                    .unwrap_or_else(|| "工具调用".to_owned());
+                self.generating_tool = Some((display_name.clone(), *received_bytes));
+                self.status = format!(
+                    "正在生成 {display_name} 调用参数（{}）……",
+                    format_bytes(*received_bytes)
+                );
+                // Low-frequency event: draw this frame immediately (the default
+                // coalesce branch keeps it out of the 16ms window).
                 outcome.force_redraw = true;
             }
             Event::Approval {
@@ -536,6 +587,7 @@ impl TuiSessionProjection {
 
     fn begin_thinking(&mut self) {
         self.invalidate_output_layout();
+        self.generating_tool = None;
         self.thinking_active = true;
         self.thinking_last_line = "模型正在思考".into();
         self.thinking_buffer.clear();
@@ -551,6 +603,7 @@ impl TuiSessionProjection {
     }
 
     pub fn finish_thinking(&mut self, line: &str) {
+        self.generating_tool = None;
         self.thinking_active = false;
         self.thinking_animation_frame = 0;
         self.persist_thinking_summary();
@@ -594,6 +647,7 @@ impl TuiSessionProjection {
     }
 
     pub fn reset_thinking_state(&mut self) {
+        self.generating_tool = None;
         self.thinking_active = false;
         self.thinking_last_line.clear();
         self.thinking_buffer.clear();
@@ -606,6 +660,7 @@ impl TuiSessionProjection {
     }
 
     fn update_thinking_line(&mut self, delta: &str) {
+        self.generating_tool = None;
         self.thinking_active = true;
         self.thinking_buffer.push_str(delta);
         if self.thinking_buffer.len() > MAX_THINKING_BUFFER_BYTES {
@@ -934,6 +989,17 @@ fn status_from_wire(status: &str) -> ToolDisplayStatus {
     }
 }
 
+/// Human-readable byte count for the "generating tool call" row (e.g. "9.0 KB").
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Localized display name for a tool, used in status lines.
 pub fn tool_display_name(name: &str) -> String {
     let translated = match name {
@@ -1146,6 +1212,7 @@ mod tests {
             live_thinking_before: None,
             live_thinking_rows: 0,
             live_thinking_lines: Vec::new(),
+            live_thinking_clickable: true,
         });
         projection.output_scroll_top = Some(0);
         projection.follow_output = false;
@@ -1381,5 +1448,97 @@ mod tests {
             approved: true,
         });
         assert!(projection.pending_approval.is_none());
+    }
+
+    #[test]
+    fn reasoning_resumes_after_history_replace_without_losing_the_buffer() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.handle_event(&Event::ModelStreaming);
+        projection.handle_event(&Event::ReasoningDelta {
+            delta: "前半".into(),
+        });
+        assert!(projection.thinking_active);
+        assert_eq!(projection.thinking_anchor, Some(0));
+        // A transcript sync rebuilds history mid-reasoning: the live anchor is
+        // dropped but the buffered reasoning survives.
+        projection.replace_history(vec![]);
+        assert!(projection.thinking_anchor.is_none());
+        assert_eq!(projection.thinking_buffer, "前半");
+        // The next reasoning delta must restore the anchor/active state while
+        // keeping the already-buffered reasoning.
+        projection.handle_event(&Event::ReasoningDelta {
+            delta: "后半".into(),
+        });
+        assert!(projection.thinking_active);
+        assert_eq!(projection.thinking_anchor, Some(0));
+        assert_eq!(projection.thinking_buffer, "前半后半");
+        assert!(
+            projection
+                .handle_event(&Event::ReasoningDelta {
+                    delta: "结尾".into(),
+                })
+                .force_redraw
+        );
+    }
+
+    #[test]
+    fn tool_call_streaming_collapses_thinking_and_clears_on_tool_start() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.handle_event(&Event::ModelStreaming);
+        projection.handle_event(&Event::ReasoningDelta {
+            delta: "推演过程".into(),
+        });
+        // The reasoning is still live when the tool call starts streaming; it
+        // must collapse into exactly one summary and hand the live slot to the
+        // "generating tool call" row.
+        projection.handle_event(&Event::ToolCallStreaming {
+            name: Some("file_write".into()),
+            received_bytes: 9216,
+        });
+        assert_eq!(projection.agent_phase, AgentPhase::StreamingToolCall);
+        assert_eq!(projection.model_phase, ModelPhase::Streaming);
+        assert!(projection.thinking_active);
+        assert!(!projection.thinking_expanded);
+        assert_eq!(
+            projection.generating_tool,
+            Some(("文件修改".to_owned(), 9216))
+        );
+        assert!(projection.status.contains("文件修改"));
+        assert!(projection.status.contains("9.0 KB"));
+        assert_eq!(
+            projection
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, DisplayKind::Thinking))
+                .count(),
+            1,
+            "the live reasoning collapses into exactly one summary"
+        );
+        // A later ToolStarted clears the generating row (the next phase ends it).
+        projection.handle_event(&Event::ToolStarted {
+            call: ToolCall {
+                id: "c1".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+        });
+        assert!(projection.generating_tool.is_none());
+        assert!(!projection.thinking_active);
+        assert_eq!(projection.agent_phase, AgentPhase::ToolRunning);
+    }
+
+    #[test]
+    fn tool_call_streaming_with_unknown_name_uses_a_generic_label() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.handle_event(&Event::ToolCallStreaming {
+            name: None,
+            received_bytes: 512,
+        });
+        assert_eq!(
+            projection.generating_tool,
+            Some(("工具调用".to_owned(), 512))
+        );
+        assert!(projection.status.contains("512 B"));
+        assert!(projection.thinking_anchor.is_some());
     }
 }

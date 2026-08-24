@@ -113,6 +113,7 @@ fn event_payload_bytes(event: &Event) -> usize {
         E::WebSearchCompleted { .. } => 8,
         E::Cancelled { reason } => string_bytes(reason),
         E::TextDelta { delta } => string_bytes(delta),
+        E::ToolCallStreaming { name, .. } => name.as_ref().map_or(0, String::len) + 16,
         E::Approval {
             call,
             reason,

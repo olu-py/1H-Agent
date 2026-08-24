@@ -136,6 +136,20 @@ pub enum Event {
     TextDelta {
         delta: String,
     },
+    /// Reports streaming progress while the model generates a tool call's
+    /// arguments (a large `file_write` payload can take seconds). `received_bytes`
+    /// is monotonic within one model round and the event is emitted at ~1 KiB
+    /// thresholds, so consumers can animate a "generating tool call" row instead
+    /// of freezing silently. Consumers may rely only on monotonicity, ordering
+    /// and boundedness — the exact thresholds and event count are a core
+    /// implementation detail and must not be depended on. Ordering guarantee
+    /// within a model round: `ReasoningDelta* -> ReasoningCompleted -> TextDelta*
+    /// -> ToolCallStreaming* -> Approval/ToolStarted`. Old clients that ignore it
+    /// still receive the same deltas and fall back to their existing behavior.
+    ToolCallStreaming {
+        name: Option<String>,
+        received_bytes: u64,
+    },
     /// The agent is waiting for a tool approval. `approval_id` is the token the
     /// frontend must echo back to `POST /api/v2/approvals/:id`.
     Approval {
@@ -445,6 +459,10 @@ mod tests {
             Event::WebSearchCompleted { count: 1 },
             Event::Cancelled { reason: "r".into() },
             Event::TextDelta { delta: "d".into() },
+            Event::ToolCallStreaming {
+                name: Some("file_write".into()),
+                received_bytes: 9216,
+            },
             Event::ReasoningCompleted,
             Event::Approval {
                 approval_id: "ap".into(),
@@ -507,6 +525,27 @@ mod tests {
                 "type tag must be snake_case, got {tag:?}"
             );
         }
+    }
+
+    #[test]
+    fn tool_call_streaming_serializes_with_tag_and_fields() {
+        let event = Event::ToolCallStreaming {
+            name: Some("file_write".into()),
+            received_bytes: 9216,
+        };
+        let json = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(json["type"], "tool_call_streaming");
+        assert_eq!(json["name"], "file_write");
+        assert_eq!(json["received_bytes"], 9216);
+        // `name` is optional on the wire; old consumers ignore the event anyway.
+        let unnamed = Event::ToolCallStreaming {
+            name: None,
+            received_bytes: 600,
+        };
+        let json = serde_json::to_value(unnamed).expect("event serializes");
+        assert_eq!(json["type"], "tool_call_streaming");
+        assert!(json.get("name").and_then(|value| value.as_str()).is_none());
+        assert_eq!(json["received_bytes"], 600);
     }
 
     #[test]

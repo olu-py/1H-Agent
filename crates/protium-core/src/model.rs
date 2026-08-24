@@ -27,6 +27,10 @@ pub enum AgentPhase {
     Idle,
     Thinking,
     StreamingText,
+    /// The model is streaming a tool call's arguments (for example a large
+    /// `file_write` payload). Snapshot string `STREAMING_TOOL_CALL`; additive —
+    /// old consumers that do not know the phase keep their existing behavior.
+    StreamingToolCall,
     WaitingApproval,
     ToolRunning,
     Completed,
@@ -39,6 +43,7 @@ impl AgentPhase {
             Self::Idle => "IDLE",
             Self::Thinking => "THINKING",
             Self::StreamingText => "STREAMING_TEXT",
+            Self::StreamingToolCall => "STREAMING_TOOL_CALL",
             Self::WaitingApproval => "WAITING_APPROVAL",
             Self::ToolRunning => "TOOL_RUNNING",
             Self::Completed => "COMPLETED",

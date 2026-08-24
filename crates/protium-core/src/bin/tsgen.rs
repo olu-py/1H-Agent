@@ -1,10 +1,17 @@
 //! Generates TypeScript bindings for the v2 UI wire protocol.
 //!
-//! Writes one `.ts` file per exported type into `TS_RS_EXPORT_DIR` (default
-//! `web/ts/` relative to the workspace root). `export_all` recurses into every
-//! dependency annotated with `#[ts(export)]`, so the output is self-contained.
-//! CI regenerates to a temporary directory and compares against the committed
-//! output to prevent Rust/TS contract drift.
+//! Writes one `.ts` file per exported type into the directory given by
+//! `TS_RS_EXPORT_DIR` (`Config::from_env`); point it at
+//! `crates/protium-core/bindings` to regenerate the committed files.
+//! `export_all` recurses into every dependency annotated with `#[ts(export)]`,
+//! so the output is self-contained.
+//!
+//! Note: the committed bindings are maintained and verified by the
+//! `#[ts(export)]`-generated `export_bindings_*` unit tests during
+//! `cargo test`, not by CI or by this binary. This binary configures
+//! `with_large_int("number")` while the export tests use ts-rs's default
+//! `bigint`, so the two outputs differ on large ints — treat the `cargo test`
+//! output as authoritative for the committed files.
 
 use protium_core::{
     model::{TodoStatus, TodoTask},

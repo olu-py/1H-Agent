@@ -521,6 +521,16 @@ pub enum AgentEvent {
     },
     Cancelled(String),
     TextDelta(String),
+    /// Reports streaming progress while the model generates a tool call's
+    /// arguments (a `file_write` payload can take seconds). `received_bytes` is
+    /// monotonic within one model round; the event is emitted at ~1 KiB
+    /// thresholds so the UI can animate a "generating tool call" row instead of
+    /// freezing silently. Ordering within a round: after the last `TextDelta`
+    /// and before `Approval`/`ToolStarted`.
+    ToolCallStreaming {
+        name: Option<String>,
+        received_bytes: u64,
+    },
     Approval {
         call: ToolCall,
         reason: String,
@@ -668,6 +678,15 @@ impl StreamCollector {
                 name,
                 arguments_delta,
             } => {
+                // Build the forwarded copy first: the closure only needs the
+                // name and the payload length, so clone the small fields and
+                // move the payload instead of cloning it.
+                let forwarded = ModelEvent::ToolCallDelta {
+                    slot: slot.clone(),
+                    id: None,
+                    name: name.clone(),
+                    arguments_delta,
+                };
                 let partial = self.partials.entry(slot).or_default();
                 if let Some(id) = id {
                     partial.id = id;
@@ -675,8 +694,17 @@ impl StreamCollector {
                 if let Some(name) = name {
                     partial.name = name;
                 }
-                partial.arguments.push_str(&arguments_delta);
-                None
+                if let ModelEvent::ToolCallDelta {
+                    arguments_delta, ..
+                } = &forwarded
+                {
+                    partial.arguments.push_str(arguments_delta);
+                }
+                // Forward the raw delta so the caller's closure can merge it
+                // into streaming progress events (TextDelta/ReasoningDelta
+                // follow the same pass-through pattern). `id` is internal to
+                // partial accumulation; the closure only needs name + bytes.
+                Some(forwarded)
             }
             ModelEvent::ToolCallComplete(call) => {
                 self.completed_ids.insert(call.id.clone());
@@ -1209,6 +1237,13 @@ impl AgentRunner {
             // a completion barrier is never repeated across rounds.
             let mut reasoning_seen = false;
             let mut reasoning_emitted = false;
+            // Per-round tool-call streaming progress. The closure is rebuilt on
+            // every round, so the merge state resets between rounds; a 9190-byte
+            // `file_write` argument stream becomes ~10 bounded events instead of
+            // hundreds of deltas.
+            let mut tool_stream_name: Option<String> = None;
+            let mut tool_stream_bytes: u64 = 0;
+            let mut tool_stream_next_emit: u64 = 0;
             match stream_once(
                 &self.provider,
                 request,
@@ -1306,9 +1341,42 @@ impl AgentRunner {
                         }
                         Ok(Forwarded::Ignore)
                     }
-                    ModelEvent::ToolCallDelta { .. }
-                    | ModelEvent::ToolCallComplete(_)
-                    | ModelEvent::Done => Ok(Forwarded::Ignore),
+                    ModelEvent::ToolCallDelta {
+                        name,
+                        arguments_delta,
+                        ..
+                    } => {
+                        // Merge into ~1 KiB progress reports: emit on the first
+                        // delta, on the first known tool name, and whenever the
+                        // cumulative byte count crosses the next threshold. The
+                        // UI animates "generating tool call" instead of freezing
+                        // while a large argument payload streams.
+                        let first = tool_stream_bytes == 0;
+                        tool_stream_bytes =
+                            tool_stream_bytes.saturating_add(arguments_delta.len() as u64);
+                        let name_first_known = name.is_some() && tool_stream_name.is_none();
+                        if let Some(name) = name {
+                            tool_stream_name = Some(name);
+                        }
+                        if first || name_first_known || tool_stream_bytes >= tool_stream_next_emit {
+                            if tool_stream_next_emit == 0 {
+                                tool_stream_next_emit = 1024;
+                            }
+                            // A single giant delta may cross several thresholds
+                            // at once; skip past all of them so the next emit
+                            // still waits a full 1 KiB.
+                            while tool_stream_bytes >= tool_stream_next_emit {
+                                tool_stream_next_emit = tool_stream_next_emit.saturating_add(1024);
+                            }
+                            Ok(Forwarded::SendIgnore(AgentEvent::ToolCallStreaming {
+                                name: tool_stream_name.clone(),
+                                received_bytes: tool_stream_bytes,
+                            }))
+                        } else {
+                            Ok(Forwarded::Ignore)
+                        }
+                    }
+                    ModelEvent::ToolCallComplete(_) | ModelEvent::Done => Ok(Forwarded::Ignore),
                 },
             )
             .await
@@ -2975,6 +3043,131 @@ mod tests {
                 "text",
                 "run_completed",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_streaming_reports_merged_progress_between_text_and_approval() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "write html")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        // Replays the reported scenario: reasoning -> body text -> a ~6 KiB
+        // file_write argument stream (10 x 600 B) -> completion -> the approval
+        // gate, then a final answer round.
+        let mut tool_round = vec![
+            ModelEvent::ReasoningDelta("推演".into()),
+            ModelEvent::TextDelta("正文".into()),
+        ];
+        for _ in 0..10 {
+            tool_round.push(ModelEvent::ToolCallDelta {
+                slot: "s0".into(),
+                id: Some("c1".into()),
+                name: Some("file_write".into()),
+                arguments_delta: "x".repeat(600),
+            });
+        }
+        tool_round.push(ModelEvent::ToolCallComplete(ToolCall {
+            id: "c1".into(),
+            name: "file_write".into(),
+            arguments: serde_json::json!({"path": "a.txt", "content": "x".repeat(6000)}),
+        }));
+        tool_round.push(ModelEvent::Done);
+        let responses = vec![
+            tool_round,
+            vec![ModelEvent::TextDelta("done".into()), ModelEvent::Done],
+        ];
+        let runner = AgentRunner::new(
+            OpenAiClient::scripted(responses).unwrap(),
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage,
+            session_id,
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "write html".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+
+        let mut streaming = Vec::new();
+        let mut text_seen = false;
+        let mut after_text = false;
+        let mut saw_approval = false;
+        let mut saw_tool_started = false;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::ToolCallStreaming {
+                    name,
+                    received_bytes,
+                } => {
+                    assert!(after_text, "streaming must follow the body text");
+                    assert!(
+                        !saw_approval && !saw_tool_started,
+                        "streaming must precede approval/tool start"
+                    );
+                    streaming.push((name, received_bytes));
+                }
+                AgentEvent::TextDelta(_) => {
+                    after_text = true;
+                    text_seen = true;
+                }
+                AgentEvent::Approval { reply, .. } => {
+                    saw_approval = true;
+                    let _ = reply.send(true);
+                }
+                AgentEvent::ToolStarted(_) => saw_tool_started = true,
+                AgentEvent::Completed { .. } => break,
+                AgentEvent::Failed(error) => panic!("unexpected failure: {error}"),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert!(text_seen);
+        assert!(
+            !streaming.is_empty(),
+            "tool call streaming must be reported"
+        );
+        assert_eq!(
+            streaming[0].0.as_deref(),
+            Some("file_write"),
+            "the first event carries the tool name"
+        );
+        let mut previous = 0u64;
+        for (_, bytes) in &streaming {
+            assert!(
+                *bytes > previous,
+                "received_bytes must be monotonic; got {streaming:?}"
+            );
+            previous = *bytes;
+        }
+        assert!(
+            streaming.len() < 10,
+            "the 1 KiB merge must produce fewer events than deltas; got {}",
+            streaming.len()
+        );
+        assert_eq!(
+            streaming.last().unwrap().1,
+            5400,
+            "the last report carries the cumulative bytes at the final threshold"
+        );
+        assert!(
+            saw_approval && saw_tool_started,
+            "the tool round must end in the approval gate then tool execution"
         );
     }
 

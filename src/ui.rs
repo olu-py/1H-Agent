@@ -549,6 +549,9 @@ pub(crate) fn update_message_layout(app: &mut App, viewport: Rect) {
     let thinking_update =
         live_thinking_lines(app, viewport.width.max(1) as usize, existing_live_rows);
     if let Some(layout) = &mut app.current.message_layout {
+        // The "generating tool call" row is display-only: it must not be
+        // clickable (expanding would be meaningless while arguments stream).
+        layout.set_live_thinking_clickable(app.current.generating_tool.is_none());
         if let Some(lines) = thinking_update.lines {
             layout.set_live_thinking_lines(lines);
         } else {
@@ -2876,6 +2879,18 @@ fn append_wrapped_thinking(
 fn live_thinking_lines_with_braille(app: &App, width: usize, braille: bool) -> Vec<String> {
     if app.current.thinking_anchor.is_none() {
         return Vec::new();
+    }
+    // The "generating tool call" row: an animated, collapsed, non-clickable line
+    // that keeps the screen live while a large argument payload (e.g. a 9 KB
+    // file_write) streams from the model.
+    if let Some((name, bytes)) = &app.current.generating_tool {
+        let spinner =
+            crate::app::thinking_animation_glyph(app.current.thinking_animation_frame, braille);
+        let line = format!(
+            "⚙ {spinner} 生成工具调用 {name} · {}",
+            crate::projection::format_bytes(*bytes)
+        );
+        return vec![fit_text_tail(&line, width)];
     }
     let status = if app.current.thinking_active {
         "思考中"

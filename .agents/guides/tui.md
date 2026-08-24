@@ -19,7 +19,8 @@ TUI adapter 的职责边界：projection、输入、布局、渲染、滚动和�
 - 终态、`TranscriptInvalidated`、`ResyncRequired` 时从 snapshot/messages 重建展示状态，不依赖被淘汰或过期的本地增量；普通 snapshot 刷新不推进未消费的 `event_cursor`，只有首次连接、消费者滞后或 `ResyncRequired` 才建立新基线，避免跳过工具终态、思考屏障和正文 delta。
 - 逻辑行保存文本和 `StyleRun` 字节区间；可见行只切片相交段，不从行头扫描或逐字素建 Span。
 - Markdown/换行按 revision、宽度和展开状态缓存；摘要只失效目标条目，滚动/footer 不重解析正文。
-- 实时思考分离动态标题与正文；追加只重排末尾，裁剪或改宽才全量重建；每帧只生成一次结果。
+- 跨 projection/ui 共享的展示 helper（如字节/工具名格式化）放 `projection.rs` 且 `pub(crate)`；与核心重复时两侧互相指向并注明为准者，避免各自漂移。
+- 实时思考分离动态标题与正文；追加只重排末尾，裁剪或改宽才全量重建；每帧只生成一次结果。工具参数流式时显示"生成工具调用"折叠动画行（`ToolCallStreaming` 驱动，复用 100ms 动画 tick），该行只读不可点击；中间同步丢弃的 live 锚点由后续 `ReasoningDelta` 或同步本身恢复，缓冲不丢。
 - 文本/reasoning delta 与滚轮共享固定 16 ms 帧；状态立即累计，后续事件不重置 deadline。
 - 点击、键盘、审批、终态和 resize 即时绘制；live `Approval` 必须同步到 facade 的全局最旧审批并立即显示 modal，`ApprovalResolved` 清理匹配项后从 snapshot 收敛下一个审批，禁止只更新 session projection 导致 agent 隐形等待超时；工具开始/结束、联网搜索状态变化和本地 Shell 完成强制重绘，工具终态在下一轮模型事件到达前就必须可见；思考结束时摘要默认折叠、点击可重新展开；后台会话的 delta 与 todo 更新不重绘当前会话；边界无效滚动不安排帧。
 - 任务浮窗锚定 viewport 右下角，在消息内容之后渲染为顶层窗口；todo 更新不失效消息布局；状态符命中宽度固定为符号宽度；全部完成后自动折叠；关闭只隐藏当前会话浮窗不删任务，后续 todo 更新重新显示。
@@ -40,6 +41,7 @@ TUI adapter 的职责边界：projection、输入、布局、渲染、滚动和�
 | 点击错位 | 实际 Rect -> 裁剪/宽字符 -> scroll offset |
 | 选择乱码/缺失 | byte/grapheme 边界 -> 反向选区 -> style run 拆分 |
 | 展示与核心不一致 | 是否直读核心状态 -> 终态/`TranscriptInvalidated`/`ResyncRequired` 后是否重建 projection |
+| live 思考行中途消失 / 快照合并把 agent_phase 重置为 Idle | `replace_history` 丢弃锚点后 `ReasoningDelta` 是否恢复锚点与缓冲 / `parse_phase` 与 `label()` 大小写一致性与 `STREAMING_TOOL_CALL` 映射 |
 
 ## 验证
 

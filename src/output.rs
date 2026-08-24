@@ -55,6 +55,9 @@ pub struct MessageLayout {
     pub live_thinking_before: Option<usize>,
     pub live_thinking_rows: usize,
     pub live_thinking_lines: Vec<String>,
+    /// Whether the first live-thinking row is clickable (toggles expansion).
+    /// The "generating tool call" row is display-only and clears this flag.
+    pub live_thinking_clickable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +168,7 @@ impl MessageLayout {
             live_thinking_before,
             live_thinking_rows,
             live_thinking_lines: Vec::new(),
+            live_thinking_clickable: true,
         }
     }
 
@@ -196,6 +200,20 @@ impl MessageLayout {
         self.width = width;
         self.scroll = self.scroll.min(self.max_scroll());
         self
+    }
+
+    pub fn set_live_thinking_clickable(&mut self, clickable: bool) {
+        self.live_thinking_clickable = clickable;
+        // Update the interaction on the existing synthetic first row so a
+        // transition to/from the generating-tool row also toggles clickability
+        // on the fast path (when the row count is unchanged).
+        if let Some(visual) = self.visual_lines.iter_mut().find(|line| line.synthetic) {
+            visual.interaction = if clickable {
+                Some(InteractionTarget::Thinking)
+            } else {
+                None
+            };
+        }
     }
 
     pub fn set_live_thinking_lines(&mut self, lines: Vec<String>) {
@@ -232,7 +250,8 @@ impl MessageLayout {
                         logical_line: logical_line.min(self.lines.len().saturating_sub(1)),
                         start: live_row,
                         end: live_row,
-                        interaction: (live_row == 0).then_some(InteractionTarget::Thinking),
+                        interaction: (live_row == 0 && self.live_thinking_clickable)
+                            .then_some(InteractionTarget::Thinking),
                         synthetic: true,
                         clickable_width: if live_row == 0 {
                             UnicodeWidthStr::width(line.as_str()).min(self.width)
@@ -620,5 +639,31 @@ mod tests {
             Some(InteractionTarget::Thinking)
         );
         assert_eq!(layout.interaction_at(30, 2), None);
+    }
+
+    #[test]
+    fn generating_tool_row_is_display_only_and_not_clickable() {
+        let mut layout = MessageLayout::new_with_live_thinking(
+            vec![Line::from("正文")],
+            Rect::new(30, 1, 40, 5),
+            0,
+            Some(0),
+        );
+        // The facade clears clickability for the "generating tool call" row;
+        // the fast path (unchanged row count) must keep it non-clickable.
+        layout.set_live_thinking_clickable(false);
+        layout.set_live_thinking_lines(vec!["⚙ ⠋ 生成工具调用 文件修改 · 9.0 KB".into()]);
+        assert!(!layout.live_thinking_clickable);
+        assert_eq!(
+            layout.interaction_at(30, 1),
+            None,
+            "the generating row must not be clickable"
+        );
+        // Restoring clickability (thinking row returns) re-enables the target.
+        layout.set_live_thinking_clickable(true);
+        assert_eq!(
+            layout.interaction_at(30, 1),
+            Some(InteractionTarget::Thinking)
+        );
     }
 }

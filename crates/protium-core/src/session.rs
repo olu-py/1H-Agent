@@ -16,6 +16,17 @@ use crate::{
     storage::Storage,
 };
 
+/// Human-readable byte count for status lines (e.g. "9.0 KB").
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Localized display name for a tool, used in status lines. UI-independent;
 /// the TUI-specific display code no longer exists.
 pub(crate) fn tool_display_name(name: &str) -> String {
@@ -293,6 +304,21 @@ impl SessionRuntime {
                     });
                 }
                 self.status = "正在输出正文…… | Esc 取消".into();
+            }
+            AgentEvent::ToolCallStreaming {
+                name,
+                received_bytes,
+            } => {
+                self.agent_phase = AgentPhase::StreamingToolCall;
+                self.model_phase = ModelPhase::Streaming;
+                let display = name
+                    .as_deref()
+                    .map(tool_display_name)
+                    .unwrap_or_else(|| "工具调用".to_owned());
+                self.status = format!(
+                    "正在生成 {display} 调用参数（{}）……",
+                    format_bytes(received_bytes)
+                );
             }
             AgentEvent::Approval {
                 call,

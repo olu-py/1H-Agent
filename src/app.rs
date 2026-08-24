@@ -409,15 +409,22 @@ async fn build_app(
 }
 
 fn parse_phase(phase: &str) -> std::result::Result<AgentPhase, ()> {
-    Ok(match phase {
-        "thinking" => AgentPhase::Thinking,
-        "streaming_text" => AgentPhase::StreamingText,
-        "waiting_approval" => AgentPhase::WaitingApproval,
-        "tool_running" => AgentPhase::ToolRunning,
-        "completed" => AgentPhase::Completed,
-        "failed" => AgentPhase::Failed,
-        _ => AgentPhase::Idle,
-    })
+    // The snapshot carries the `AgentPhase::label()` output (uppercase, e.g.
+    // "THINKING" / "STREAMING_TOOL_CALL"); compare case-insensitively so the
+    // snapshot merge never resets a live phase to Idle. Unknown phases keep the
+    // current projection state (Err) instead of clobbering it.
+    let normalized = phase.to_ascii_lowercase();
+    match normalized.as_str() {
+        "idle" => Ok(AgentPhase::Idle),
+        "thinking" => Ok(AgentPhase::Thinking),
+        "streaming_text" => Ok(AgentPhase::StreamingText),
+        "streaming_tool_call" => Ok(AgentPhase::StreamingToolCall),
+        "waiting_approval" => Ok(AgentPhase::WaitingApproval),
+        "tool_running" => Ok(AgentPhase::ToolRunning),
+        "completed" => Ok(AgentPhase::Completed),
+        "failed" => Ok(AgentPhase::Failed),
+        _ => Err(()),
+    }
 }
 
 async fn home_event_loop(
@@ -2766,6 +2773,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_call_streaming_is_visible_on_the_screen() {
+        let (mut app, _temp) = test_app().await;
+        let session = app.current.session_id.clone();
+        let mut cursor = app.event_cursor;
+        let mut push = |app: &mut App, event: ProtocolEvent| {
+            cursor += 1;
+            handle_envelope(
+                app,
+                &Envelope {
+                    cursor,
+                    session_id: session.clone(),
+                    event,
+                },
+            );
+        };
+        push(&mut app, ProtocolEvent::ModelStreaming);
+        push(
+            &mut app,
+            ProtocolEvent::ReasoningDelta {
+                delta: "推演过程".into(),
+            },
+        );
+        push(&mut app, ProtocolEvent::ReasoningCompleted);
+        push(
+            &mut app,
+            ProtocolEvent::TextDelta {
+                delta: "正文".into(),
+            },
+        );
+        push(
+            &mut app,
+            ProtocolEvent::ToolCallStreaming {
+                name: Some("file_write".into()),
+                received_bytes: 9216,
+            },
+        );
+        assert_eq!(app.current.agent_phase, AgentPhase::StreamingToolCall);
+        assert!(
+            app.current.status.contains("文件修改"),
+            "status must name the tool; got: {}",
+            app.current.status
+        );
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| ui::draw(frame, &mut app))
+            .expect("draw");
+        let content = terminal.backend().buffer().content().to_vec();
+        let text: String = content.iter().map(|cell| cell.symbol()).collect();
+        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(
+            compact.contains("生成工具调用"),
+            "the generating-tool row must be visible; got: {text:?}"
+        );
+        assert!(
+            compact.contains("文件修改") && compact.contains("9.0KB"),
+            "the row must show the tool name and human-readable bytes; got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn live_refresh_does_not_advance_unprocessed_event_cursor() {
         let (mut app, _temp) = test_app().await;
         let processed = app.event_cursor;
@@ -2876,6 +2945,16 @@ mod tests {
         assert!(!should_coalesce_stream_redraw(
             &session,
             &envelope(ProtocolEvent::ReasoningCompleted),
+        ));
+        // Tool-call streaming progress is low-frequency and phase-forming: it is
+        // never coalesced so the animated "generating tool call" row appears on
+        // its own frame instead of waiting for the 16ms window.
+        assert!(!should_coalesce_stream_redraw(
+            &session,
+            &envelope(ProtocolEvent::ToolCallStreaming {
+                name: Some("file_write".into()),
+                received_bytes: 9216,
+            }),
         ));
         // Events for a background session never force an immediate repaint of
         // the active view through this path.

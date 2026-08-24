@@ -125,6 +125,8 @@ pub fn activity_view(app: &App) -> ActivityView {
         (ActivityState::Waiting, "●", "正在思考".into())
     } else if app.current.agent_phase == AgentPhase::StreamingText {
         (ActivityState::Working, "●", "正在生成回复".into())
+    } else if app.current.agent_phase == AgentPhase::StreamingToolCall {
+        (ActivityState::Working, "●", "正在生成工具调用".into())
     } else if app.current.agent_phase == AgentPhase::Completed {
         (ActivityState::Success, "✓", "已完成".into())
     } else if app.current.status.contains("已取消") {

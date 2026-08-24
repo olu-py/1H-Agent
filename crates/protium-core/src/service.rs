@@ -1058,6 +1058,13 @@ fn routed_to_event(event: &AgentEvent) -> Option<Event> {
         AgentEvent::TextDelta(delta) => Event::TextDelta {
             delta: delta.clone(),
         },
+        AgentEvent::ToolCallStreaming {
+            name,
+            received_bytes,
+        } => Event::ToolCallStreaming {
+            name: name.clone(),
+            received_bytes: *received_bytes,
+        },
         AgentEvent::Approval { .. } => return None,
         AgentEvent::ToolStarted(call) => Event::ToolStarted { call: call.clone() },
         AgentEvent::ToolFinished { call, result } => Event::ToolFinished {
