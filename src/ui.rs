@@ -677,6 +677,7 @@ fn render_message_lines(app: &mut App, width: usize) -> RenderedMessageLines {
         let (label, role) = match &entry.kind {
             DisplayKind::User => ("用户", VisualRole::User),
             DisplayKind::Assistant => ("Agent", VisualRole::Accent),
+            DisplayKind::AssistantPartial => ("Agent（未完成）", VisualRole::Warning),
             DisplayKind::Thinking => ("思考摘要", VisualRole::Thinking),
             DisplayKind::Tool => ("工具", VisualRole::Tool),
             DisplayKind::Error => ("错误", VisualRole::Danger),

@@ -79,6 +79,12 @@ pub struct ProviderConfig {
     pub use_previous_response_id: bool,
     pub native_web_search: NativeWebSearch,
     pub context_window_tokens: Option<u64>,
+    /// Hard cap on the model's output tokens. When set it is both the output
+    /// reservation subtracted from the safe input budget and the per-request
+    /// provider limit (`max_output_tokens` on Responses, `max_completion_tokens`
+    /// on OpenAI chat, `max_tokens` on other chat providers). `None` lets the
+    /// provider pick its default.
+    pub max_output_tokens: Option<u32>,
     pub thinking: ThinkingCapability,
     pub thinking_level: ThinkingLevel,
     pub thinking_budget_tokens: Option<u32>,
@@ -519,6 +525,7 @@ impl Default for ProviderConfig {
             use_previous_response_id: false,
             native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
+            max_output_tokens: None,
             thinking: ThinkingCapability::Auto,
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
@@ -591,6 +598,14 @@ impl Config {
                 anyhow::bail!("provider.context_window_tokens must be at least 4096");
             }
             config.provider.context_window_tokens = Some(limit.min(10_000_000));
+        }
+        if let Some(limit) = config.provider.max_output_tokens {
+            // 0 disables the cap (provider default); otherwise bounded 64..=64_000.
+            config.provider.max_output_tokens = if limit == 0 {
+                None
+            } else {
+                Some(limit.clamp(64, 64_000))
+            };
         }
         if config.browser.timeout_seconds == 0 || config.browser.timeout_seconds > 3600 {
             anyhow::bail!("browser timeout must be between 1 and 3600 seconds");
@@ -739,9 +754,14 @@ impl ProviderConfig {
             self.thinking_budget_tokens = None;
         }
     }
+    /// The model's context window: an explicit `context_window_tokens` always
+    /// wins; otherwise the provider-aware registry is consulted. Returns `None`
+    /// for models the registry does not know, so no request is sent against an
+    /// uncertain default window — an unknown model must set
+    /// `context_window_tokens` explicitly.
     pub fn resolved_context_window_tokens(&self) -> Option<u64> {
         self.context_window_tokens
-            .or_else(|| Some(known_context_window(self.preset, &self.model)))
+            .or_else(|| known_context_window(self.preset, &self.model))
     }
 
     pub fn validate(&mut self) -> Result<()> {
@@ -836,6 +856,7 @@ impl ProviderPreset {
             use_previous_response_id: false,
             native_web_search: NativeWebSearch::Auto,
             context_window_tokens: None,
+            max_output_tokens: None,
             thinking: ThinkingCapability::Auto,
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
@@ -912,8 +933,6 @@ const QWEN_SELECTABLE_MODELS: &[&str] = &[
 
 const VOLCANO_SELECTABLE_MODELS: &[&str] =
     &["doubao-seed-2-1-pro-260628", "deepseek-v4-flash", "glm-5.2"];
-
-const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 258_000;
 
 #[derive(Clone, Copy)]
 struct ModelRule {
@@ -1242,9 +1261,9 @@ const VOLCANO_PREFIX_MODELS: &[ModelRule] = &[
     },
 ];
 
-fn known_context_window(preset: ProviderPreset, model: &str) -> u64 {
+fn known_context_window(preset: ProviderPreset, model: &str) -> Option<u64> {
     let model = model.trim().to_ascii_lowercase();
-    let matched = match preset {
+    match preset {
         ProviderPreset::OpenAi => {
             lookup_model_window(&model, OPENAI_EXACT_MODELS, OPENAI_PREFIX_MODELS)
         }
@@ -1261,8 +1280,7 @@ fn known_context_window(preset: ProviderPreset, model: &str) -> u64 {
                 .or_else(|| lookup_model_window(&model, QWEN_EXACT_MODELS, QWEN_PREFIX_MODELS))
                 .or_else(|| lookup_model_window(&model, &[], VOLCANO_PREFIX_MODELS))
         }
-    };
-    matched.unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+    }
 }
 
 fn lookup_model_window(model: &str, exact: &[ModelRule], prefixes: &[ModelRule]) -> Option<u64> {
@@ -1671,7 +1689,6 @@ model = "qwen3.7-plus"
             (ProviderPreset::Volcano, "doubao-seed-2.0-lite", 256_000),
             (ProviderPreset::Volcano, "kimi-k2.6", 256_000),
             (ProviderPreset::Volcano, "kimi-k2.5", 256_000),
-            (ProviderPreset::Volcano, "other-model-256k", 258_000),
             (ProviderPreset::Custom, "gpt-5-mini", 400_000),
             (ProviderPreset::Custom, "deepseek-chat", 128_000),
             (ProviderPreset::Custom, "qwen3-32b", 131_072),
@@ -1681,7 +1698,6 @@ model = "qwen3.7-plus"
                 256_000,
             ),
             (ProviderPreset::Custom, "deepseek-v4-flash", 1_000_000),
-            (ProviderPreset::Custom, "vendor-model-128k", 258_000),
         ];
         for (preset, model, expected) in cases {
             let mut provider = preset.defaults();
@@ -1691,31 +1707,57 @@ model = "qwen3.7-plus"
     }
 
     #[test]
+    fn unknown_models_return_no_window_without_explicit_override() {
+        // An unrecognized model must never resolve to an uncertain default
+        // window: requests must not be sized against a made-up capacity.
+        for (preset, model) in [
+            (ProviderPreset::Volcano, "other-model-256k"),
+            (ProviderPreset::Custom, "vendor-model-128k"),
+            (ProviderPreset::Custom, "unknown-32k"),
+            (ProviderPreset::OpenAi, "o3foobar"),
+            (ProviderPreset::Qwen, "qwen-plusfake"),
+            (ProviderPreset::OpenAi, "gpt-5fake"),
+        ] {
+            let mut provider = preset.defaults();
+            provider.model = model.into();
+            assert_eq!(provider.resolved_context_window_tokens(), None);
+        }
+        // An explicit override still wins for the same unknown model.
+        let mut provider = ProviderPreset::Custom.defaults();
+        provider.model = "vendor-model-128k".into();
+        provider.context_window_tokens = Some(128_000);
+        assert_eq!(provider.resolved_context_window_tokens(), Some(128_000));
+    }
+
+    #[test]
     fn exact_model_rules_win_and_prefixes_use_longest_match() {
         assert_eq!(
             known_context_window(ProviderPreset::OpenAi, "O1-MINI"),
-            128_000
+            Some(128_000)
         );
         assert_eq!(
             known_context_window(ProviderPreset::OpenAi, "gpt-4.1-mini"),
-            1_047_576
+            Some(1_047_576)
         );
         assert_eq!(
             known_context_window(ProviderPreset::DeepSeek, "deepseek-r1"),
-            128_000
+            Some(128_000)
         );
-        assert_eq!(known_context_window(ProviderPreset::Qwen, "qwen3"), 131_072);
+        assert_eq!(
+            known_context_window(ProviderPreset::Qwen, "qwen3"),
+            Some(131_072)
+        );
         assert_eq!(
             known_context_window(ProviderPreset::OpenAi, "o3foobar"),
-            258_000
+            None
         );
         assert_eq!(
             known_context_window(ProviderPreset::Qwen, "qwen-plusfake"),
-            258_000
+            None
         );
         assert_eq!(
             known_context_window(ProviderPreset::OpenAi, "gpt-5fake"),
-            258_000
+            None
         );
     }
 
@@ -1723,11 +1765,11 @@ model = "qwen3.7-plus"
     fn custom_only_uses_explicit_known_vendor_families() {
         assert_eq!(
             known_context_window(ProviderPreset::Custom, "gpt-5"),
-            400_000
+            Some(400_000)
         );
         assert_eq!(
             known_context_window(ProviderPreset::Custom, "unknown-32k"),
-            258_000
+            None
         );
     }
 

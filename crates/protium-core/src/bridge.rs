@@ -34,6 +34,34 @@ pub enum ReplayResult {
     ResyncRequired,
 }
 
+/// An atomic live subscription plus the buffered events that preceded it.
+///
+/// Returned by [`EventBridge::subscribe_from`]. `replay` holds every event with
+/// a cursor strictly after the consumer's last-processed cursor that existed
+/// when the ring boundary was snapshotted; `live` delivers every event pushed
+/// after the receiver was created. An event pushed between the two steps (the
+/// receiver creation and the boundary snapshot) is delivered in **both** `replay`
+/// and `live`, so consumers must deduplicate by cursor — skip live events whose
+/// cursor is `<=` the last cursor they processed from `replay`.
+pub struct Subscription {
+    pub replay: Vec<Arc<Envelope>>,
+    pub live: broadcast::Receiver<Arc<Envelope>>,
+}
+
+/// The requested replay cursor was evicted from the ring; the consumer must
+/// refetch the snapshot and message page and subscribe again from the fresh
+/// cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResyncRequired;
+
+impl core::fmt::Display for ResyncRequired {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "event cursor evicted; resync required")
+    }
+}
+
+impl std::error::Error for ResyncRequired {}
+
 /// Default maximum number of events retained in the ring.
 pub const DEFAULT_MAX_EVENTS: usize = 512;
 /// Default maximum total bytes retained in the ring.
@@ -71,6 +99,7 @@ fn event_payload_bytes(event: &Event) -> usize {
     use crate::protocol::Event as E;
     match event {
         E::ReasoningDelta { delta } => string_bytes(delta),
+        E::ReasoningCompleted => 0,
         E::ProviderRetry {
             reason, delay_ms, ..
         } => string_bytes(reason) + 16 + (*delay_ms as usize / 16),
@@ -124,6 +153,7 @@ fn event_payload_bytes(event: &Event) -> usize {
             })
             .sum(),
         E::TranscriptInvalidated => 0,
+        E::ContextUpdated { .. } => 48,
         E::ResyncRequired => 0,
     }
 }
@@ -230,6 +260,53 @@ impl EventBridge {
         )
     }
 
+    /// Atomically subscribes from a known last-processed cursor.
+    ///
+    /// Subscribes to the live stream first, then snapshots the replay ring under
+    /// its read lock so `replay` covers exactly the events with a cursor
+    /// strictly after `after` that existed at the boundary snapshot. Events
+    /// pushed between the two steps land in both `replay` and `live`; consumers
+    /// deduplicate by cursor (skip live events with `cursor <= last_processed`).
+    ///
+    /// This removes the race in the old "replay then subscribe" pattern, where
+    /// an event pushed between the two calls was neither replayed nor received
+    /// live. Returns [`ResyncRequired`] when `after` has been evicted from the
+    /// ring, in which case the caller must refetch the snapshot and message
+    /// page and subscribe again from the fresh cursor.
+    pub fn subscribe_from(&self, after: u64) -> Result<Subscription, ResyncRequired> {
+        // Subscribe before snapshotting the boundary so anything pushed after
+        // the snapshot is still delivered live (never lost, never double when
+        // deduplicated by cursor).
+        let live = self.tx.subscribe();
+        let ring = self
+            .ring
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The ring and the cursor counter are read under the same read lock, so
+        // no push (which needs the write lock) can interleave: `boundary` is
+        // consistent with the ring contents.
+        let boundary = self.next_cursor.load(Ordering::SeqCst);
+        let Some(oldest) = ring.events.front() else {
+            if after < boundary {
+                return Err(ResyncRequired);
+            }
+            return Ok(Subscription {
+                replay: Vec::new(),
+                live,
+            });
+        };
+        if after < oldest.cursor {
+            return Err(ResyncRequired);
+        }
+        let replay = ring
+            .events
+            .iter()
+            .filter(|envelope| envelope.cursor > after && envelope.cursor < boundary)
+            .cloned()
+            .collect();
+        Ok(Subscription { replay, live })
+    }
+
     /// The configured ring capacity (clamped).
     pub fn max_events(&self) -> usize {
         self.max_events
@@ -321,6 +398,26 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_completed_is_replayed_in_order_with_zero_payload() {
+        let bridge = EventBridge::new(64, DEFAULT_MAX_BYTES);
+        // Leading event occupies cursor 0 so the replay-after-0 starts at the
+        // reasoning sequence.
+        bridge.push("a".into(), text("lead"));
+        bridge.push("a".into(), Event::ReasoningDelta { delta: "d".into() });
+        bridge.push("a".into(), Event::ReasoningCompleted);
+        bridge.push("a".into(), text("answer"));
+        match bridge.replay_after(0) {
+            ReplayResult::Replay(events) => {
+                assert_eq!(events.len(), 3);
+                assert!(matches!(events[0].event, Event::ReasoningDelta { .. }));
+                assert!(matches!(events[1].event, Event::ReasoningCompleted));
+                assert!(matches!(events[2].event, Event::TextDelta { .. }));
+            }
+            ReplayResult::ResyncRequired => panic!("cursor 0 must still be buffered"),
+        }
+    }
+
+    #[test]
     fn live_broadcast_carries_arc_envelopes() {
         let bridge = EventBridge::new(64, DEFAULT_MAX_BYTES);
         let mut receiver = bridge.subscribe();
@@ -329,5 +426,79 @@ mod tests {
         assert_eq!(received.cursor, pushed.cursor);
         assert_eq!(received.session_id, "s");
         assert!(Arc::ptr_eq(&received, &pushed));
+    }
+
+    #[test]
+    fn subscribe_from_replays_then_streams_live_without_gap() {
+        let bridge = EventBridge::new(64, DEFAULT_MAX_BYTES);
+        for i in 0..5 {
+            bridge.push("a".into(), text(&format!("{i}")));
+        }
+        let Subscription { replay, mut live } = bridge.subscribe_from(2).unwrap();
+        // Cursors 0..=4 are pushed; replay is strictly after 2 and before the
+        // boundary (the next cursor to assign, 5), so 3 and 4.
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].cursor, 3);
+        assert_eq!(replay[1].cursor, 4);
+        // An event pushed after the atomic subscription arrives live only.
+        let pushed = bridge.push("a".into(), text("5"));
+        let received = live.try_recv().expect("live event after subscribe");
+        assert_eq!(received.cursor, pushed.cursor);
+        assert_eq!(received.cursor, 5);
+    }
+
+    #[test]
+    fn subscribe_from_from_current_cursor_replays_nothing() {
+        let bridge = EventBridge::new(64, DEFAULT_MAX_BYTES);
+        for i in 0..5 {
+            bridge.push("a".into(), text(&format!("{i}")));
+        }
+        let Subscription { replay, .. } = bridge.subscribe_from(5).unwrap();
+        assert!(replay.is_empty());
+    }
+
+    #[test]
+    fn subscribe_from_evicted_cursor_requires_resync() {
+        let bridge = EventBridge::new(16, DEFAULT_MAX_BYTES);
+        for i in 0..32 {
+            bridge.push("a".into(), text(&format!("{i}")));
+        }
+        assert!(matches!(bridge.subscribe_from(15), Err(ResyncRequired)));
+        // The oldest retained cursor succeeds.
+        assert!(bridge.subscribe_from(16).is_ok());
+    }
+
+    #[test]
+    fn subscribe_from_duplicate_overlap_is_deduplicatable_by_cursor() {
+        // An event pushed between the live subscription and the ring snapshot
+        // lands in both `replay` and `live`; consumers skip any live event whose
+        // cursor is <= the last cursor processed from `replay`. Exercised with
+        // the consumer-side rule so the gapless, exactly-once property holds.
+        let bridge = EventBridge::new(64, DEFAULT_MAX_BYTES);
+        for i in 0..5 {
+            bridge.push("a".into(), text(&format!("{i}")));
+        }
+        let Subscription { replay, live } = bridge.subscribe_from(2).unwrap();
+        let mut last = 2;
+        let mut applied: Vec<u64> = Vec::new();
+        for envelope in &replay {
+            if envelope.cursor > last {
+                applied.push(envelope.cursor);
+                last = envelope.cursor;
+            }
+        }
+        assert_eq!(applied, vec![3, 4]);
+        // Fresh live events (cursors 5, 6) pass the rule.
+        let mut live = live;
+        bridge.push("a".into(), text("5"));
+        bridge.push("a".into(), text("6"));
+        while let Ok(envelope) = live.try_recv() {
+            if envelope.cursor > last {
+                applied.push(envelope.cursor);
+                last = envelope.cursor;
+            }
+        }
+        assert_eq!(applied, vec![3, 4, 5, 6]);
+        assert_eq!(last, 6);
     }
 }

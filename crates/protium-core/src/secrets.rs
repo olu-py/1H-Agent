@@ -134,6 +134,14 @@ pub fn redact(input: &str) -> String {
         .join(" ")
 }
 
+/// Seeds the process key cache with a fake key. Test-only: makes `build_app`
+/// create a runner without touching the OS keyring, so core tests are
+/// deterministic regardless of what other tests cached.
+#[cfg(test)]
+pub fn test_seed_key(preset: ProviderPreset, api_key: &str) {
+    remember_key(preset, Ok(api_key.to_owned()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

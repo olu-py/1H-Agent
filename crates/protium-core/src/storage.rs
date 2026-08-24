@@ -169,6 +169,8 @@ impl Storage {
             VALUES (4, CURRENT_TIMESTAMP);
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (5, CURRENT_TIMESTAMP);
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (6, CURRENT_TIMESTAMP);
             ",
         )?;
         // These checks keep databases created by the first release compatible
@@ -204,6 +206,16 @@ impl Storage {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&connection, "messages", "metadata", "TEXT")?;
+        // `assistant_partial`: a persisted incomplete assistant answer (0/1).
+        // Partial rows are written on interruption/failure/cancel, cleared on
+        // normal completion, and filtered out of the normal history page so a
+        // partial never re-enters context or previous_response_id replay.
+        ensure_column(
+            &connection,
+            "messages",
+            "partial",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         backfill_turns(&connection)?;
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, CURRENT_TIMESTAMP)",
@@ -381,6 +393,65 @@ impl Storage {
             return append_message_on_turn(&connection, session_id, &child, role, content);
         }
         append_message_on_turn(&connection, session_id, &turn_id, role, content)
+    }
+
+    /// Persists the incomplete assistant answer for a session, replacing any
+    /// previous partial. Written on stream interruption, provider failure or
+    /// user cancellation; cleared on normal completion.
+    pub fn save_partial(&self, session_id: &str, content: &str) -> Result<(), StorageError> {
+        let content = content.trim();
+        if content.is_empty() {
+            return self.clear_partial(session_id);
+        }
+        let connection = self.lock()?;
+        let tx = connection.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND partial = 1",
+            [session_id],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO messages(session_id, role, content, created_at, turn_id, kind, hidden, partial) VALUES (?1, 'assistant', ?2, ?3, NULL, 'message', 0, 1)",
+            params![session_id, content, now],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session_id, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted incomplete assistant answer for a session, if any.
+    pub fn load_partial(&self, session_id: &str) -> Result<Option<StoredMessage>, StorageError> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT id, role, content, kind, metadata, created_at FROM messages WHERE session_id = ?1 AND partial = 1 ORDER BY id DESC LIMIT 1",
+                [session_id],
+                |row| {
+                    Ok(StoredMessage {
+                        id: row.get(0)?,
+                        role: row.get(1)?,
+                        content: row.get(2)?,
+                        kind: row.get(3)?,
+                        metadata: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Removes the persisted partial answer for a session (used when a formal
+    /// assistant message replaces it or when the session is cleared).
+    pub fn clear_partial(&self, session_id: &str) -> Result<(), StorageError> {
+        self.lock()?.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND partial = 1",
+            [session_id],
+        )?;
+        Ok(())
     }
 
     pub fn append_context(
@@ -1051,7 +1122,7 @@ impl Storage {
                  WHERE turns.parent_id IS NOT NULL
              )
              SELECT id, role, content, kind, metadata, created_at FROM messages
-             WHERE session_id = ?1 AND hidden = 0
+             WHERE session_id = ?1 AND hidden = 0 AND partial = 0
                AND (turn_id IN (SELECT id FROM chain) OR turn_id IS NULL)
                AND (?2 IS NULL OR id < ?2)
              ORDER BY id DESC
@@ -1678,5 +1749,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn partial_is_saved_replaced_loaded_and_cleared() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+
+        assert!(storage.load_partial(&session).unwrap().is_none());
+
+        storage.save_partial(&session, "half an answer").unwrap();
+        let partial = storage.load_partial(&session).unwrap().unwrap();
+        assert_eq!(partial.content, "half an answer");
+        assert_eq!(partial.role, "assistant");
+
+        // Saving again replaces the previous partial.
+        storage
+            .save_partial(&session, "half an answer, continued")
+            .unwrap();
+        let partial = storage.load_partial(&session).unwrap().unwrap();
+        assert_eq!(partial.content, "half an answer, continued");
+
+        // Clearing removes it.
+        storage.clear_partial(&session).unwrap();
+        assert!(storage.load_partial(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_is_filtered_from_history_page_and_does_not_trip_cursor() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+
+        storage
+            .append_message(&session, Role::User, "first")
+            .unwrap();
+        storage
+            .append_message(&session, Role::User, "second")
+            .unwrap();
+        storage.save_partial(&session, "incomplete answer").unwrap();
+
+        // The normal history page excludes the partial row.
+        let page = storage.load_message_page(&session, None, 100).unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().all(|row| row.content != "incomplete answer"));
+    }
+
+    #[test]
+    fn empty_partial_clears_existing_partial() {
+        let storage = Storage::in_memory().unwrap();
+        let root = tempdir().unwrap();
+        let session = storage.create_session(root.path()).unwrap();
+        storage.save_partial(&session, "some text").unwrap();
+        storage.save_partial(&session, "   ").unwrap();
+        assert!(storage.load_partial(&session).unwrap().is_none());
     }
 }

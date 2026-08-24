@@ -4,6 +4,7 @@ use std::{
     io,
     path::PathBuf,
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -142,6 +143,12 @@ pub struct App {
     /// True while a snapshot/message refetch is pending; suppresses extra
     /// refetches from bursty events.
     pub sync_pending: bool,
+    /// The request sequence of the last submit the facade started, per session.
+    /// Passed to `cancel` so a stale cancel never aborts a newer request.
+    pub request_ids: HashMap<String, u64>,
+    /// Set when the user scrolled to the top of the loaded history and older
+    /// messages exist; the event loop drains it into `load_older_history`.
+    pub history_load_pending: bool,
 }
 
 pub async fn run(workspace_path: PathBuf, mut config: Config) -> Result<()> {
@@ -393,6 +400,8 @@ async fn build_app(
         event_cursor: snapshot.event_cursor,
         should_quit: false,
         sync_pending: false,
+        request_ids: HashMap::new(),
+        history_load_pending: false,
     };
     app.sync_from_snapshot(&snapshot);
     app.load_history().await?;
@@ -436,12 +445,7 @@ async fn event_loop(
     app: &mut App,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
-    let (replay, mut live) = app.handle.subscribe_from(app.event_cursor);
-    if let protium_core::bridge::ReplayResult::ResyncRequired = replay {
-        app.sync_all().await?;
-    } else {
-        // Replayed envelopes are processed by the facade below.
-    }
+    let mut live = subscribe_live(app).await?;
     let mut edge_scroll_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut thinking_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
     let mut deferred_redraw_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
@@ -526,6 +530,11 @@ async fn event_loop(
                         if let Some(sequence) = outcome.osc52 {
                             execute!(terminal.backend_mut(), Print(sequence))?;
                         }
+                        // Scrolling to the top of the loaded history requests
+                        // the previous page; drained in the sync phase below.
+                        if app.current.at_history_top() {
+                            app.history_load_pending = true;
+                        }
                     }
                     Some(Err(error)) => return Err(error.into()),
                     None => break,
@@ -534,15 +543,25 @@ async fn event_loop(
             envelope = live.recv() => {
                 match envelope {
                     Ok(envelope) => {
-                        let coalesce = should_coalesce_stream_redraw(&app.active_session, &envelope);
-                        redraw = handle_envelope(app, &envelope);
-                        if redraw && coalesce {
-                            schedule_deferred_redraw(&mut deferred_redraw_timer);
-                            redraw = false;
+                        if envelope.cursor > app.event_cursor {
+                            let coalesce = should_coalesce_stream_redraw(&app.active_session, &envelope);
+                            redraw = handle_envelope(app, &envelope);
+                            app.event_cursor = envelope.cursor;
+                            if redraw && coalesce {
+                                schedule_deferred_redraw(&mut deferred_redraw_timer);
+                                redraw = false;
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        app.sync_pending = true;
+                        // The receiver fell behind the live broadcast. Refetch
+                        // snapshot + message page and subscribe with a fresh
+                        // receiver from the new cursor; never keep consuming the
+                        // stale one.
+                        app.sync_pending = false;
+                        app.resync_all().await?;
+                        live = subscribe_live(app).await?;
+                        redraw = true;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -556,16 +575,59 @@ async fn event_loop(
             app.sync_all().await?;
             terminal.draw(|frame| ui::draw(frame, app))?;
         }
+        if app.history_load_pending {
+            app.history_load_pending = false;
+            app.load_older_history().await?;
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
     }
     Ok(())
 }
 
+/// Establishes a live subscription from the facade's last-processed cursor.
+/// The bridge subscribes atomically (live first, then ring snapshot), so every
+/// event pushed between the snapshot and the subscription is replayed exactly
+/// once. When the cursor has been evicted the facade refetches the snapshot and
+/// message page and retries from the fresh cursor. Returns a new live receiver.
+async fn subscribe_live(app: &mut App) -> Result<tokio::sync::broadcast::Receiver<Arc<Envelope>>> {
+    loop {
+        match app.handle.subscribe_from(app.event_cursor) {
+            Ok(subscription) => {
+                // Replay buffered events first, advancing the processed cursor
+                // so overlapping live deliveries are deduplicated.
+                for envelope in &subscription.replay {
+                    if envelope.cursor > app.event_cursor {
+                        handle_envelope(app, envelope);
+                        app.event_cursor = envelope.cursor;
+                    }
+                }
+                return Ok(subscription.live);
+            }
+            Err(protium_core::bridge::ResyncRequired) => {
+                // The requested cursor is gone; rebuild from a fresh snapshot
+                // and message page before subscribing again.
+                app.resync_all().await?;
+            }
+        }
+    }
+}
+
+/// Whether a stream event for the active session may be batched into the 16ms
+/// coalescing window instead of forcing an immediate repaint.
+///
+/// `ReasoningCompleted` is a phase barrier: it retires the thinking view and
+/// must be drawn on its own so the user sees a frame with only the finished
+/// thinking summary before the answer body starts streaming below it. It is
+/// therefore never coalesced — the frame is painted right away.
 fn should_coalesce_stream_redraw(active_session: &str, envelope: &Envelope) -> bool {
-    envelope.session_id == active_session
-        && matches!(
-            &envelope.event,
-            ProtocolEvent::TextDelta { .. } | ProtocolEvent::ReasoningDelta { .. }
-        )
+    if envelope.session_id != active_session {
+        return false;
+    }
+    match &envelope.event {
+        ProtocolEvent::TextDelta { .. } | ProtocolEvent::ReasoningDelta { .. } => true,
+        ProtocolEvent::ReasoningCompleted => false,
+        _ => false,
+    }
 }
 
 fn should_coalesce_terminal_redraw(event: &Event) -> bool {
@@ -1625,7 +1687,8 @@ impl App {
     async fn cancel(&mut self) -> Result<()> {
         let session_id = self.current.session_id.clone();
         if !session_id.is_empty() {
-            self.handle.cancel(&session_id).await?;
+            let request_seq = self.request_ids.get(&session_id).copied();
+            self.handle.cancel(&session_id, request_seq).await?;
         }
         self.current.reset_thinking_state();
         self.current.busy = false;
@@ -1677,12 +1740,20 @@ impl App {
                 return Ok(());
             }
             let session_id = self.current.session_id.clone();
-            self.input.clear();
+            // Do not clear the input until the core has accepted the message:
+            // on a busy session, missing API key or rejected command the user
+            // keeps their text.
             self.file_suggestions.clear();
-            if let Err(error) = self.handle.submit(Some(session_id), &input).await {
-                self.current.status = secrets::redact(&error.message);
-                return Ok(());
+            match self.handle.submit(Some(session_id.clone()), &input).await {
+                Ok(request_id) => {
+                    self.request_ids.insert(session_id, request_id);
+                }
+                Err(error) => {
+                    self.current.status = secrets::redact(&error.message);
+                    return Ok(());
+                }
             }
+            self.input.clear();
             self.sync_all().await?;
             return Ok(());
         }
@@ -1805,6 +1876,47 @@ impl App {
 }
 
 fn handle_envelope(app: &mut App, envelope: &Envelope) -> bool {
+    let approval_redraw = match &envelope.event {
+        ProtocolEvent::Approval {
+            approval_id,
+            call,
+            reason,
+            source_title,
+            ..
+        } => {
+            // The modal reads the facade's global oldest approval, while the
+            // projection only owns active-session display state. Populate the
+            // global slot directly from the live event so an agent cannot wait
+            // invisibly until the server-side approval timeout. A newer event
+            // must not replace an older approval already being shown.
+            if app.approval.is_none() {
+                app.approval = Some(ApprovalDisplay {
+                    approval_id: approval_id.clone(),
+                    call: call.clone(),
+                    reason: reason.clone(),
+                    source_session_id: Some(envelope.session_id.clone()),
+                    source_title: source_title.clone(),
+                    created_at: std::time::Instant::now(),
+                });
+            }
+            true
+        }
+        ProtocolEvent::ApprovalResolved { approval_id, .. } => {
+            if app
+                .approval
+                .as_ref()
+                .is_some_and(|approval| approval.approval_id == *approval_id)
+            {
+                app.approval = None;
+            }
+            // The resolved approval may expose another pending approval behind
+            // it. Refresh the authoritative global-oldest slot without moving
+            // the live event cursor (sync_snapshot preserves it).
+            app.sync_pending = true;
+            true
+        }
+        _ => false,
+    };
     match &envelope.event {
         ProtocolEvent::SessionsChanged | ProtocolEvent::ResyncRequired => {
             app.sync_pending = true;
@@ -1835,7 +1947,10 @@ fn handle_envelope(app: &mut App, envelope: &Envelope) -> bool {
                 if outcome.sessions_dirty || outcome.transcript_dirty {
                     app.sync_pending = true;
                 }
-                outcome.force_redraw || outcome.transcript_dirty || outcome.sessions_dirty
+                approval_redraw
+                    || outcome.force_redraw
+                    || outcome.transcript_dirty
+                    || outcome.sessions_dirty
             } else {
                 // Background session events only affect the session list.
                 app.sync_pending = true;
@@ -1846,10 +1961,14 @@ fn handle_envelope(app: &mut App, envelope: &Envelope) -> bool {
 }
 
 impl App {
-    /// Merges a fresh snapshot into the facade without touching history.
-    /// Transient streaming state in the projection is preserved.
-    pub(crate) fn sync_from_snapshot(&mut self, snapshot: &AppSnapshotV2) {
-        self.event_cursor = snapshot.event_cursor;
+    /// Merges snapshot state into the facade. `advance_cursor` is only true
+    /// when the caller is establishing a new event-stream baseline; a normal
+    /// refresh while the live stream is active must not skip envelopes that
+    /// have reached the bridge but have not yet been rendered.
+    fn merge_snapshot(&mut self, snapshot: &AppSnapshotV2, advance_cursor: bool) {
+        if advance_cursor {
+            self.event_cursor = snapshot.event_cursor;
+        }
         if let Some(session_id) = &snapshot.active_session {
             if !self.current.session_id.is_empty() && self.current.session_id != *session_id {
                 // The active session changed: rebuild the projection shell.
@@ -1878,6 +1997,15 @@ impl App {
             }
         }
         self.current.mode = AgentMode::parse(&snapshot.mode).unwrap_or(self.current.mode);
+        if let Some(context) = &snapshot.context {
+            self.current.context_budget = Some(context.clone());
+            self.current.context_limit_tokens = context.context_window_tokens;
+            self.current.context_used_tokens = context.used_tokens;
+        }
+        // Render a persisted incomplete answer (surviving a restart) once, and
+        // drop it once the core clears the partial (normal completion).
+        self.current
+            .sync_partial(snapshot.assistant_partial.as_ref());
         self.sessions = snapshot.sessions.iter().map(session_summary).collect();
         self.approval = snapshot.approval.as_ref().map(approval_display);
         self.current.todos = snapshot
@@ -1909,25 +2037,56 @@ impl App {
         }
     }
 
+    pub(crate) fn sync_from_snapshot(&mut self, snapshot: &AppSnapshotV2) {
+        self.merge_snapshot(snapshot, true);
+    }
+
     /// Refetches the snapshot and merges it into the facade. Never touches
     /// the live history; call [`App::load_history`] separately when the
     /// transcript changed.
     pub(crate) async fn sync_snapshot(&mut self) -> Result<()> {
         let snapshot = self.handle.snapshot().await?;
-        self.sync_from_snapshot(&snapshot);
+        self.merge_snapshot(&snapshot, false);
         Ok(())
     }
 
-    /// Refetches the message page for the active session and replaces the
-    /// projection history from the database.
+    /// Refetches state after the event cursor has been evicted or a broadcast
+    /// receiver has lagged. The snapshot becomes the new replay baseline.
+    pub(crate) async fn resync_all(&mut self) -> Result<()> {
+        let snapshot = self.handle.snapshot().await?;
+        self.merge_snapshot(&snapshot, true);
+        self.load_history().await
+    }
+
+    /// Refetches the newest message page for the active session and replaces
+    /// the projection history from the database. The page's `has_more` /
+    /// `next_before` cursors drive subsequent [`Self::load_older_history`]
+    /// calls, so history is no longer capped at a fixed "last 100" snapshot.
     pub(crate) async fn load_history(&mut self) -> Result<()> {
         let session_id = self.current.session_id.clone();
         if session_id.is_empty() {
             return Ok(());
         }
-        let page = self.handle.messages(&session_id, None, Some(100)).await?;
-        let entries = TuiSessionProjection::message_dto_to_entries(&page.messages);
-        self.current.replace_history(entries);
+        let page = self.handle.messages(&session_id, None, None).await?;
+        self.current.apply_message_page(&page, false);
+        Ok(())
+    }
+
+    /// Loads the next older message page and prepends it, anchoring the scroll
+    /// so the visible content stays put. No-op when the head is fully loaded.
+    pub(crate) async fn load_older_history(&mut self) -> Result<()> {
+        let session_id = self.current.session_id.clone();
+        if session_id.is_empty() || !self.current.history_has_more {
+            return Ok(());
+        }
+        let Some(before) = self.current.history_next_before else {
+            return Ok(());
+        };
+        let page = self
+            .handle
+            .messages(&session_id, Some(before), None)
+            .await?;
+        self.current.apply_message_page(&page, true);
         Ok(())
     }
 
@@ -2515,6 +2674,7 @@ async fn remove_settings_provider(app: &mut App) -> Result<()> {
 mod tests {
     use super::*;
     use protium_core::config::Config;
+    use protium_core::provider::ToolCall;
     use ratatui::backend::TestBackend;
     use tempfile::tempdir;
 
@@ -2554,6 +2714,233 @@ mod tests {
         let content = terminal.backend().buffer().content().to_vec();
         assert!(!content.is_empty());
         assert!(content.iter().any(|cell| cell.symbol() != " "));
+    }
+
+    #[tokio::test]
+    async fn live_thinking_streams_reasoning_onto_the_screen() {
+        let (mut app, _temp) = test_app().await;
+        let session = app.current.session_id.clone();
+        let mut cursor = app.event_cursor;
+        let mut push = |app: &mut App, event: ProtocolEvent| {
+            cursor += 1;
+            handle_envelope(
+                app,
+                &Envelope {
+                    cursor,
+                    session_id: session.clone(),
+                    event,
+                },
+            );
+        };
+        push(&mut app, ProtocolEvent::ModelStreaming);
+        push(
+            &mut app,
+            ProtocolEvent::ReasoningDelta {
+                delta: "正在检查项目结构".into(),
+            },
+        );
+        push(
+            &mut app,
+            ProtocolEvent::ReasoningDelta {
+                delta: "并确认上下文预算".into(),
+            },
+        );
+        assert!(app.current.thinking_active);
+        assert_eq!(
+            app.current.thinking_buffer,
+            "正在检查项目结构并确认上下文预算"
+        );
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| ui::draw(frame, &mut app))
+            .expect("draw");
+        let content = terminal.backend().buffer().content().to_vec();
+        let text: String = content.iter().map(|cell| cell.symbol()).collect();
+        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(
+            compact.contains("正在检查项目结构"),
+            "live thinking reasoning should be visible on screen; got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_refresh_does_not_advance_unprocessed_event_cursor() {
+        let (mut app, _temp) = test_app().await;
+        let processed = app.event_cursor;
+        let mut snapshot = app.handle.snapshot().await.expect("snapshot");
+        snapshot.event_cursor = processed.saturating_add(100);
+
+        // A refresh issued immediately after submit may race with events that
+        // are already in the bridge. Those envelopes still need to be consumed
+        // by the live subscription, so an ordinary refresh must preserve the
+        // facade's processed cursor.
+        app.merge_snapshot(&snapshot, false);
+        assert_eq!(app.event_cursor, processed);
+
+        // Initial connection/resync explicitly establishes a new baseline.
+        app.merge_snapshot(&snapshot, true);
+        assert_eq!(app.event_cursor, processed + 100);
+    }
+
+    #[tokio::test]
+    async fn live_tool_approval_is_visible_and_resolved_without_waiting_for_snapshot() {
+        let (mut app, _temp) = test_app().await;
+        let session_id = app.current.session_id.clone();
+        let read = ToolCall {
+            id: "read-1".into(),
+            name: "file_list".into(),
+            arguments: serde_json::json!({"path": "."}),
+        };
+        let shell = ToolCall {
+            id: "shell-1".into(),
+            name: "terminal_exec".into(),
+            arguments: serde_json::json!({"program": "pwd"}),
+        };
+        let mut cursor = app.event_cursor;
+        let mut push = |app: &mut App, event: ProtocolEvent| {
+            cursor += 1;
+            handle_envelope(
+                app,
+                &Envelope {
+                    cursor,
+                    session_id: session_id.clone(),
+                    event,
+                },
+            )
+        };
+
+        // Reproduce one model round that first completes an allowed read tool,
+        // then blocks on a command requiring approval.
+        push(&mut app, ProtocolEvent::ToolStarted { call: read.clone() });
+        push(
+            &mut app,
+            ProtocolEvent::ToolFinished {
+                call: read,
+                result: "[]".into(),
+            },
+        );
+        assert!(push(
+            &mut app,
+            ProtocolEvent::Approval {
+                approval_id: "approval-1".into(),
+                call: shell,
+                reason: "command execution requires approval".into(),
+                source_session_id: None,
+                source_title: None,
+            },
+        ));
+        assert!(app.has_pending_approval());
+        assert_eq!(
+            app.pending_approval()
+                .map(|approval| approval.approval_id.as_str()),
+            Some("approval-1")
+        );
+        assert!(app.current.pending_approval.is_some());
+
+        assert!(push(
+            &mut app,
+            ProtocolEvent::ApprovalResolved {
+                approval_id: "approval-1".into(),
+                approved: false,
+            },
+        ));
+        assert!(!app.has_pending_approval());
+        assert!(app.current.pending_approval.is_none());
+        assert!(
+            app.sync_pending,
+            "resolution must refresh the next global-oldest approval"
+        );
+    }
+
+    #[test]
+    fn should_coalesce_stream_redraw_is_a_phase_barrier() {
+        let session = "s1".to_owned();
+        let envelope = |event: ProtocolEvent| Envelope {
+            cursor: 1,
+            session_id: session.clone(),
+            event,
+        };
+        // Body and reasoning deltas stay coalescable into the 16ms window.
+        assert!(should_coalesce_stream_redraw(
+            &session,
+            &envelope(ProtocolEvent::TextDelta { delta: "d".into() }),
+        ));
+        assert!(should_coalesce_stream_redraw(
+            &session,
+            &envelope(ProtocolEvent::ReasoningDelta { delta: "r".into() }),
+        ));
+        // The completion barrier is a phase boundary and must never be batched:
+        // it is painted immediately so the finished thinking view shows alone.
+        assert!(!should_coalesce_stream_redraw(
+            &session,
+            &envelope(ProtocolEvent::ReasoningCompleted),
+        ));
+        // Events for a background session never force an immediate repaint of
+        // the active view through this path.
+        assert!(!should_coalesce_stream_redraw(
+            "other",
+            &envelope(ProtocolEvent::TextDelta { delta: "d".into() }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn reasoning_completed_draws_summary_before_body_frame() {
+        let (mut app, _temp) = test_app().await;
+        let session = app.current.session_id.clone();
+        let mut cursor = app.event_cursor;
+        let mut push = |app: &mut App, event: ProtocolEvent| {
+            cursor += 1;
+            handle_envelope(
+                app,
+                &Envelope {
+                    cursor,
+                    session_id: session.clone(),
+                    event,
+                },
+            );
+        };
+        push(&mut app, ProtocolEvent::ModelStreaming);
+        push(
+            &mut app,
+            ProtocolEvent::ReasoningDelta {
+                delta: "思考摘要文本".into(),
+            },
+        );
+        push(&mut app, ProtocolEvent::ReasoningCompleted);
+
+        let compact_of = |app: &mut App| -> String {
+            let backend = TestBackend::new(120, 40);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal.draw(|frame| ui::draw(frame, app)).expect("draw");
+            let content = terminal.backend().buffer().content().to_vec();
+            let text: String = content.iter().map(|cell| cell.symbol()).collect();
+            text.chars().filter(|ch| !ch.is_whitespace()).collect()
+        };
+
+        // The frame right after the barrier contains the finished summary and no
+        // Agent body yet.
+        let frame = compact_of(&mut app);
+        assert!(
+            frame.contains("思考摘要文本"),
+            "the summary must be visible on the barrier frame; got: {frame:?}"
+        );
+        assert!(
+            !frame.contains("正文"),
+            "no Agent body may appear before the first TextDelta; got: {frame:?}"
+        );
+
+        // The next frame after the first body delta shows summary and body.
+        push(
+            &mut app,
+            ProtocolEvent::TextDelta {
+                delta: "正文".into(),
+            },
+        );
+        let frame = compact_of(&mut app);
+        assert!(frame.contains("思考摘要文本"), "summary must persist");
+        assert!(frame.contains("正文"), "body must stream below the summary");
     }
 
     #[tokio::test]

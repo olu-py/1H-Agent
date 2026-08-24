@@ -90,8 +90,7 @@ pub(crate) async fn build_app(
     {
         let _ = secrets::api_key_cached(provider_config.preset);
     }
-    let (active_secret, initial_status) = match secrets::api_key_cached_only(config.provider.preset)
-    {
+    let (active_secret, initial_status) = match secrets::api_key_cached(config.provider.preset) {
         Ok(api_key) => (
             Some((config.provider.preset, api_key)),
             format!(
@@ -211,10 +210,20 @@ pub(crate) fn cancel_active_request(app: &mut App) {
             let _ = reply.send(false);
         }
     }
+    // Capture the half-generated assistant text (accumulated in the live
+    // entries by TextDelta) and persist it as `assistant_partial` before
+    // aborting, so an interrupted stream survives for review.
+    if let Some(text) = streaming_assistant_text(&app.current.entries)
+        && !text.trim().is_empty()
+    {
+        let _ = app.storage.save_partial(&app.current.session_id, text);
+        let _ = app.storage.clear_response_id(&app.current.session_id);
+    }
     if let Some(task) = app.current.active_task.take() {
         task.abort();
     }
     app.current.finish_thinking("思考已取消");
+    app.current.mark_partial_if_streaming();
     app.current.busy = false;
     app.current.agent_phase = AgentPhase::Idle;
     app.current.model_phase = ModelPhase::Idle;
@@ -223,6 +232,16 @@ pub(crate) fn cancel_active_request(app: &mut App) {
         kind: DisplayKind::System,
         content: DisplayContent::Markdown("当前请求已取消。".into()),
     });
+}
+
+/// The text of the trailing live assistant entry, if one is streaming.
+fn streaming_assistant_text(entries: &[DisplayEntry]) -> Option<&str> {
+    entries.iter().rev().find_map(|entry| match &entry.content {
+        DisplayContent::Markdown(text) if matches!(entry.kind, DisplayKind::Assistant) => {
+            Some(text.as_str())
+        }
+        _ => None,
+    })
 }
 
 pub(crate) fn submit_input(app: &mut App) -> Result<()> {
@@ -259,6 +278,12 @@ pub(crate) fn submit_input(app: &mut App) -> Result<()> {
         app.current.status = "请打开提供商设置配置 API Key".into();
         return Ok(());
     };
+    // A concurrent submit must never overwrite the running `active_task`;
+    // reject it instead (the service layer mirrors this check for non-active
+    // target sessions).
+    if app.current.busy || app.current.active_task.is_some() {
+        return Err(anyhow::anyhow!("session is busy with another request"));
+    }
     app.input.clear();
     app.current.push_entry(DisplayEntry {
         kind: DisplayKind::User,
@@ -283,7 +308,10 @@ pub(crate) fn submit_input(app: &mut App) -> Result<()> {
         });
     }
     refresh_sessions(app)?;
-    trim_conversation(&mut app.current.conversation);
+    // No fixed item/byte trim here: context capacity is the model window minus
+    // the output reservation and system overhead, and overflow is handled by
+    // full-turn compaction (falling back to a hinted hard-limit trim). The
+    // estimated usage below feeds the authoritative context budget.
     app.current.context_used_tokens = estimate_context_tokens(&app.current.conversation);
     app.current.busy = true;
     app.current.agent_phase = AgentPhase::Thinking;
@@ -1049,6 +1077,7 @@ fn build_runtime(
         runner,
         agent_tx,
         active_task: None,
+        request_seq: 0,
         parked_at: Instant::now(),
     }
 }
@@ -1138,6 +1167,18 @@ fn restore_snapshots(app: &mut App, turn_id: &str, direction: SnapshotDirection)
 pub(crate) fn activate_session(app: &mut App, session_id: String) -> Result<()> {
     if session_id == app.active_session {
         return Ok(());
+    }
+    // Explicit resume: the target session may own a different provider than the
+    // currently active one. Unlock that provider's key once (cached per
+    // provider per process) before building its runtime, so the restored
+    // session owns a usable runner even when its key lives only in the keychain.
+    if let Some(provider_config) = app
+        .storage
+        .session_provider_model(&session_id)
+        .ok()
+        .and_then(|(provider_id, model)| session_provider_config(&app.config, &provider_id, &model))
+    {
+        let _ = secrets::api_key_cached(provider_config.preset);
     }
     // Pull the target runtime from the background (preserving any in-flight
     // agent state) or build it fresh; the current runtime is parked so its
@@ -1819,6 +1860,7 @@ mod tests {
             runner: None,
             agent_tx,
             active_task: None,
+            request_seq: 0,
             parked_at: Instant::now(),
         };
         App {
@@ -1885,6 +1927,78 @@ mod tests {
     }
 
     #[test]
+    fn cancel_saves_streaming_text_as_partial_and_marks_it_incomplete() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        let session_id = app.active_session.clone();
+        // The fixture pre-seeds an assistant entry; a live session starts empty.
+        app.current.entries.clear();
+
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::TextDelta("half an ".into()));
+        handle_event_for_test(&mut app, AgentEvent::TextDelta("answer".into()));
+
+        // The runtime tracks the streaming text as a regular Assistant entry.
+        assert!(matches!(
+            app.current.entries.last().map(|e| &e.kind),
+            Some(DisplayKind::Assistant)
+        ));
+
+        cancel_active_request(&mut app);
+
+        // The interrupted answer is persisted as assistant_partial.
+        let partial = app.storage.load_partial(&session_id).unwrap().unwrap();
+        assert_eq!(partial.content, "half an answer");
+
+        // And the live entry is now marked incomplete.
+        assert!(matches!(
+            app.current.entries.iter().rev().find(|e| matches!(e.kind, DisplayKind::Assistant | DisplayKind::AssistantPartial)),
+            Some(entry) if matches!(entry.kind, DisplayKind::AssistantPartial)
+        ));
+    }
+
+    #[test]
+    fn terminal_events_mark_streaming_assistant_as_partial() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        handle_event_for_test(&mut app, AgentEvent::TextDelta("interrupted".into()));
+        handle_event_for_test(&mut app, AgentEvent::Failed("boom".into()));
+        assert!(
+            app.current
+                .entries
+                .iter()
+                .any(|e| matches!(e.kind, DisplayKind::AssistantPartial))
+        );
+
+        // A fresh streaming round after completion stays a normal assistant.
+        let mut app2 = test_app(&temp);
+        handle_event_for_test(&mut app2, AgentEvent::TextDelta("complete".into()));
+        handle_event_for_test(&mut app2, AgentEvent::Completed { items: Vec::new() });
+        assert!(
+            app2.current
+                .entries
+                .iter()
+                .all(|e| !matches!(e.kind, DisplayKind::AssistantPartial))
+        );
+    }
+
+    #[test]
+    fn submit_while_busy_is_rejected_without_overwriting_task() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        crate::secrets::test_seed_key(app.config.provider.preset, "test-key");
+        app.active_secret = Some((app.config.provider.preset, "test-key".into()));
+        rebuild_runner(&mut app).unwrap();
+        assert!(app.current.runner.is_some());
+
+        app.current.busy = true;
+        app.input.set("second message");
+        let result = submit_input(&mut app);
+        assert!(result.is_err(), "busy submit must be rejected");
+        assert!(app.current.active_task.is_none());
+    }
+
+    #[test]
     fn finish_thinking_skips_empty_buffer() {
         let temp = TempDir::new().unwrap();
         let mut app = test_app(&temp);
@@ -1944,6 +2058,32 @@ mod tests {
         assert_eq!(app.current.thinking_result, ThinkingResult::Cancelled);
         assert_eq!(thinking_summary_count(&app), 3);
         assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("取消前内容")));
+    }
+
+    #[test]
+    fn reasoning_completed_persists_summary_and_switches_to_body_phase() {
+        let temp = TempDir::new().unwrap();
+        let mut app = test_app(&temp);
+        handle_event_for_test(&mut app, AgentEvent::ModelStreaming);
+        handle_event_for_test(&mut app, AgentEvent::ReasoningDelta("思考内容".into()));
+        handle_event_for_test(&mut app, AgentEvent::ReasoningCompleted);
+        assert!(
+            !app.current.thinking_active,
+            "live thinking retires at the barrier"
+        );
+        assert_eq!(app.current.thinking_result, ThinkingResult::Completed);
+        assert_eq!(app.current.agent_phase, AgentPhase::StreamingText);
+        assert_eq!(thinking_summary_count(&app), 1);
+        assert!(last_thinking_summary(&app).is_some_and(|text| text.contains("思考内容")));
+
+        // The body delta only appends to the answer; it must not re-persist a
+        // second summary for the same reasoning phase.
+        handle_event_for_test(&mut app, AgentEvent::TextDelta("正文".into()));
+        assert_eq!(thinking_summary_count(&app), 1);
+        assert!(
+            matches!(app.current.entries.last().map(|entry| &entry.content),
+            Some(DisplayContent::Markdown(text)) if text == "正文")
+        );
     }
 
     #[test]

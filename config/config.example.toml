@@ -11,6 +11,10 @@ use_previous_response_id = false
 native_web_search = "auto"
 # Optional override for gateways or new models absent from the built-in registry.
 # context_window_tokens = 128000
+# Hard cap on the model's output tokens. Also the output reservation subtracted
+# from the safe input budget. Responses uses max_output_tokens, OpenAI chat uses
+# max_completion_tokens, other chat providers use max_tokens. 0 = provider default.
+# max_output_tokens = 8192
 # HTTP-level retry with exponential backoff, applied only before any stream
 # event has been emitted. retry_max_attempts = 0 disables retries.
 retry_max_attempts = 3

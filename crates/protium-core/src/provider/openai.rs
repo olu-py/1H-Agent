@@ -316,6 +316,17 @@ fn chat_body(request: &ModelRequest) -> Value {
         body["tools"] = Value::Array(tools);
     }
     apply_chat_thinking(&mut body, request);
+    if let Some(limit) = request.max_output_tokens {
+        // OpenAI-compatible chat uses `max_completion_tokens`; other chat
+        // providers (DeepSeek, Qwen, Volcano) use `max_tokens`.
+        let key = match request.thinking_profile_kind {
+            ThinkingProfileKind::OpenAi | ThinkingProfileKind::Compatible => {
+                "max_completion_tokens"
+            }
+            _ => "max_tokens",
+        };
+        body[key] = Value::Number(limit.into());
+    }
     body
 }
 
@@ -429,6 +440,9 @@ fn responses_body(request: &ModelRequest) -> Value {
     }
     if let Some(id) = &request.previous_response_id {
         body["previous_response_id"] = Value::String(id.clone());
+    }
+    if let Some(limit) = request.max_output_tokens {
+        body["max_output_tokens"] = Value::Number(limit.into());
     }
     body
 }
@@ -1295,6 +1309,7 @@ mod tests {
             thinking_level: ThinkingLevel::High,
             thinking_budget_tokens: None,
             thinking_profile_kind: ThinkingProfileKind::DeepSeekFlash,
+            max_output_tokens: None,
         };
         let body = responses_body(&request);
         assert_eq!(body["instructions"], "stable system prefix");
@@ -1338,6 +1353,7 @@ mod tests {
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
             thinking_profile_kind: ThinkingProfileKind::Compatible,
+            max_output_tokens: None,
         };
         let body = chat_body(&request);
         assert!(body.get("tools").is_none());
@@ -1357,6 +1373,7 @@ mod tests {
             thinking_level: ThinkingLevel::Enabled,
             thinking_budget_tokens: Some(4096),
             thinking_profile_kind: ThinkingProfileKind::Qwen37,
+            max_output_tokens: None,
         };
         assert_eq!(chat_body(&request)["enable_thinking"], true);
         assert_eq!(chat_body(&request)["thinking_budget"], 4096);
@@ -1382,6 +1399,7 @@ mod tests {
             thinking_level: ThinkingLevel::Auto,
             thinking_budget_tokens: None,
             thinking_profile_kind: ThinkingProfileKind::Compatible,
+            max_output_tokens: None,
         }
     }
 

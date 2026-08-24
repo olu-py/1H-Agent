@@ -106,6 +106,13 @@ pub enum Event {
     ReasoningDelta {
         delta: String,
     },
+    /// Marks the end of the current reasoning phase. Ordering guarantee within a
+    /// model round: `ReasoningDelta* -> ReasoningCompleted -> TextDelta*`. It is
+    /// emitted exactly once, only when the round produced reasoning, and is the
+    /// render barrier consumers must use to commit/refresh the thinking view
+    /// before accepting the first body delta. Old clients that ignore it still
+    /// receive the same deltas and fall back to their existing behavior.
+    ReasoningCompleted,
     ProviderRetry {
         attempt: u32,
         reason: String,
@@ -187,6 +194,12 @@ pub enum Event {
     /// cached message pages and refetch from the newest page. Replaces the v1
     /// frontend's fixed-delay refresh.
     TranscriptInvalidated,
+    /// The session's context budget changed (submit, usage, compaction, or a
+    /// provider/model switch). The consumer updates its displayed safe-input
+    /// budget; no history refetch is required.
+    ContextUpdated {
+        budget: ContextBudgetDto,
+    },
     /// Transport-level signal: the consumer's event cursor was evicted from the
     /// bridge ring (or the consumer lagged the live channel). The consumer must
     /// refetch the snapshot and the current message page instead of guessing
@@ -272,6 +285,46 @@ pub struct AppSnapshotV2 {
     /// Serialized pending approval of the oldest waiting session, if any.
     pub approval: Option<ApprovalDto>,
     pub todos: Vec<TodoDto>,
+    /// Context capacity of the active session, computed by the core (the single
+    /// authority). `None` when no session is active.
+    pub context: Option<ContextBudgetDto>,
+    /// The active session's persisted incomplete assistant answer, if any
+    /// (survives a restart so an interrupted stream is still visible).
+    pub assistant_partial: Option<PartialDto>,
+}
+
+/// A persisted incomplete assistant answer, shown as "未完成" and never fed
+/// back into the model context or `previous_response_id`.
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export)]
+pub struct PartialDto {
+    pub content: String,
+    pub created_at: String,
+}
+
+/// Per-session context capacity, computed by the core.
+///
+/// The core is the single authority for context capacity; the TUI must not
+/// infer capacity from local character counts. `safe_input_tokens` is the
+/// window minus the output reservation minus current usage — the budget a new
+/// user message must fit into.
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export)]
+pub struct ContextBudgetDto {
+    /// The model's context window in tokens. `None` when the model is unknown
+    /// and no explicit `context_window_tokens` is configured.
+    pub context_window_tokens: Option<u64>,
+    /// Current estimated used tokens for the session's conversation.
+    pub used_tokens: u64,
+    /// Output tokens reserved for the model's reply (the configured
+    /// `max_output_tokens`, also the per-request provider hard cap).
+    pub output_reserve_tokens: u64,
+    /// Safe available input budget = window − reserve − used. `None` when the
+    /// window is unknown.
+    pub safe_input_tokens: Option<u64>,
+    /// True when the window came from the built-in model registry (an
+    /// estimate); false when it is an explicit user configuration.
+    pub estimated: bool,
 }
 
 /// A single message in a session's transcript, in display shape. The `kind`
@@ -392,6 +445,7 @@ mod tests {
             Event::WebSearchCompleted { count: 1 },
             Event::Cancelled { reason: "r".into() },
             Event::TextDelta { delta: "d".into() },
+            Event::ReasoningCompleted,
             Event::Approval {
                 approval_id: "ap".into(),
                 call: call.clone(),
@@ -432,6 +486,15 @@ mod tests {
             Event::CompactionFailed { error: "e".into() },
             Event::TodoUpdated { tasks: Vec::new() },
             Event::TranscriptInvalidated,
+            Event::ContextUpdated {
+                budget: ContextBudgetDto {
+                    context_window_tokens: Some(128_000),
+                    used_tokens: 1000,
+                    output_reserve_tokens: 8192,
+                    safe_input_tokens: Some(118_808),
+                    estimated: true,
+                },
+            },
             Event::ResyncRequired,
         ];
         assert!(!variants.is_empty());

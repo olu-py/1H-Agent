@@ -58,6 +58,9 @@ pub struct ContextView {
     pub enabled: bool,
     pub used: u64,
     pub limit: Option<u64>,
+    /// Safe available input budget (window − output reserve − used), computed
+    /// by the core. `None` when the model window is unknown.
+    pub safe_input: Option<u64>,
     pub percent: Option<u64>,
 }
 
@@ -233,6 +236,11 @@ impl UiViewModel {
             enabled: app.context_meter_enabled,
             used: app.current.context_used_tokens,
             limit: app.current.context_limit_tokens,
+            safe_input: app
+                .current
+                .context_budget
+                .as_ref()
+                .and_then(|budget| budget.safe_input_tokens),
             percent: app.current.context_limit_tokens.map(|limit| {
                 app.current
                     .context_used_tokens
@@ -405,14 +413,17 @@ fn context_segments(context: &ContextView, density: Density) -> Vec<UiSegment> {
     let percent = context
         .percent
         .map_or("--".into(), |value| value.to_string());
-    let text = match (density, context.limit) {
-        (Density::Compact, _) => format!("上下文 {percent}%"),
-        (_, Some(limit)) => format!(
+    let text = match (density, context.limit, context.safe_input) {
+        // The core-computed safe available input budget is the authoritative
+        // capacity; the window is shown for reference.
+        (Density::Compact, _, _) => format!("上下文 {percent}%"),
+        (_, Some(_limit), Some(safe)) => format!("上下文 {percent}% 可用{}", compact_tokens(safe),),
+        (_, Some(limit), None) => format!(
             "上下文 {percent}% {}/{}",
             compact_tokens(context.used),
             compact_tokens(limit)
         ),
-        (_, None) => format!("上下文 {percent}% {}", compact_tokens(context.used)),
+        (_, None, _) => format!("上下文 {percent}% {}", compact_tokens(context.used)),
     };
     vec![UiSegment {
         text,

@@ -36,8 +36,8 @@ use crate::{
     config::Config,
     model::{AgentPhase, ApprovalAction, PendingApproval},
     protocol::{
-        self, ApiError, AppSnapshotV2, ApprovalDto, Event, MessageDto, MessagePage,
-        SessionStateDto, TodoDto,
+        self, ApiError, AppSnapshotV2, ApprovalDto, ContextBudgetDto, Event, MessageDto,
+        MessagePage, SessionStateDto, TodoDto,
     },
     provider::ToolCall,
     secrets,
@@ -81,7 +81,9 @@ enum CoreCommand {
     SubmitInput {
         session_id: Option<String>,
         text: String,
-        reply: oneshot::Sender<Result<(), ApiError>>,
+        /// Replies with the request sequence assigned to the new request
+        /// (or the current sequence when the input was a command/approval).
+        reply: oneshot::Sender<Result<u64, ApiError>>,
     },
     ExecuteCommand {
         session_id: Option<String>,
@@ -98,6 +100,11 @@ enum CoreCommand {
     },
     Cancel {
         session_id: String,
+        /// The request sequence the caller believes is active. `Some(seq)` that
+        /// no longer matches the session's current request is a stale cancel and
+        /// is ignored (never aborts a newer request); `None` cancels whatever is
+        /// active.
+        request_seq: Option<u64>,
         reply: oneshot::Sender<Result<(), ApiError>>,
     },
     SetProvider {
@@ -199,7 +206,27 @@ impl Engine {
             self.bridge.push(session_id.clone(), event);
         }
 
-        app::handle_routed_event(&mut self.app, crate::app::RoutedEvent { session_id, event });
+        // The session's context budget changes whenever usage or a terminal
+        // turn outcome updates the estimated used tokens; keep the TUI meter
+        // authoritative without a history refetch. Computed before the event is
+        // moved into the app state machine.
+        let context_dirty = matches!(
+            &event,
+            AgentEvent::Usage(_)
+                | AgentEvent::Completed { .. }
+                | AgentEvent::CompactionCompleted { .. }
+                | AgentEvent::CompactionFailed(_)
+        );
+        app::handle_routed_event(
+            &mut self.app,
+            crate::app::RoutedEvent {
+                session_id: session_id.clone(),
+                event,
+            },
+        );
+        if context_dirty {
+            push_context_updated(self, &session_id);
+        }
     }
 
     /// Rejects every approval whose deadline has passed, sending `false` to the
@@ -365,7 +392,10 @@ impl AppService {
         })?;
         let storage = Storage::open(&config.data_dir.join("agent.db"))?;
         secrets::preload_environment_keys();
-        let _ = secrets::api_key_cached_only(config.config.provider.preset);
+        // Startup loads the default provider's key once (environment first,
+        // then the system keychain) so the restored session owns a usable
+        // runner without a settings round trip. Cached per provider.
+        let _ = secrets::api_key_cached(config.config.provider.preset);
 
         let bridge = Arc::new(crate::bridge::EventBridge::new(
             config.event_capacity,
@@ -470,8 +500,10 @@ impl AppHandle {
     }
 
     /// Submits user input, creating the session when `session_id` is `None`
-    /// (the home-screen "first message creates a session" semantic).
-    pub async fn submit(&self, session_id: Option<String>, text: &str) -> Result<(), ApiError> {
+    /// (the home-screen "first message creates a session" semantic). Returns the
+    /// request sequence assigned to the new request; pass it to [`Self::cancel`]
+    /// so a stale cancel never aborts a newer request.
+    pub async fn submit(&self, session_id: Option<String>, text: &str) -> Result<u64, ApiError> {
         let (tx, rx) = oneshot::channel();
         self.send(CoreCommand::SubmitInput {
             session_id,
@@ -521,11 +553,15 @@ impl AppHandle {
             .map_err(|_| ApiError::internal("command dropped"))?
     }
 
-    /// Cancels the active request of a session.
-    pub async fn cancel(&self, session_id: &str) -> Result<(), ApiError> {
+    /// Cancels the active request of a session. `request_seq` is the sequence
+    /// returned by the submit that started the request: when it no longer
+    /// matches the session's current request the cancel is stale and ignored,
+    /// so it can never abort a newer request.
+    pub async fn cancel(&self, session_id: &str, request_seq: Option<u64>) -> Result<(), ApiError> {
         let (tx, rx) = oneshot::channel();
         self.send(CoreCommand::Cancel {
             session_id: session_id.to_owned(),
+            request_seq,
             reply: tx,
         })
         .await?;
@@ -601,21 +637,20 @@ impl AppHandle {
         self.inner.bridge.subscribe()
     }
 
-    /// Replays every event strictly after `after` and returns a live receiver,
-    /// so a fresh consumer misses nothing between its snapshot and the live
-    /// stream. Returns `ResyncRequired` when `after` has been evicted from the
-    /// bridge ring; the caller must then refetch the snapshot and message page
-    /// instead of guessing the missing state.
+    /// Replays every event strictly after `after` and returns a live receiver
+    /// atomically, so a fresh consumer misses nothing between its snapshot and
+    /// the live stream. Returns [`crate::bridge::ResyncRequired`] when `after`
+    /// has been evicted from the bridge ring; the caller must then refetch the
+    /// snapshot and message page and subscribe again from the fresh cursor.
+    ///
+    /// Events pushed between the live subscription and the ring snapshot appear
+    /// in both `replay` and `live`; consumers deduplicate by cursor (skip live
+    /// events whose cursor is `<=` the last cursor processed from `replay`).
     pub fn subscribe_from(
         &self,
         after: u64,
-    ) -> (
-        crate::bridge::ReplayResult,
-        tokio::sync::broadcast::Receiver<Arc<crate::protocol::Envelope>>,
-    ) {
-        let replay = self.inner.bridge.replay_after(after);
-        let live = self.inner.bridge.subscribe();
-        (replay, live)
+    ) -> Result<crate::bridge::Subscription, crate::bridge::ResyncRequired> {
+        self.inner.bridge.subscribe_from(after)
     }
 
     /// The current process-global cursor (matches the latest snapshot).
@@ -724,8 +759,12 @@ async fn handle_command(engine: &mut Engine, command: CoreCommand) {
             let result = engine.resolve_approval(&approval_id, accept, allow_session);
             let _ = reply.send(result);
         }
-        CoreCommand::Cancel { session_id, reply } => {
-            let result = cancel_session(engine, &session_id);
+        CoreCommand::Cancel {
+            session_id,
+            request_seq,
+            reply,
+        } => {
+            let result = cancel_session(engine, &session_id, request_seq);
             let _ = reply.send(result);
         }
         CoreCommand::SetProvider {
@@ -794,6 +833,17 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
         .iter()
         .map(TodoDto::from)
         .collect::<Vec<_>>();
+    let context = active_session
+        .as_deref()
+        .and_then(|session_id| context_budget(engine, session_id));
+    let assistant_partial = active_session
+        .as_deref()
+        .and_then(|session_id| engine.app.storage.load_partial(session_id).ok())
+        .flatten()
+        .map(|row| protocol::PartialDto {
+            content: row.content,
+            created_at: row.created_at,
+        });
     Ok(AppSnapshotV2 {
         protocol_version: protocol::PROTOCOL_VERSION,
         event_cursor: engine.bridge.current_cursor(),
@@ -804,7 +854,42 @@ fn state_snapshot(engine: &Engine) -> Result<AppSnapshotV2, ApiError> {
         mode: app.current.mode.as_str().to_owned(),
         approval,
         todos,
+        context,
+        assistant_partial,
     })
+}
+
+/// Computes the context budget for a session: window, current usage, output
+/// reservation and the resulting safe input budget. The core is the single
+/// authority for context capacity.
+fn context_budget(engine: &Engine, session_id: &str) -> Option<ContextBudgetDto> {
+    let app = &engine.app;
+    let runtime = app.runtime(session_id)?;
+    let provider = &app.config.provider;
+    let window = runtime.context_limit_tokens;
+    let used = runtime
+        .context_used_tokens
+        .max(crate::session::estimate_context_tokens(
+            &runtime.conversation,
+        ));
+    let reserve = u64::from(provider.max_output_tokens.unwrap_or(0));
+    Some(ContextBudgetDto {
+        context_window_tokens: window,
+        used_tokens: used,
+        output_reserve_tokens: reserve,
+        safe_input_tokens: window.map(|w| w.saturating_sub(reserve).saturating_sub(used)),
+        estimated: provider.context_window_tokens.is_none(),
+    })
+}
+
+/// Broadcasts a `ContextUpdated` envelope for a session (when it has a
+/// runtime), so consumers refresh their safe-input budget.
+fn push_context_updated(engine: &Engine, session_id: &str) {
+    if let Some(budget) = context_budget(engine, session_id) {
+        engine
+            .bridge
+            .push(session_id.to_owned(), Event::ContextUpdated { budget });
+    }
 }
 
 /// Fetches a page of a session's transcript along the current head chain.
@@ -943,6 +1028,7 @@ fn routed_to_event(event: &AgentEvent) -> Option<Event> {
         AgentEvent::ReasoningDelta(delta) => Event::ReasoningDelta {
             delta: delta.clone(),
         },
+        AgentEvent::ReasoningCompleted => Event::ReasoningCompleted,
         AgentEvent::ProviderRetry {
             attempt,
             reason,
@@ -1016,34 +1102,78 @@ fn routed_to_event(event: &AgentEvent) -> Option<Event> {
 }
 
 /// Submits user input to a session, creating it first when `None` (the home
-/// screen "first message creates a session" semantic).
-fn submit_input(engine: &mut Engine, session_id: Option<&str>, text: &str) -> Result<(), ApiError> {
+/// screen "first message creates a session" semantic). Returns the request
+/// sequence of the new request (the current sequence for command/approval
+/// inputs, which do not start an agent task).
+fn submit_input(
+    engine: &mut Engine,
+    session_id: Option<&str>,
+    text: &str,
+) -> Result<u64, ApiError> {
     let session_id = ensure_session(engine, session_id)?;
-    let app = &mut engine.app;
-    app.input.set(text.to_owned());
+    // The target session is authoritative: when a caller submits to a session
+    // that is not the engine's active one, route to it instead of mutating the
+    // engine's current session.
+    if session_id != engine.app.active_session {
+        activate_session(engine, &session_id)?;
+    }
     if text.starts_with('/') {
+        let app = &mut engine.app;
         if let Some(command) = commands::parse(text) {
             let outcome = CommandOutcome::from_command(&command);
             app::execute_command(app, command).map_err(api_error)?;
+            let request_seq = app.current.request_seq;
             sync_state_after_command(engine, &session_id, outcome);
-        } else {
-            app.current.push_entry(crate::model::DisplayEntry {
-                kind: crate::model::DisplayKind::Error,
-                content: crate::model::DisplayContent::Markdown(format!(
-                    "未知命令，请使用 /help 查看命令：{text}"
-                )),
-            });
+            return Ok(request_seq);
         }
-    } else if text.starts_with('!') {
+        let request_seq = app.current.request_seq;
+        app.current.push_entry(crate::model::DisplayEntry {
+            kind: crate::model::DisplayKind::Error,
+            content: crate::model::DisplayContent::Markdown(format!(
+                "未知命令，请使用 /help 查看命令：{text}"
+            )),
+        });
+        return Ok(request_seq);
+    }
+    if text.starts_with('!') {
         let command = text.strip_prefix('!').unwrap_or(text).trim().to_owned();
+        let app = &mut engine.app;
         app::request_shell_approval(app, command.clone()).map_err(api_error)?;
+        let request_seq = app.current.request_seq;
         // The shell approval is created directly on the runtime (no AgentEvent
         // round trip), so register an id and broadcast it ourselves.
         register_shell_approval(engine, &command);
-    } else {
-        app::submit_input(app).map_err(api_error)?;
+        return Ok(request_seq);
     }
-    Ok(())
+    // Normal conversation: strict pre-submit checks against the target session.
+    // A concurrent submit must never overwrite `active_task`.
+    let app = &mut engine.app;
+    {
+        let runtime = app
+            .runtime(&session_id)
+            .ok_or_else(|| ApiError::conflict("session runtime is unavailable"))?;
+        if runtime.busy || runtime.active_task.is_some() {
+            return Err(ApiError::conflict("session is busy with another request"));
+        }
+        if runtime.pending_approval.is_some() {
+            return Err(ApiError::conflict("session is waiting for an approval"));
+        }
+        if runtime.runner.is_none() {
+            return Err(ApiError::conflict(
+                "provider/API key is not configured; open the Provider settings",
+            ));
+        }
+    }
+    // The target session is the active one here; stamp the new request before
+    // `submit` starts its task.
+    app.current.request_seq = app.current.request_seq.wrapping_add(1);
+    let request_seq = app.current.request_seq;
+    app.input.set(text.to_owned());
+    app::submit_input(app).map_err(api_error)?;
+    // Submitting a message changes the used-token estimate; refresh the
+    // safe-input budget for the target session.
+    push_context_updated(engine, &session_id);
+    Ok(request_seq)
 }
 
 /// Registers a shell (`!`) approval that was created directly on the runtime:
@@ -1180,11 +1310,25 @@ fn activate_session(engine: &mut Engine, session_id: &str) -> Result<(), ApiErro
     Ok(())
 }
 
-fn cancel_session(engine: &mut Engine, session_id: &str) -> Result<(), ApiError> {
+fn cancel_session(
+    engine: &mut Engine,
+    session_id: &str,
+    request_seq: Option<u64>,
+) -> Result<(), ApiError> {
     if session_id != engine.app.active_session {
         return Err(ApiError::conflict(
             "only the active session can be cancelled",
         ));
+    }
+    // A stale cancel (a sequence that no longer matches the session's current
+    // request) must not abort a newer request; ignore it silently.
+    if let Some(seq) = request_seq {
+        let Some(runtime) = engine.app.runtime(session_id) else {
+            return Err(ApiError::not_found("session not found"));
+        };
+        if runtime.request_seq != seq {
+            return Ok(());
+        }
     }
     app::cancel_active_request(&mut engine.app);
     // `cancel_active_request` mutates the runtime in place without an
@@ -1227,6 +1371,7 @@ fn set_provider(engine: &mut Engine, preset: &str, model: &str) -> Result<(), Ap
     if !model.is_empty() && model != engine.app.config.provider.model {
         app::apply_model_choice(&mut engine.app, model.to_owned()).map_err(api_error)?;
     }
+    push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
 }
 
@@ -1259,6 +1404,7 @@ fn set_provider_config(
         ),
     };
     engine.app.current.status = status;
+    push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
 }
 
@@ -1284,6 +1430,7 @@ fn remove_provider(
         app::rebuild_runner(&mut engine.app).map_err(api_error)?;
     }
     engine.app.config.save().map_err(api_error)?;
+    push_context_updated(engine, &engine.app.current.session_id);
     Ok(())
 }
 
@@ -1345,6 +1492,10 @@ mod tests {
         let workspace = temp.path().to_path_buf();
         let mut config = Config::default();
         config.data_dir = temp.path().join("data");
+        // Deterministic runner: without a seeded key, whether the shared key
+        // cache holds one depends on test scheduling, making submit-based tests
+        // flaky.
+        crate::secrets::test_seed_key(config.provider.preset, "test-key");
         let handle = AppService::start(CoreConfig {
             workspace,
             config,
@@ -1392,15 +1543,16 @@ mod tests {
         let (_temp, handle) = test_handle().await;
         handle.submit(None, "hello").await.unwrap();
         let session = handle.snapshot().await.unwrap().active_session.unwrap();
-        // Seed enough messages to force multiple pages.
-        for i in 0..10 {
-            handle
-                .submit(Some(session.clone()), &format!("message {i}"))
-                .await
-                .unwrap();
-        }
+        // A running session rejects concurrent submits (structured conflict), so
+        // multi-page seeding is exercised at the storage layer; here we verify
+        // the page shape and the rejection path.
+        let error = handle
+            .submit(Some(session.clone()), "while busy")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::Conflict);
         let page = handle.messages(&session, None, Some(20)).await.unwrap();
-        assert!(!page.messages.is_empty());
+        assert_eq!(page.messages.len(), 1);
         // Display order: oldest first.
         let first = &page.messages[0];
         match first {
@@ -1410,6 +1562,56 @@ mod tests {
         // Unknown session is rejected.
         let error = handle.messages("missing", None, None).await.unwrap_err();
         assert_eq!(error.kind, ApiErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn submit_to_unknown_session_returns_not_found() {
+        let (_temp, handle) = test_handle().await;
+        let error = handle
+            .submit(Some("missing-session".into()), "hi")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ApiErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn submit_reports_request_seq_and_stale_cancel_is_ignored() {
+        let (_temp, handle) = test_handle().await;
+        let seq = handle.submit(None, "hello").await.unwrap();
+        assert_eq!(seq, 1, "first submit starts request sequence at 1");
+        let session = handle.snapshot().await.unwrap().active_session.unwrap();
+        // Watch the live stream for the Cancelled event.
+        let subscription = handle
+            .subscribe_from(handle.current_cursor())
+            .expect("cursor not evicted");
+        let mut live = subscription.live;
+        // A stale cancel (wrong sequence) must not abort the current request and
+        // must not emit a Cancelled event.
+        handle.cancel(&session, Some(seq + 100)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut stale_cancelled = false;
+        while let Ok(envelope) = live.try_recv() {
+            if matches!(envelope.event, Event::Cancelled { .. }) {
+                stale_cancelled = true;
+            }
+        }
+        assert!(!stale_cancelled, "stale cancel must not emit Cancelled");
+        // A matching cancel succeeds and emits the terminal event.
+        handle.cancel(&session, Some(seq)).await.unwrap();
+        let mut matched = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !matched {
+            if let Ok(envelope) = live.try_recv() {
+                if matches!(envelope.event, Event::Cancelled { .. }) {
+                    matched = true;
+                }
+            } else if tokio::time::Instant::now() >= deadline {
+                break;
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        assert!(matched, "matching cancel must emit a Cancelled event");
     }
 
     #[tokio::test]
@@ -1519,5 +1721,79 @@ mod tests {
         let b = stable_hash(Path::new("/workspace/b"));
         assert_ne!(a, b);
         assert_eq!(stable_hash(Path::new("/workspace/a")), a);
+    }
+
+    #[tokio::test]
+    async fn restart_and_restore_session_keeps_a_usable_runner_and_streams() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().to_path_buf();
+        let data_dir = temp.path().join("data");
+        let mut config = Config::default();
+        config.data_dir = data_dir.clone();
+        // Deterministic runner across both service lifetimes (no keyring I/O).
+        crate::secrets::test_seed_key(config.provider.preset, "test-key");
+
+        let start = |workspace: PathBuf, config: Config| {
+            AppService::start(CoreConfig {
+                workspace,
+                config,
+                data_dir: data_dir.clone(),
+                event_capacity: 64,
+                event_max_bytes: crate::bridge::DEFAULT_MAX_BYTES,
+                approval_timeout: Duration::from_secs(300),
+                message_page_size: 100,
+            })
+        };
+
+        // First service: create two sessions so the second service can
+        // explicitly restore the non-latest one (exercising the rebuild path).
+        let handle1 = start(workspace.clone(), config.clone()).await.unwrap();
+        handle1.submit(None, "first").await.unwrap();
+        let session_a = handle1.snapshot().await.unwrap().active_session.unwrap();
+        handle1.submit(None, "second").await.unwrap();
+        let session_b = handle1.snapshot().await.unwrap().active_session.unwrap();
+        assert_ne!(session_a, session_b);
+        handle1.shutdown().await.unwrap();
+        drop(handle1);
+
+        // Restart against the same persistent database. The latest session is
+        // restored automatically; explicitly restore the older one.
+        let handle2 = start(workspace, config).await.unwrap();
+        handle2.activate_session(&session_a).await.unwrap();
+
+        // Watch the live stream, then submit to the restored session. A
+        // successful submit (not a "provider not configured" conflict) proves
+        // the restored session owns a usable runner.
+        let subscription = handle2
+            .subscribe_from(handle2.current_cursor())
+            .expect("cursor must still be buffered");
+        let mut live = subscription.live;
+        handle2
+            .submit(Some(session_a.clone()), "again")
+            .await
+            .unwrap();
+
+        // The agent emits ModelStreaming before any network I/O, so the
+        // restored session is guaranteed to enter the streaming phase even
+        // though the seeded key would be rejected by the real provider.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut entered_streaming = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(envelope) = live.try_recv() {
+                if envelope.session_id == session_a
+                    && matches!(envelope.event, Event::ModelStreaming)
+                {
+                    entered_streaming = true;
+                    break;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            entered_streaming,
+            "restored session must accept input and enter ModelStreaming"
+        );
+        handle2.shutdown().await.unwrap();
     }
 }

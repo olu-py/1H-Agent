@@ -60,6 +60,10 @@ pub struct ModelRequest {
     pub thinking_level: ThinkingLevel,
     pub thinking_budget_tokens: Option<u32>,
     pub thinking_profile_kind: ThinkingProfileKind,
+    /// Hard per-request output-token cap. `None` lets the provider pick its
+    /// default. Responses uses `max_output_tokens`, OpenAI chat uses
+    /// `max_completion_tokens`, other chat providers use `max_tokens`.
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

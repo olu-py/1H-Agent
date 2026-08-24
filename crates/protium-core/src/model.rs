@@ -11,6 +11,10 @@ use crate::provider::ToolCall;
 pub enum DisplayKind {
     User,
     Assistant,
+    /// An incomplete assistant answer that survived an interrupted stream
+    /// (failure, cancellation, or restart). Displayed distinctly and never fed
+    /// back into the model context.
+    AssistantPartial,
     Thinking,
     Tool,
     Error,

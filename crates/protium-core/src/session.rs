@@ -96,6 +96,10 @@ pub struct SessionRuntime {
     pub runner: Option<AgentRunner>,
     pub agent_tx: mpsc::Sender<AgentEvent>,
     pub active_task: Option<JoinHandle<()>>,
+    /// Monotonic per-session request sequence. Each `submit` that starts a task
+    /// bumps it; `cancel` carries the expected sequence so a stale cancel (for a
+    /// superseded request) is ignored instead of aborting a newer request.
+    pub request_seq: u64,
     /// When the runtime was last parked into the background; used to evict the
     /// least-recently-parked idle runtime when background capacity is exceeded.
     pub parked_at: Instant,
@@ -136,6 +140,15 @@ impl SessionRuntime {
                 self.agent_phase = AgentPhase::Thinking;
                 self.model_phase = ModelPhase::Streaming;
                 self.update_thinking_line(&delta);
+            }
+            AgentEvent::ReasoningCompleted => {
+                // Render barrier from the thinking view to the body view: the
+                // buffered reasoning is persisted as a summary and the live
+                // thinking row is retired before any body delta arrives.
+                self.finish_thinking("思考完成");
+                self.agent_phase = AgentPhase::StreamingText;
+                self.model_phase = ModelPhase::Streaming;
+                self.status = "正在输出正文…… | Esc 取消".into();
             }
             AgentEvent::ModelStreaming => {
                 self.begin_thinking();
@@ -245,6 +258,7 @@ impl SessionRuntime {
             }
             AgentEvent::Cancelled(reason) => {
                 self.finish_thinking("思考已取消");
+                self.mark_partial_if_streaming();
                 self.busy = false;
                 self.active_task = None;
                 if let Some(approval) = self.take_pending_approval() {
@@ -265,7 +279,10 @@ impl SessionRuntime {
                 self.agent_phase = AgentPhase::StreamingText;
                 self.model_phase = ModelPhase::Streaming;
                 if let Some(entry) = self.entries.last_mut()
-                    && matches!(entry.kind, DisplayKind::Assistant)
+                    && matches!(
+                        entry.kind,
+                        DisplayKind::Assistant | DisplayKind::AssistantPartial
+                    )
                     && let DisplayContent::Markdown(text) = &mut entry.content
                 {
                     text.push_str(&delta);
@@ -353,7 +370,12 @@ impl SessionRuntime {
                     .iter()
                     .any(|item| matches!(item, ConversationItem::CompactionSummary { .. }));
                 self.conversation = items;
-                trim_conversation(&mut self.conversation);
+                // Known-window models rely on window-based capacity and
+                // compaction; only apply the fixed item/byte ceiling as a
+                // memory safety net when the window is unknown.
+                if self.context_limit_tokens.is_none() {
+                    trim_conversation(&mut self.conversation);
+                }
                 if compacted {
                     self.entries = display_entries(&self.conversation);
                 }
@@ -373,6 +395,7 @@ impl SessionRuntime {
             AgentEvent::ChildSessionProgress { .. } => {}
             AgentEvent::Failed(error) => {
                 self.finish_thinking("思考失败");
+                self.mark_partial_if_streaming();
                 self.push_entry(DisplayEntry {
                     kind: DisplayKind::Error,
                     content: DisplayContent::Markdown(secrets::redact(&error)),
@@ -517,6 +540,19 @@ impl SessionRuntime {
         self.pending_approval.take()
     }
 
+    /// Marks the trailing live assistant entry as incomplete when a stream is
+    /// interrupted (cancelled or failed) before its answer was persisted. A
+    /// persisted tool-round assistant entry is never touched (the last entry is
+    /// then a tool, not an assistant).
+    pub(crate) fn mark_partial_if_streaming(&mut self) {
+        if let Some(entry) = self.entries.last_mut()
+            && matches!(entry.kind, DisplayKind::Assistant)
+            && matches!(&entry.content, DisplayContent::Markdown(t) if !t.trim().is_empty())
+        {
+            entry.kind = DisplayKind::AssistantPartial;
+        }
+    }
+
     pub fn push_entry(&mut self, entry: DisplayEntry) {
         self.entries.push(entry);
     }
@@ -581,6 +617,55 @@ pub(crate) fn trim_entries(entries: &mut Vec<DisplayEntry>) -> usize {
 
 pub(crate) fn trim_conversation(items: &mut Vec<ConversationItem>) {
     trim_conversation_bounded(items, 200, 1024 * 1024);
+}
+
+/// Conservative token budget for the system prompt, tool schemas and stream
+/// scaffolding. Subtracted from the model window when computing the safe input
+/// capacity so requests never exceed the window on top of system overhead.
+pub(crate) const SYSTEM_OVERHEAD_TOKENS: u64 = 4096;
+
+/// The safe input token capacity for a provider: model window minus the output
+/// reservation (configured `max_output_tokens`) minus system overhead. `None`
+/// when the model window is unknown — the caller must not assume a capacity.
+pub fn safe_input_capacity(provider: &crate::config::ProviderConfig) -> Option<u64> {
+    let window = provider.resolved_context_window_tokens()?;
+    let reserve = u64::from(provider.max_output_tokens.unwrap_or(0));
+    Some(
+        window
+            .saturating_sub(reserve)
+            .saturating_sub(SYSTEM_OVERHEAD_TOKENS),
+    )
+}
+
+/// Hard-limit degradation: trims the conversation from the front until its
+/// estimated token count fits `budget_tokens` (or nothing is left), then
+/// inserts a localized note. Returns the number of items removed. This is the
+/// last-resort fallback after compaction failed, never a silent pre-send trim.
+pub fn trim_conversation_to_budget(items: &mut Vec<ConversationItem>, budget_tokens: u64) -> usize {
+    let mut removed = 0usize;
+    while !items.is_empty() {
+        if estimate_context_tokens(items) <= budget_tokens {
+            break;
+        }
+        items.remove(0);
+        removed += 1;
+    }
+    while matches!(items.first(), Some(ConversationItem::ToolOutput { .. })) {
+        items.remove(0);
+        removed += 1;
+    }
+    if removed > 0 {
+        items.insert(
+            0,
+            ConversationItem::Message {
+                role: Role::System,
+                content: format!(
+                    "Earlier context was trimmed to fit the model's input budget ({removed} items omitted)."
+                ),
+            },
+        );
+    }
+    removed
 }
 
 pub(crate) fn trim_conversation_bounded(
@@ -753,4 +838,75 @@ pub(crate) fn display_entries(conversation: &[ConversationItem]) -> Vec<DisplayE
         });
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProviderPreset;
+
+    #[test]
+    fn safe_input_capacity_subtracts_reserve_and_system_overhead() {
+        let mut provider = ProviderPreset::DeepSeek.defaults();
+        provider.model = "deepseek-v4-flash".into();
+        assert_eq!(provider.resolved_context_window_tokens(), Some(1_000_000));
+        provider.max_output_tokens = Some(8192);
+        assert_eq!(
+            safe_input_capacity(&provider),
+            Some(1_000_000 - 8192 - SYSTEM_OVERHEAD_TOKENS)
+        );
+        // No output cap configured: only the system overhead is reserved.
+        provider.max_output_tokens = None;
+        assert_eq!(
+            safe_input_capacity(&provider),
+            Some(1_000_000 - SYSTEM_OVERHEAD_TOKENS)
+        );
+    }
+
+    #[test]
+    fn safe_input_capacity_is_none_for_unknown_windows() {
+        let mut provider = ProviderPreset::Custom.defaults();
+        provider.model = "some-brand-new-model".into();
+        assert_eq!(provider.resolved_context_window_tokens(), None);
+        assert_eq!(safe_input_capacity(&provider), None);
+        // An explicit window restores a capacity.
+        provider.context_window_tokens = Some(128_000);
+        assert_eq!(
+            safe_input_capacity(&provider),
+            Some(128_000 - SYSTEM_OVERHEAD_TOKENS)
+        );
+    }
+
+    #[test]
+    fn trim_conversation_to_budget_trims_to_capacity_with_note() {
+        let items = (0..40)
+            .map(|i| ConversationItem::Message {
+                role: Role::User,
+                content: format!("message {i} padding padding padding"),
+            })
+            .collect::<Vec<_>>();
+        let mut items = items;
+        let before = items.len();
+        let removed = trim_conversation_to_budget(&mut items, 64);
+        assert!(removed > 0);
+        assert!(removed < before);
+        assert!(estimate_context_tokens(&items) <= 64 + 64);
+        assert!(matches!(
+            &items[0],
+            ConversationItem::Message {
+                role: Role::System,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trim_conversation_to_budget_is_a_noop_within_budget() {
+        let mut items = vec![ConversationItem::Message {
+            role: Role::User,
+            content: "small".into(),
+        }];
+        assert_eq!(trim_conversation_to_budget(&mut items, 1_000_000), 0);
+        assert_eq!(items.len(), 1);
+    }
 }

@@ -497,6 +497,11 @@ impl Drop for ChildCancellationGuard {
 #[derive(Debug)]
 pub enum AgentEvent {
     ReasoningDelta(String),
+    /// Marks the end of the current reasoning phase. Guaranteed to be emitted
+    /// exactly once per model round between the last `ReasoningDelta` and the
+    /// first `TextDelta`; never emitted for rounds without reasoning. Consumers
+    /// treat it as the render barrier from the thinking view to the body view.
+    ReasoningCompleted,
     ProviderRetry {
         attempt: u32,
         reason: String,
@@ -715,6 +720,10 @@ impl StreamCollector {
 enum Forwarded {
     /// Send this agent event, propagating send failures.
     Send(AgentEvent),
+    /// Send multiple agent events in order, propagating send failures. One
+    /// model event may expand into a fixed ordered sequence (e.g. the
+    /// `ReasoningCompleted` barrier immediately before the first `TextDelta`).
+    SendMany(Vec<AgentEvent>),
     /// Send this agent event, ignoring send failures.
     SendIgnore(AgentEvent),
     /// The event was handled locally and needs no UI forwarding.
@@ -754,6 +763,13 @@ async fn stream_once(
                     .send(agent_event)
                     .await
                     .map_err(|_| StreamFailure::Handler("UI event receiver closed".to_owned()))?,
+                Forwarded::SendMany(agent_events) => {
+                    for agent_event in agent_events {
+                        ui_events.send(agent_event).await.map_err(|_| {
+                            StreamFailure::Handler("UI event receiver closed".to_owned())
+                        })?;
+                    }
+                }
                 Forwarded::SendIgnore(agent_event) => {
                     let _ = ui_events.send(agent_event).await;
                 }
@@ -933,7 +949,12 @@ impl AgentRunner {
         }
         if let Err(error) = self.compact_context(items, None, ui_events).await {
             let _ = ui_events.send(AgentEvent::CompactionFailed(error)).await;
-            trim_conversation_bounded(items, 200, 1024 * 1024);
+            // Compaction failed: degrade to a hinted hard-limit trim computed
+            // from the model window minus output reservation and system
+            // overhead, never a fixed 200-item/1 MiB silent crop.
+            if let Some(budget) = crate::session::safe_input_capacity(&self.provider_config) {
+                crate::session::trim_conversation_to_budget(items, budget);
+            }
         }
     }
 
@@ -958,7 +979,11 @@ impl AgentRunner {
         let mut cut = items.len();
         let mut recent = 0u64;
         while cut > 0 {
-            let size = crate::session::estimate_context_tokens(&items[cut - 1..]);
+            // Estimate the single trailing item only: accumulating the whole
+            // suffix slice on every iteration would count each earlier item
+            // again and again, over-estimating and trimming more history than
+            // the budget intends.
+            let size = crate::session::estimate_context_tokens(&items[cut - 1..cut]);
             if recent.saturating_add(size) > recent_budget {
                 break;
             }
@@ -1028,6 +1053,7 @@ impl AgentRunner {
                 &self.provider_config.model,
             )
             .kind,
+            max_output_tokens: self.provider_config.max_output_tokens,
         };
         let _ = ui_events.send(AgentEvent::CompactionStarted).await;
         let summary_limit = self
@@ -1098,6 +1124,17 @@ impl AgentRunner {
         self.run_inner(items, ui_events, depth).await
     }
 
+    /// Persists the half-generated answer as `assistant_partial` and clears the
+    /// provider response id so the next request never resumes an interrupted
+    /// stream. Best-effort: a storage failure must not mask the stream failure.
+    fn save_partial(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let _ = self.storage.save_partial(&self.session_id, text);
+        let _ = self.storage.clear_response_id(&self.session_id);
+    }
+
     async fn run_inner(
         &self,
         items: &mut Vec<ConversationItem>,
@@ -1158,6 +1195,7 @@ impl AgentRunner {
                     &self.provider_config.model,
                 )
                 .kind,
+                max_output_tokens: self.provider_config.max_output_tokens,
             };
             ui_events
                 .send(AgentEvent::ModelStreaming)
@@ -1166,6 +1204,11 @@ impl AgentRunner {
             let mut collector = StreamCollector::new(None);
             let mut search_results = 0usize;
             let mut search_bytes = 0usize;
+            // Per-round reasoning phase tracking: this closure is rebuilt on every
+            // outer-loop round, so the phase resets between tool/model rounds and
+            // a completion barrier is never repeated across rounds.
+            let mut reasoning_seen = false;
+            let mut reasoning_emitted = false;
             match stream_once(
                 &self.provider,
                 request,
@@ -1226,6 +1269,7 @@ impl AgentRunner {
                         Ok(Forwarded::Ignore)
                     }
                     ModelEvent::ReasoningDelta(delta) => {
+                        reasoning_seen = true;
                         Ok(Forwarded::Send(AgentEvent::ReasoningDelta(delta)))
                     }
                     ModelEvent::Retrying {
@@ -1238,7 +1282,19 @@ impl AgentRunner {
                         delay_ms,
                     })),
                     ModelEvent::TextDelta(delta) => {
-                        Ok(Forwarded::Send(AgentEvent::TextDelta(delta)))
+                        // The reasoning phase ends at the first body delta: emit
+                        // the ReasoningCompleted barrier immediately before it so
+                        // consumers can draw the finished thinking view on its
+                        // own frame before the answer starts streaming below it.
+                        if reasoning_seen && !reasoning_emitted {
+                            reasoning_emitted = true;
+                            Ok(Forwarded::SendMany(vec![
+                                AgentEvent::ReasoningCompleted,
+                                AgentEvent::TextDelta(delta),
+                            ]))
+                        } else {
+                            Ok(Forwarded::Send(AgentEvent::TextDelta(delta)))
+                        }
                     }
                     ModelEvent::Usage(usage) => Ok(Forwarded::SendIgnore(AgentEvent::Usage(usage))),
                     ModelEvent::ResponseId(id) => {
@@ -1273,12 +1329,17 @@ impl AgentRunner {
                         request_cursor = 0;
                         continue;
                     }
+                    // Keep the half-generated answer so the user can review and
+                    // resume it instead of losing the stream.
+                    self.save_partial(&collector.assistant_text);
                     return Err(error);
                 }
                 Err(StreamFailure::Handler(error)) | Err(StreamFailure::Join(error)) => {
+                    self.save_partial(&collector.assistant_text);
                     return Err(error);
                 }
                 Err(StreamFailure::EndedWithoutCompletion) => {
+                    self.save_partial(&collector.assistant_text);
                     return Err("model stream ended without completion".into());
                 }
             }
@@ -1299,6 +1360,10 @@ impl AgentRunner {
                 });
                 self.storage
                     .append_message(&self.session_id, Role::Assistant, &collector.assistant_text)
+                    .map_err(|error| error.to_string())?;
+                // The formal assistant message replaces any earlier partial.
+                self.storage
+                    .clear_partial(&self.session_id)
                     .map_err(|error| error.to_string())?;
             }
             if collector.completed_calls.is_empty() {
@@ -1922,6 +1987,7 @@ impl AgentRunner {
                 thinking_level: provider_config.thinking_level,
                 thinking_budget_tokens: provider_config.thinking_budget_tokens,
                 thinking_profile_kind,
+                max_output_tokens: provider_config.max_output_tokens,
             };
             let mut collector = StreamCollector::new(Some(child_max_output_bytes));
             emit_child_progress(
@@ -2709,6 +2775,207 @@ mod tests {
                 ConversationItem::ThinkingSummary { content } if content == "第一段第二段"
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn reasoning_completed_sits_between_last_reasoning_and_first_text() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "think")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![vec![
+            ModelEvent::ReasoningDelta("第一段".into()),
+            ModelEvent::ReasoningDelta("第二段".into()),
+            ModelEvent::TextDelta("answer".into()),
+            ModelEvent::Done,
+        ]])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage,
+            session_id,
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "think".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+
+        let mut sequence = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::ReasoningDelta(delta) => sequence.push(("reasoning", delta)),
+                AgentEvent::ReasoningCompleted => sequence.push(("completed", String::new())),
+                AgentEvent::TextDelta(delta) => sequence.push(("text", delta)),
+                AgentEvent::Failed(error) => panic!("unexpected failure: {error}"),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert_eq!(
+            sequence,
+            vec![
+                ("reasoning", "第一段".to_owned()),
+                ("reasoning", "第二段".to_owned()),
+                ("completed", String::new()),
+                ("text", "answer".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_reasoning_emits_no_completion_event() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "plain")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        let provider = OpenAiClient::scripted(vec![vec![
+            ModelEvent::TextDelta("answer".into()),
+            ModelEvent::Done,
+        ]])
+        .unwrap();
+        let runner = AgentRunner::new(
+            provider,
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage,
+            session_id,
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "plain".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+
+        let mut completed = false;
+        let mut completion_events = 0usize;
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::ReasoningCompleted => completion_events += 1,
+                AgentEvent::Completed { .. } => completed = true,
+                AgentEvent::Failed(error) => panic!("unexpected failure: {error}"),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert!(completed);
+        assert_eq!(
+            completion_events, 0,
+            "rounds without reasoning must not emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_round_reasoning_emits_one_completion_per_phase() {
+        let temp = TempDir::new().unwrap();
+        let storage = Storage::open(&temp.path().join("agent.db")).unwrap();
+        let session_id = storage.create_session(temp.path()).unwrap();
+        storage
+            .append_message(&session_id, Role::User, "multi")
+            .unwrap();
+        let tools = Arc::new(ToolRegistry::new(
+            Workspace::new(temp.path()).unwrap(),
+            RuntimeConfig::default(),
+            false,
+        ));
+        // Round 1: reasoning + body text, then a tool call. Round 2: reasoning +
+        // final body text. Each round with reasoning followed by text must emit
+        // exactly one completion barrier; none may leak across rounds.
+        let responses = vec![
+            vec![
+                ModelEvent::ReasoningDelta("r1".into()),
+                ModelEvent::TextDelta("t1".into()),
+                ModelEvent::ToolCallComplete(ToolCall {
+                    id: "call-1".into(),
+                    name: "file_read".into(),
+                    arguments: serde_json::json!({"path": "missing-1"}),
+                }),
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ReasoningDelta("r2".into()),
+                ModelEvent::TextDelta("t2".into()),
+                ModelEvent::Done,
+            ],
+        ];
+        let runner = AgentRunner::new(
+            OpenAiClient::scripted(responses).unwrap(),
+            ProviderPreset::Custom.defaults(),
+            tools,
+            storage,
+            session_id,
+        );
+        let (events, mut receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            runner
+                .run(
+                    vec![ConversationItem::Message {
+                        role: Role::User,
+                        content: "multi".into(),
+                    }],
+                    events,
+                )
+                .await;
+        });
+
+        let mut tags = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            match event {
+                AgentEvent::ReasoningDelta(_) => tags.push("reasoning"),
+                AgentEvent::ReasoningCompleted => tags.push("completed"),
+                AgentEvent::TextDelta(_) => tags.push("text"),
+                AgentEvent::ToolFinished { .. } => tags.push("tool"),
+                AgentEvent::Completed { .. } => tags.push("run_completed"),
+                AgentEvent::Failed(error) => panic!("unexpected failure: {error}"),
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert_eq!(
+            tags,
+            vec![
+                // Round 1: reasoning then its own completion barrier before text.
+                "reasoning",
+                "completed",
+                "text",
+                "tool",
+                // Round 2: a fresh barrier for the second reasoning phase.
+                "reasoning",
+                "completed",
+                "text",
+                "run_completed",
+            ]
+        );
     }
 
     #[tokio::test]

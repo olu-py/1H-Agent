@@ -13,7 +13,7 @@ use protium_core::{
         AgentPhase, DisplayContent, DisplayEntry, DisplayKind, ModelPhase, ThinkingDisplay,
         ThinkingResult, TodoStatus, TodoTask, ToolDisplay, ToolDisplayStatus,
     },
-    protocol::{Event, MessageDto},
+    protocol::{ContextBudgetDto, Event, MessageDto},
     provider::{ToolCall, Usage},
     secrets,
 };
@@ -40,7 +40,9 @@ pub struct ProjectionOutcome {
     /// The session list (or the active session) may have changed; the caller
     /// should refresh the snapshot.
     pub sessions_dirty: bool,
-    /// An approval overlay was dismissed and the frame needs a full redraw.
+    /// The visible state changed and the frame needs a repaint: an approval
+    /// overlay was dismissed, or a streaming delta (reasoning/text) arrived.
+    /// The caller coalesces high-frequency deltas before drawing.
     pub force_redraw: bool,
     /// A transcript-changing event arrived; the caller must refetch the
     /// message page to rebuild history from the database.
@@ -102,6 +104,9 @@ pub struct TuiSessionProjection {
     pub usage: Usage,
     pub context_used_tokens: u64,
     pub context_limit_tokens: Option<u64>,
+    /// The core-computed context budget for this session; the authority for
+    /// the safe-input budget the meter shows.
+    pub context_budget: Option<ContextBudgetDto>,
     pub expanded_tools: HashSet<String>,
     pub expanded_thinking: HashSet<String>,
     pub message_scroll: usize,
@@ -111,6 +116,10 @@ pub struct TuiSessionProjection {
     pub message_layout: Option<MessageLayout>,
     pub markdown_render_cache: HashMap<usize, CachedMarkdown>,
     pub output_layout_dirty: bool,
+    /// Whether older messages exist beyond the loaded history head (from the
+    /// last message page's `has_more`), and the opaque cursor to fetch them.
+    pub history_has_more: bool,
+    pub history_next_before: Option<i64>,
     #[cfg(test)]
     pub output_layout_rebuild_count: usize,
     #[cfg(test)]
@@ -155,6 +164,7 @@ impl TuiSessionProjection {
             usage: Usage::default(),
             context_used_tokens: 0,
             context_limit_tokens,
+            context_budget: None,
             expanded_tools: HashSet::new(),
             expanded_thinking: HashSet::new(),
             message_scroll: 0,
@@ -164,6 +174,8 @@ impl TuiSessionProjection {
             message_layout: None,
             markdown_render_cache: HashMap::new(),
             output_layout_dirty: true,
+            history_has_more: false,
+            history_next_before: None,
             #[cfg(test)]
             output_layout_rebuild_count: 0,
             #[cfg(test)]
@@ -190,12 +202,25 @@ impl TuiSessionProjection {
                 self.agent_phase = AgentPhase::Thinking;
                 self.model_phase = ModelPhase::Streaming;
                 self.update_thinking_line(delta);
+                outcome.force_redraw = true;
+            }
+            Event::ReasoningCompleted => {
+                // Phase barrier: persist the current reasoning as a summary,
+                // retire the live thinking row, and switch to the body phase.
+                // The facade draws this frame immediately (not coalesced) so the
+                // user sees only the finished thinking before the answer starts.
+                self.finish_thinking("思考完成");
+                self.agent_phase = AgentPhase::StreamingText;
+                self.model_phase = ModelPhase::Streaming;
+                self.status = "正在输出正文…… | Esc 取消".into();
+                outcome.force_redraw = true;
             }
             Event::ModelStreaming => {
                 self.begin_thinking();
                 self.agent_phase = AgentPhase::Thinking;
                 self.model_phase = ModelPhase::Streaming;
                 self.status = "等待模型流式响应".into();
+                outcome.force_redraw = true;
             }
             Event::ProviderRetry {
                 attempt,
@@ -228,6 +253,7 @@ impl TuiSessionProjection {
                 self.finish_thinking("思考完成");
                 self.agent_phase = AgentPhase::ToolRunning;
                 self.model_phase = ModelPhase::Streaming;
+                outcome.force_redraw = true;
                 let already_open = self.entries.last().is_some_and(|entry| {
                     matches!(&entry.content, DisplayContent::Tool(tool) if tool.name == "web_search" && tool.status == ToolDisplayStatus::Running)
                 });
@@ -297,9 +323,13 @@ impl TuiSessionProjection {
                 } else {
                     format!("联网搜索完成：{count} 条结果")
                 };
+                // The search card terminal state must be visible even before
+                // the next model round arrives.
+                outcome.force_redraw = true;
             }
             Event::Cancelled { reason } => {
                 self.finish_thinking("思考已取消");
+                self.mark_partial_if_streaming();
                 self.busy = false;
                 if self.pending_approval.is_some() {
                     outcome.force_redraw = true;
@@ -319,7 +349,10 @@ impl TuiSessionProjection {
                 self.model_phase = ModelPhase::Streaming;
                 self.invalidate_output_layout();
                 if let Some(entry) = self.entries.last_mut()
-                    && matches!(entry.kind, DisplayKind::Assistant)
+                    && matches!(
+                        entry.kind,
+                        DisplayKind::Assistant | DisplayKind::AssistantPartial
+                    )
                     && let DisplayContent::Markdown(text) = &mut entry.content
                 {
                     text.push_str(delta);
@@ -330,6 +363,7 @@ impl TuiSessionProjection {
                     });
                 }
                 self.status = "正在输出正文…… | Esc 取消".into();
+                outcome.force_redraw = true;
             }
             Event::Approval {
                 approval_id,
@@ -376,6 +410,7 @@ impl TuiSessionProjection {
                         result: None,
                     }),
                 });
+                outcome.force_redraw = true;
             }
             Event::ToolFinished { call, result } => {
                 self.agent_phase = AgentPhase::Thinking;
@@ -405,6 +440,9 @@ impl TuiSessionProjection {
                     });
                 }
                 self.status = "正在将工具结果交给模型……".into();
+                // Terminal tool state must be drawn immediately: the card leaves
+                // "Running" even when the next model response has not arrived.
+                outcome.force_redraw = true;
             }
             Event::Usage {
                 input_tokens,
@@ -440,6 +478,7 @@ impl TuiSessionProjection {
             Event::ChildSessionProgress { .. } => {}
             Event::Failed { error } => {
                 self.finish_thinking("思考失败");
+                self.mark_partial_if_streaming();
                 self.push_entry(DisplayEntry {
                     kind: DisplayKind::Error,
                     content: DisplayContent::Markdown(secrets::redact(error)),
@@ -450,6 +489,7 @@ impl TuiSessionProjection {
                 self.status = "请求失败".into();
             }
             Event::LocalCommandFinished { command, result } => {
+                outcome.force_redraw = true;
                 if command == "/diff" {
                     self.push_entry(DisplayEntry {
                         kind: DisplayKind::Tool,
@@ -480,6 +520,11 @@ impl TuiSessionProjection {
             Event::TranscriptInvalidated => {
                 outcome.transcript_dirty = true;
             }
+            Event::ContextUpdated { budget } => {
+                self.context_budget = Some(budget.clone());
+                self.context_limit_tokens = budget.context_window_tokens;
+                self.context_used_tokens = budget.used_tokens;
+            }
             Event::ResyncRequired => {
                 outcome.sessions_dirty = true;
                 outcome.transcript_dirty = true;
@@ -499,7 +544,10 @@ impl TuiSessionProjection {
         self.live_thinking_layout_cache.clear();
         self.thinking_animation_frame = 0;
         self.thinking_anchor = Some(self.entries.len());
-        self.thinking_expanded = false;
+        // Auto-expand the live thinking so the reasoning is visible on screen
+        // as it streams, instead of hiding behind a one-line spinner and only
+        // surfacing as a finished summary once thinking ends.
+        self.thinking_expanded = true;
     }
 
     pub fn finish_thinking(&mut self, line: &str) {
@@ -532,13 +580,17 @@ impl TuiSessionProjection {
         } else {
             reasoning
         };
+        let id = format!("thinking-{}", uuid::Uuid::new_v4());
         self.push_entry(DisplayEntry {
             kind: DisplayKind::Thinking,
             content: DisplayContent::Thinking(ThinkingDisplay {
-                id: format!("thinking-{}", uuid::Uuid::new_v4()),
+                id: id.clone(),
                 content,
             }),
         });
+        // The finished summary starts collapsed (auto-collapse when thinking
+        // ends, per the UI contract) so the body answer takes the visual
+        // foreground; the user can still click the summary to re-expand it.
     }
 
     pub fn reset_thinking_state(&mut self) {
@@ -589,6 +641,17 @@ impl TuiSessionProjection {
     pub fn clear_output_selection(&mut self) {
         self.output_selection = None;
         self.edge_scroll = EdgeScroll::default();
+    }
+
+    /// Marks the trailing live assistant entry as incomplete when a stream was
+    /// interrupted before its answer was persisted.
+    fn mark_partial_if_streaming(&mut self) {
+        if let Some(entry) = self.entries.last_mut()
+            && matches!(entry.kind, DisplayKind::Assistant)
+            && matches!(&entry.content, DisplayContent::Markdown(t) if !t.trim().is_empty())
+        {
+            entry.kind = DisplayKind::AssistantPartial;
+        }
     }
 
     pub fn invalidate_output_layout(&mut self) {
@@ -672,6 +735,84 @@ impl TuiSessionProjection {
         self.clear_output_selection();
         self.thinking_anchor = None;
         self.scroll_to_bottom();
+    }
+
+    /// Applies a message page to the history. `prepend = false` rebuilds the
+    /// history head (session start, reconnect, transcript invalidation) and
+    /// resets the pagination cursors; `prepend = true` loads the next older
+    /// page above the current entries, keeping the visible content anchored so
+    /// the view does not jump.
+    pub fn apply_message_page(
+        &mut self,
+        page: &protium_core::protocol::MessagePage,
+        prepend: bool,
+    ) {
+        let entries = Self::message_dto_to_entries(&page.messages);
+        self.history_has_more = page.has_more;
+        self.history_next_before = page.next_before;
+        if prepend && !entries.is_empty() {
+            // Preserve the scroll anchor: distance-from-bottom stays constant
+            // when older entries are prepended above, so the same content stays
+            // in view. The renderer recomputes scroll from `message_scroll`
+            // against the grown layout.
+            let anchor = self.message_scroll;
+            let old = std::mem::take(&mut self.entries);
+            let mut merged = entries;
+            merged.extend(old);
+            self.entries = merged;
+            self.invalidate_output_layout();
+            self.markdown_render_cache.clear();
+            self.clear_output_selection();
+            self.output_scroll_top = None;
+            self.follow_output = false;
+            self.message_scroll = anchor;
+        } else {
+            self.replace_history(entries);
+        }
+    }
+
+    /// True when the view is scrolled to the very top of the loaded history and
+    /// older messages still exist — the signal to load the previous page.
+    pub fn at_history_top(&self) -> bool {
+        if !self.history_has_more {
+            return false;
+        }
+        match &self.message_layout {
+            Some(layout) if !self.follow_output => {
+                self.output_scroll_top.unwrap_or(layout.scroll) == 0
+            }
+            _ => false,
+        }
+    }
+
+    /// Renders (or drops) a persisted incomplete assistant answer reported by
+    /// the snapshot. Re-applies only when the content changed, so repeated
+    /// snapshot merges do not duplicate the entry.
+    pub fn sync_partial(&mut self, partial: Option<&protium_core::protocol::PartialDto>) {
+        let current = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.kind, DisplayKind::AssistantPartial))
+            .and_then(|entry| match &entry.content {
+                DisplayContent::Markdown(text) => Some(text.clone()),
+                _ => None,
+            });
+        let incoming = partial.map(|partial| partial.content.clone());
+        if current == incoming {
+            return;
+        }
+        self.entries
+            .retain(|entry| !matches!(entry.kind, DisplayKind::AssistantPartial));
+        if let Some(partial) = partial
+            && !partial.content.trim().is_empty()
+        {
+            self.push_entry(DisplayEntry {
+                kind: DisplayKind::AssistantPartial,
+                content: DisplayContent::Markdown(partial.content.clone()),
+            });
+        }
+        self.invalidate_output_layout();
     }
 
     /// Converts a v2 message page into the display list, mirroring the core's
@@ -902,6 +1043,7 @@ pub(crate) fn next_output_scroll_top(current: usize, max_scroll: usize, delta: i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protium_core::protocol::MessagePage;
 
     #[test]
     fn message_page_rebuilds_entry_history() {
@@ -929,6 +1071,92 @@ mod tests {
         assert!(matches!(entries[2].kind, DisplayKind::Thinking));
     }
 
+    fn message_page(ids: &[i64], next_before: Option<i64>, has_more: bool) -> MessagePage {
+        MessagePage {
+            messages: ids
+                .iter()
+                .map(|&id| MessageDto::User {
+                    id,
+                    content: format!("msg {id}"),
+                    created_at: "t".into(),
+                })
+                .collect(),
+            next_before,
+            has_more,
+        }
+    }
+
+    #[test]
+    fn apply_message_page_tracks_pagination_and_prepends_older() {
+        fn user_text(entry: &DisplayEntry) -> &str {
+            match &entry.content {
+                DisplayContent::Markdown(text) => text,
+                other => panic!("expected markdown entry, got {other:?}"),
+            }
+        }
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        // Fresh head page: newest 2 messages, older exist.
+        projection.apply_message_page(&message_page(&[10, 11], Some(9), true), false);
+        assert_eq!(projection.entries.len(), 2);
+        assert_eq!(user_text(&projection.entries[0]), "msg 10");
+        assert!(projection.history_has_more);
+        assert_eq!(projection.history_next_before, Some(9));
+        // Load the older page: prepended in front, cursors advance.
+        projection.apply_message_page(&message_page(&[7, 8, 9], Some(6), true), true);
+        assert_eq!(projection.entries.len(), 5);
+        assert_eq!(user_text(&projection.entries[0]), "msg 7");
+        assert_eq!(user_text(&projection.entries[4]), "msg 11");
+        assert!(projection.history_has_more);
+        assert_eq!(projection.history_next_before, Some(6));
+        // Head exhausted.
+        projection.apply_message_page(&message_page(&[1, 2, 3, 4, 5, 6], None, false), true);
+        assert_eq!(projection.entries.len(), 11);
+        assert!(!projection.history_has_more);
+        assert_eq!(projection.history_next_before, None);
+    }
+
+    #[test]
+    fn apply_message_page_preserves_scroll_anchor_on_prepend() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.apply_message_page(&message_page(&[10, 11], None, false), false);
+        // Simulate the user having scrolled up (distance from bottom > 0).
+        projection.message_scroll = 3;
+        projection.follow_output = false;
+        projection.output_scroll_top = Some(2);
+        projection.apply_message_page(&message_page(&[7, 8, 9], None, false), true);
+        // The anchor is preserved: distance-from-bottom unchanged and the
+        // absolute top position recomputed by the renderer, not kept stale.
+        assert_eq!(projection.message_scroll, 3);
+        assert!(!projection.follow_output);
+        assert_eq!(projection.output_scroll_top, None);
+    }
+
+    #[test]
+    fn at_history_top_requires_more_history_and_top_scroll() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.apply_message_page(&message_page(&[10, 11], Some(9), true), false);
+        assert!(!projection.at_history_top(), "no layout yet");
+        projection.message_layout = Some(MessageLayout {
+            viewport: ratatui::layout::Rect::new(0, 0, 80, 24),
+            width: 80,
+            scroll: 1,
+            text: String::new(),
+            lines: Vec::new(),
+            visual_lines: Vec::new(),
+            live_thinking_before: None,
+            live_thinking_rows: 0,
+            live_thinking_lines: Vec::new(),
+        });
+        projection.output_scroll_top = Some(0);
+        projection.follow_output = false;
+        assert!(projection.at_history_top());
+        projection.output_scroll_top = Some(5);
+        assert!(!projection.at_history_top());
+        projection.history_has_more = false;
+        projection.output_scroll_top = Some(0);
+        assert!(!projection.at_history_top(), "no more history");
+    }
+
     #[test]
     fn text_delta_appends_to_live_assistant_entry() {
         let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
@@ -942,6 +1170,174 @@ mod tests {
         assert!(
             matches!(&projection.entries[0].content, DisplayContent::Markdown(t) if t == "hello")
         );
+    }
+
+    #[test]
+    fn streaming_deltas_require_a_repaint() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        // Every streaming delta must ask the facade for a (coalesced) repaint so
+        // the answer and reasoning are visibly rendered as they arrive instead
+        // of only appearing once the response completes.
+        assert!(projection.handle_event(&Event::ModelStreaming).force_redraw);
+        assert!(
+            projection
+                .handle_event(&Event::ReasoningDelta {
+                    delta: "reasoning".into(),
+                })
+                .force_redraw
+        );
+        assert!(
+            projection
+                .handle_event(&Event::TextDelta {
+                    delta: "answer".into(),
+                })
+                .force_redraw
+        );
+    }
+
+    #[test]
+    fn tool_and_search_and_shell_events_force_a_repaint() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        };
+        // Tool start and finish must both request a repaint: the card leaves
+        // "Running" and shows "正在将工具结果交给模型……" on its own frame,
+        // even when no model event has arrived after the tool ended.
+        assert!(
+            projection
+                .handle_event(&Event::ToolStarted { call: call.clone() })
+                .force_redraw
+        );
+        assert!(
+            projection
+                .handle_event(&Event::ToolFinished {
+                    call,
+                    result: "ok".into(),
+                })
+                .force_redraw
+        );
+        // Native web search start and completion are visible transitions too.
+        assert!(
+            projection
+                .handle_event(&Event::WebSearchStarted {
+                    query: "rust async".into(),
+                })
+                .force_redraw
+        );
+        assert!(
+            projection
+                .handle_event(&Event::WebSearchCompleted { count: 3 })
+                .force_redraw
+        );
+        // A finished local shell command immediately releases the busy state
+        // and must be drawn (including the /diff early-return branch).
+        assert!(
+            projection
+                .handle_event(&Event::LocalCommandFinished {
+                    command: "!echo hi".into(),
+                    result: "hi".into(),
+                })
+                .force_redraw
+        );
+        assert!(
+            projection
+                .handle_event(&Event::LocalCommandFinished {
+                    command: "/diff".into(),
+                    result: "--- a\n+++ b".into(),
+                })
+                .force_redraw
+        );
+    }
+
+    #[test]
+    fn reasoning_completed_persists_summary_and_clears_live_state() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.handle_event(&Event::ModelStreaming);
+        projection.handle_event(&Event::ReasoningDelta {
+            delta: "推演过程".into(),
+        });
+        assert!(projection.thinking_active);
+        let outcome = projection.handle_event(&Event::ReasoningCompleted);
+        assert!(
+            outcome.force_redraw,
+            "the phase barrier must request a repaint"
+        );
+        assert!(
+            !projection.thinking_active,
+            "live thinking retires at the barrier"
+        );
+        assert!(projection.thinking_buffer.is_empty());
+        assert_eq!(projection.agent_phase, AgentPhase::StreamingText);
+        assert_eq!(
+            projection
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, DisplayKind::Thinking))
+                .count(),
+            1,
+            "the reasoning is persisted as a thinking summary"
+        );
+    }
+
+    #[test]
+    fn text_delta_after_reasoning_completed_only_appends_body() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.handle_event(&Event::ModelStreaming);
+        projection.handle_event(&Event::ReasoningDelta {
+            delta: "推演过程".into(),
+        });
+        projection.handle_event(&Event::ReasoningCompleted);
+        projection.handle_event(&Event::TextDelta {
+            delta: "正文".into(),
+        });
+        projection.handle_event(&Event::TextDelta {
+            delta: "继续".into(),
+        });
+        let summaries = projection
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, DisplayKind::Thinking))
+            .count();
+        assert_eq!(summaries, 1, "body deltas must not re-persist a summary");
+        assert!(
+            matches!(projection.entries.last().map(|entry| &entry.content),
+            Some(DisplayContent::Markdown(text)) if text == "正文继续")
+        );
+    }
+
+    #[test]
+    fn thinking_autexpands_while_streaming_then_summary_collapses_when_done() {
+        let mut projection = TuiSessionProjection::new("s1".into(), AgentMode::Build, None);
+        projection.handle_event(&Event::ModelStreaming);
+        assert!(
+            projection.thinking_expanded,
+            "live thinking should be expanded so reasoning is visible while streaming"
+        );
+        projection.handle_event(&Event::ReasoningDelta {
+            delta: "推演过程".into(),
+        });
+        projection.handle_event(&Event::ReasoningCompleted);
+        projection.handle_event(&Event::TextDelta {
+            delta: "正文".into(),
+        });
+        let thinking = projection
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.content {
+                DisplayContent::Thinking(thinking) => Some(thinking),
+                _ => None,
+            })
+            .expect("a thinking summary should be persisted when thinking ends");
+        assert!(
+            !projection.expanded_thinking.contains(&thinking.id),
+            "the finished summary should be collapsed by default (auto-collapse)"
+        );
+        // The user can still re-expand it by clicking the summary.
+        projection.expanded_thinking.insert(thinking.id.clone());
+        assert!(projection.expanded_thinking.contains(&thinking.id));
     }
 
     #[test]
