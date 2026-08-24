@@ -21,6 +21,7 @@
 - 快照写工具调用前由 agent 层捕获 pre_image、执行后回填 post_image；单文件超 `checkpoint_max_file_bytes` 存 marker（existed=0），单会话超 `checkpoint_max_session_bytes` 丢最旧，均由 storage 在写事务内 enforce。
 - 软删子树返回全部后代 id 供调用方关停 runtime；快照随软删由 `purge_soft_deleted_snapshots` 清理（`delete_session` 路径）。
 - 审计链：`tool_calls.decision` 记 `allowed`/`approved`/`rejected`/`denied`/`session-allowed`，新增策略来源需同步这里。
+- `messages.partial=1` 保存中断流的未完成回答（`save_partial`/`load_partial`/`clear_partial`）：单会话一条、覆盖写、正常完成或清空时清除；普通 history 页过滤 partial 行，partial 永不进入上下文或 `previous_response_id` 重放。
 
 ## 诊断
 

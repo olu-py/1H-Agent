@@ -34,7 +34,7 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 | TUI projection、渲染、长文本、滚动、鼠标（门面非核心） | `src/projection.rs`、`src/app.rs`、`src/ui.rs`、`src/output.rs` | [TUI](.agents/guides/tui.md) |
 | 工具、路径、SSRF、外部进程 | `crates/protium-core/src/tools/`、`security.rs` | [Tools](.agents/guides/tools.md) |
 | 会话、分支、迁移、持久化 | `crates/protium-core/src/storage.rs`、`session.rs` | [Storage](.agents/guides/storage.md)；涉及 Provider 状态时再读 Provider |
-| 配置上限、容量归一化、新增配置键 | `crates/protium-core/src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | 无；同步默认值与 `defaults_are_bounded` 类测试 |
+| 配置上限、容量归一化、新增配置键 | `crates/protium-core/src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算、`max_output_tokens`、未知模型窗口语义）；同步默认值与 `defaults_are_bounded` 类测试 |
 | CI、版本、安装包、tag | `.github/workflows/`、`Cargo.toml` | [Release](.agents/guides/release.md) |
 
 指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。
@@ -54,9 +54,9 @@ protium-core
 ```
 
 - 核心独占 `SessionRuntime`/`AgentRunner`/Provider 与密钥/ToolRegistry 与 Security/Storage(SQLite)/审批 oneshot，以及命令串行队列与取消、关停逻辑；消费端不得触碰以上任何一项。
-- 消费端（TUI/WebUI/Desktop）只允许使用 `AppService::start(CoreConfig)`、`AppHandle` 的 snapshot/messages/submit/execute_command/approve/cancel/activate/set_provider/subscribe/shutdown 接口，以及 `protocol.rs` 的 DTO 与 `bridge.rs` 的事件游标/回放。
+- 消费端（TUI/WebUI/Desktop）只允许使用 `AppService::start(CoreConfig)`、`AppHandle` 的 snapshot/messages/submit/execute_command/approve/cancel/activate/set_provider/subscribe/shutdown 接口，以及 `protocol.rs` 的 DTO 与 `bridge.rs` 的原子订阅（`subscribe_from`/`ResyncRequired`）。`submit` 返回请求序号、`cancel` 携带之防陈旧取消。
 - 消费端不解析 `AgentEvent` 或私有 JSON，只消费 `Envelope/Event`；Provider 私有协议先规范化为 `ModelEvent`，再经 protocol 映射给消费端。
-- 启动先取 snapshot，再按 `event_cursor` 回放后 subscribe；游标逐出或消费者滞后必须 resync（重取 snapshot + 消息页）。
+- 启动先取 snapshot，再 `subscribe_from(event_cursor)` 原子订阅并按 cursor 去重；游标逐出（`ResyncRequired`）或消费者滞后必须 resync（重取 snapshot + 消息页）。
 - TUI 是消费端 adapter：`App` 持有 `AppHandle` 与 `TuiSessionProjection`，经命令队列提交全部变更，不直接触碰核心；核心引擎独占会话状态，切换不停止后台任务；前端退出/断连不等于取消 agent。
 - 恢复沿 `head_turn_id` 父链；fork 不复制 Provider 服务端状态；undo/redo 移动 head 并按 `file_snapshots` 回滚/前滚文件（无快照的路径跳过）。
 - workspace 必须 canonicalize；拒绝绝对路径、`..`、符号链接逃逸；新目标验证 canonical parent。
