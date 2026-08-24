@@ -2,17 +2,19 @@
 
 ## 适用范围
 
-`agent_spawn`、子 Agent 调度、执行预算、进度状态、审批、取消和父子会话结果。
+集群调度、审批、取消、预算和子会话持久化——全部归 core 独占；消费端只展示 `ChildSessionProgress` 等公共事件。
 
 ## 入口
 
 - `crates/protium-core/src/agent.rs`：`AgentRunner`、`child_slots`、`ChildSessionStatus`、`ChildSessionProgress`、子循环与结果 JSON。
-- `crates/protium-core/src/config.rs`：`ClusterConfig` 和 Agent 模板；`service.rs`：审批 owner 与路由；`src/app.rs`：批次、进度展示与 `child_status` 跟踪。
+- `crates/protium-core/src/config.rs`：`ClusterConfig` 和 Agent 模板；`service.rs`：审批 owner 与路由。
 - `crates/protium-core/src/prompt.rs`/`tools/mod.rs`：集群契约、spawn schema 和子工具过滤。
+- 消费端展示：TUI 在 `src/app.rs`/`src/projection.rs` 只消费 `ChildSessionProgress` 与 `child_status`，不维护调度/审批 owner/批次状态机。
 
 ## 不变量
 
 - 子 Agent 仅一层、不能 spawn、无终端；写入仍经过 mode、安全和审批。
+- 调度、审批 owner、取消、预算和子会话持久化全部由 core 独占；TUI/WebUI/Desktop 不得自行调度子 Agent、维护审批 owner 或复制批次状态机，只能展示公共事件。
 - 同一父 runner 的 clone 共享 `child_slots`，默认并发 4；不同父 runner 不共享 semaphore，App runtime 共享审批锁。
 - 主动预算默认 300 秒，只计模型和工具；并发槽、审批槽和用户等待不计。范围由 `Config::load` 归一化。
 - `max_turns = 0` 无固定轮次；正数才产生 `turn_limit`，预算和资源上限始终有效。
@@ -31,6 +33,7 @@
 | 审批不可见/Y-N 无效 | 全局最早项 -> owner -> oneshot -> 锁范围 |
 | 取消后仍运行 | token -> select -> future/drop guard -> 终态 -> permit |
 | 主 Agent 无结果 | 每个 tool call ID 是否在失败/超时路径也返回结构化 output |
+| 消费端自行调度/错乱 | 是否绕过 core 调度 -> 是否复制批次状态机 -> 只读公共事件 |
 
 ## 验证
 

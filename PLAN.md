@@ -1,146 +1,142 @@
-# 将 WebUI 后端核心迁移到旧 TUI 项目
+# 重构 Agent 维护文档以支持多前端架构
 
-## 总体方案
+## Summary
 
-把 `1H-Agent-webUI` 中的 `crates/protium-core` 迁入当前仓库，保留旧 TUI 的 Ratatui/Crossterm 渲染层。最终形成：
+将维护协议统一调整为“`protium-core` 独立演进，TUI、WebUI、原生桌面作为消费端适配器”的架构。文档明确核心状态机、通用协议和各前端职责边界，禁止任何前端直接操作 `SessionRuntime`、`AgentRunner`、Storage、Provider 或审批 oneshot。
+
+本次只修改 `AGENTS.md`、`.agents/guides/` 和文档检查脚本，不修改 Rust 或前端实现。保留当前 TUI 专题，同时新增通用 UI 契约专题。
+
+## 主要修改
+
+### `AGENTS.md`
+
+- 更新稳定上下文：
+  - 项目由 `protium-core`、TUI adapter、WebUI adapter、Desktop adapter 组成。
+  - 后端核心可独立发布和迭代。
+  - TUI/WebUI/Desktop 只能通过通用接口连接核心。
+  - 当前仓库保留单进程 TUI 运行方式，但文档不再把 TUI 视为核心状态机。
+- 更新架构图：
 
 ```text
-1h-agent-tui
-  ├─ TUI 输入、布局、主题、Markdown、鼠标交互
-  └─ TuiAdapter
-       └─ protium-core::AppHandle
-            ├─ AgentRunner
-            ├─ Provider
-            ├─ ToolRegistry / Security
-            ├─ SessionRuntime
-            ├─ SQLite/WAL Storage
-            └─ EventBridge + v2 Protocol
+protium-core
+  AppService -> AppHandle -> Engine
+       |          |           |
+       |          +-> protocol::Snapshot / MessagePage
+       |          +-> EventBridge::Envelope
+       |
+       +-- TUI adapter      -> Ratatui/Crossterm
+       +-- WebUI adapter    -> REST/SSE
+       +-- Desktop adapter  -> native IPC
 ```
 
-TUI 与核心使用进程内 `AppHandle` 和 `protocol::Event` 连接，不启动 Web 服务、不通过 HTTP 回环调用、不保留第二套 Agent 状态机。`web/`、`crates/1h-agent-web`、Axum、SSE、RustEmbed 和 Web 鉴权代码不迁移。
+- 明确核心独占：
+  - `SessionRuntime`
+  - `AgentRunner`
+  - Provider/密钥
+  - ToolRegistry/Security
+  - Storage/SQLite
+  - 审批 oneshot
+  - 命令串行队列和取消/关停逻辑
+- 明确消费端只允许使用：
+  - `AppService::start(CoreConfig)`
+  - `AppHandle` 的 snapshot/messages/submit/execute_command/approve/cancel/activate/set_provider/subscribe/shutdown 等接口
+  - `protocol.rs` 的 DTO 和 `bridge.rs` 的事件游标/回放
+- 更新任务路由，新增 UI 通用接口路由，并将 Provider、Storage、Cluster、Tools、Runtime 的入口统一指向 `crates/protium-core`。
+- 保留 TUI 路由，但说明 `src/app.rs` 是 TUI 门面，不是业务核心。
+- 将 WebUI、Desktop 从“排除领域”改为“同一协议的外部消费端”；当前仓库不实现其 UI 代码，但维护协议覆盖其接入约束。
 
-## 代码组织
+### 新增 `.agents/guides/ui-contract.md`
 
-- 将新项目的 `crates/protium-core/src` 迁入当前仓库的 `crates/protium-core`，包含：
-  - `agent.rs`、`app.rs`、`commands.rs`、`config.rs`
-  - `provider/`、`tools/`、`security.rs`
-  - `storage.rs`、`session.rs`、`secrets.rs`
-  - `model.rs`、`input.rs`、`settings.rs`
-  - 新增的 `protocol.rs`、`bridge.rs`、`service.rs`
-- 根项目改为 Cargo workspace；旧 TUI 作为 `1h-agent-tui` 包，依赖 `protium-core`。
-- 旧 TUI 保留 `home.rs`、`ui.rs`、`output.rs`、`ui_layout.rs`、`ui_theme.rs`、`ui_view_model.rs`、`clipboard.rs` 以及 Ratatui/Crossterm 依赖。
-- TUI 不再直接拥有 `AgentRunner`、`Storage`、`ToolRegistry`、Provider 请求、审批 oneshot 或 `router_rx`。
-- 旧 `src/app.rs` 改造成 TUI 门面，建议保留 `App` 名称以减少渲染代码改动，但其内部只保存：
-  - `AppHandle`
-  - 当前 `TuiSessionProjection`
-  - TUI 专属输入、菜单、滚动、布局和鼠标状态
-  - 最近会话及子 Agent 展示状态
+控制在检查脚本允许的 50 行以内，包含：
 
-## v2 协议接入
+- 适用范围：所有 TUI/WebUI/Desktop 消费端。
+- 权威入口：
+  - `crates/protium-core/src/service.rs`
+  - `crates/protium-core/src/protocol.rs`
+  - `crates/protium-core/src/bridge.rs`
+  - 各消费端 adapter 的 transport/projection/render 层
+- 核心接口契约：
+  - 所有变更经 `AppHandle` 串行进入 Engine。
+  - 消费端不解析 `AgentEvent`，只消费 `Envelope/Event`。
+  - 启动先取 snapshot，再按 `event_cursor` replay 后 subscribe。
+  - 游标逐出或消费者滞后时必须 resync。
+  - 消息通过 `MessagePage` 游标分页。
+  - Approval 只传 `approval_id`，不得跨接口暴露 oneshot sender。
+- 协议演进：
+  - v2 之后只允许加法演进。
+  - 新事件必须贯通 agent forward、session reducer、protocol mapping、bridge 和所有消费端。
+  - 未知事件必须静默忽略。
+- 分层约束：
+  - TUI：Ratatui 状态、projection、渲染和输入。
+  - WebUI：HTTP/SSE transport 和浏览器状态。
+  - Desktop：IPC transport 和原生窗口生命周期。
+  - transport 不承载业务规则，核心不依赖任何 UI 框架。
 
-TUI 启动流程改为：
+### 现有专题指南
 
-1. canonicalize workspace。
-2. 读取共享 `Config`。
-3. 构造 `CoreConfig`，调用 `AppService::start`。
-4. 调用 `AppHandle::snapshot()` 获取：
-   - 当前会话
-   - 会话列表
-   - provider/model/mode
-   - busy/phase/status
-   - pending approval
-   - todo
-5. 用 `snapshot.event_cursor` 建立 `replay_after + subscribe` 事件消费。
-6. 对当前会话调用 `messages()`，初始化 TUI 展示投影。
-7. 进入原有 Ratatui 事件循环。
+- `runtime.md`
+  - 将生命周期主体改为 core `Engine/AppHandle`。
+  - 说明所有消费端共享同一核心状态机，前端退出/断连不等于取消 agent。
+  - 将事件链改为 `Agent task -> Engine -> EventBridge -> adapter`。
+  - 保留后台容量、删除子树、审批拒绝、取消、shutdown 和 workspace lock 规则。
+  - 新增 adapter 断开、resync、重复订阅和多消费端并发命令诊断项。
 
-所有上行操作统一调用 `AppHandle`：
+- `tui.md`
+  - 明确 TUI 只负责 projection、输入、布局、渲染、滚动和复制。
+  - 所有会话/命令/审批/取消/provider 操作都调用 `AppHandle`。
+  - `TuiSessionProjection` 只保存展示状态，不保存核心 runtime 或 oneshot。
+  - 终态、`transcript_invalidated`、`resync_required` 时从 snapshot/messages 重建展示状态。
+  - 保留现有 Ratatui 性能、缓存、hit-test、重绘和 UTF-8 约束。
 
-| TUI 行为 | 核心调用 |
-| --- | --- |
-| 首条输入/普通输入 | `submit(session_id, text)` |
-| `/undo`、`/redo`、`/fork`、`/todo` 等 | `execute_command(session_id, text)` |
-| Esc 取消 | `cancel(session_id)` |
-| 会话切换 | `activate_session(session_id)` |
-| 审批 y/n/a/Esc | `approve(approval_id, accept)` |
-| Provider/model 更新 | `set_provider(...)` 或扩展后的非密钥配置接口 |
-| 退出 | `shutdown()` |
+- `provider.md`
+  - 将 Provider 配置、密钥、协议解析、重试和恢复明确归入 core。
+  - 消费端不能读取 API Key、直接构造 Provider 请求或解析私有 JSON。
+  - 前端只能通过非密钥配置接口切换 provider/model/thinking。
+  - Provider 事件必须先规范化为公共 `ModelEvent`，再经 protocol 映射给消费端。
 
-禁止 TUI 重新实现 `Command` 解析、审批等待、取消 abort、会话删除和文件回滚。
+- `cluster.md`
+  - 将集群调度、审批、取消、预算、子会话持久化归入 core。
+  - TUI/WebUI/Desktop 只能展示 `ChildSessionProgress` 等公共事件。
+  - 各消费端不得自行调度子 Agent、维护审批 owner 或复制批次状态机。
 
-## TUI 状态投影
+- `tools.md`
+  - 将工具定义、权限分类、路径安全、进程控制、SSRF 校验归入 core。
+  - UI 只负责工具卡片、风险说明和审批交互；不得重新判断权限。
+  - 工具新增时增加 protocol 事件/DTO 与各消费端展示映射检查。
 
-旧渲染器依赖 `SessionRuntime` 的 `entries`、thinking、tool、approval 和滚动字段，而 v2 核心不向消费端暴露内部 runtime。因此新增 TUI 专属投影层：
+- `storage.md`
+  - 明确 SQLite/WAL、会话树、消息、provider state、file snapshots 全部由 core 独占。
+  - 消费端不得直接打开数据库或绕过 `AppHandle` 查询/写入。
+  - `snapshot/messages` 是消费端读取历史的唯一入口。
+  - 保留迁移、head 父链、fork、undo/redo、软删和快照上限规则。
 
-- `MessageDto -> DisplayEntry`：用于恢复历史消息。
-- `Event` reducer：处理 `text_delta`、`reasoning_delta`、`tool_started`、`tool_finished`、`todo_updated`、`child_session_progress`、`completed`、`failed`、`cancelled` 等事件。
-- `Approval` 只保存 `approval_id`、工具调用和原因，不保存 oneshot sender。
-- `Completed`、`transcript_invalidated`、`resync_required` 后重新调用 `messages()`，以数据库结果重建历史，避免 TUI 自己推断持久化状态。
-- 流式文本和思考内容在本地投影中增量更新，保持旧 TUI 的实时渲染体验。
-- 未知 v2 事件静默忽略，并记录调试日志。
-- `Event` 与 Crossterm 的 `Event` 使用显式别名，避免类型冲突。
+- `release.md`
+  - 增加 workspace/core/adapter 的版本兼容要求。
+  - 核心协议版本与消费端兼容性必须在发布前验证。
+  - 分别验证 TUI、WebUI、Desktop adapter；核心变更需覆盖所有消费端。
+  - 继续保留平台归档、checksums、安装包和完整 Rust 验证矩阵。
 
-旧 `ui.rs` 尽量继续读取兼容字段；无法直接复用的核心字段迁移到 `TuiSessionProjection`，不向 core 暴露 TUI 布局字段。
+### `scripts/check-agent-docs.sh`
 
-## 需要补齐的核心接口
+- 将 `ui-contract` 加入固定指南清单。
+- 保持每个指南必须包含五个标准章节。
+- 保持根文档每个指南只路由一次。
+- 保持根文档和指南行数上限；如新增架构说明导致超限，压缩重复叙述而不是放宽检查上限。
 
-新项目现有 `AppHandle` 已覆盖大部分行为，但为保证旧 TUI 功能完整，需要补齐：
+## Test Plan
 
-- 非密钥 Provider 配置更新接口，覆盖旧设置页实际修改的字段；API Key 仍只能写入环境变量/系统钥匙串。
-- thinking level/budget 的配置接口，或将其纳入同一个非密钥 Provider 更新请求。
-- 一个明确的 `subscribe_from(cursor)` 辅助方法，封装回放、订阅和 resync 语义，避免每个消费端重复实现。
-- 如 TUI 需要展示当前审批之外的后台审批，提供按 session 的审批查询或保持现有全局最早审批语义并在 TUI 中明确显示来源会话。
+- `bash scripts/check-agent-docs.sh`
+- `git diff --check`
+- 用 `rg` 检查旧的“WebUI 完全排除”“TUI 直接拥有 SessionRuntime”“消费端解析 AgentEvent”等矛盾表述已移除。
+- 检查所有指南入口是否与目标架构一致：
+  - core 代码只出现在 core/协议专题；
+  - TUI 代码只出现在 TUI 专题；
+  - WebUI/Desktop 只作为 adapter 和契约消费端出现。
+- 不运行 Cargo 测试，因为本次不修改 Rust、Cargo 或协议实现。
 
-这些接口必须继续通过核心命令队列串行执行，不能让 TUI 直接修改 core 内部 `Config`、`SessionRuntime` 或 `PendingApproval`。
+## Assumptions
 
-## 会话首页和配置兼容
-
-- 首页最近会话来自 `snapshot.sessions`，不再直接打开 SQLite。
-- 新会话采用 `submit(None, first_prompt)`，由核心创建会话；收到 `sessions_changed` 后刷新 snapshot 并进入主界面。
-- 保持现有 `data_dir/agent.db` 路径，直接复用新核心的 SQLite migration、head 链、file snapshot、undo/redo 逻辑。
-- 首次迁移前验证旧数据库备份、会话树、消息、provider 状态和文件快照。
-- 保留旧配置键的读取兼容；Web 专属 `server` 字段即使暂时保留，也只能由 Web adapter 使用，core 不读取 bind/port/auth。
-- 保留 `1h-agent` 命令作为兼容别名，同时将正式二进制命名为 `1h-agent-tui`。
-
-## 实施阶段
-
-1. **Workspace 与核心导入**
-   - 建立 workspace 和 `protium-core` crate。
-   - 迁入新核心源码、依赖和配置迁移。
-   - 先让 core 单独通过 fmt、lib tests、Clippy。
-
-2. **TUI 启动适配**
-   - 用 `AppService::start` 替换旧 `build_app`/直接 Storage 初始化。
-   - 删除 TUI 内部 AgentRunner、provider 请求和 router channel。
-   - 建立 snapshot/messages/bootstrap 流程。
-
-3. **事件和命令适配**
-   - 增加 TUI projection reducer。
-   - 替换输入、命令、审批、取消、切换会话、provider 设置调用。
-   - 保持原有键盘、鼠标、菜单和渲染行为。
-
-4. **功能 parity**
-   - 覆盖流式回复、思考、工具卡片、审批、取消、todo、子 Agent、mode、fork、undo/redo、diff、export、compact。
-   - 重点验证删除会话、后台 runtime 淘汰和退出清理只由 core 执行一次。
-
-5. **清理和发布**
-   - 删除 TUI 中重复的后端实现和无效依赖。
-   - 更新 README、Cargo metadata、安装脚本和维护指南。
-   - 保留 WebUI 项目作为未来独立 adapter，不把前端资源放入 TUI 二进制。
-
-## 验证标准
-
-- Core：`cargo fmt --all -- --check`、完整 lib tests、`cargo clippy --all-targets --all-features --locked -- -D warnings`。
-- TUI：Ratatui `TestBackend` 覆盖首页、消息流、工具状态、审批、取消、会话切换和 resync。
-- 集成测试：mock provider 下验证 `AppService -> AppHandle -> EventBridge -> TUI projection` 全链路。
-- 持久化测试：旧数据库迁移、10,000 条消息分页、head 父链、fork、undo/redo 文件快照。
-- 生命周期测试：workspace 独占锁、审批超时、Esc 取消终态、删除子树、后台 runtime 关停、`shutdown` 释放资源。
-- 手工验收：首条消息建会话、流式 reasoning/text、工具审批批准/拒绝、取消、provider/model 切换、集群子 Agent、重启恢复。
-- 最终执行 `cargo test --all-features --locked`、`git diff --check` 和 `bash scripts/check-agent-docs.sh`。
-
-## 默认假设
-
-- TUI 与核心在同一进程内运行，通过 `AppHandle`/v2 DTO/EventBridge 连接。
-- 不引入常驻 daemon、跨进程附着、TUI 到 Web 服务的 HTTP 调用。
-- 本次迁移只实现“新核心 + 旧 TUI”；Web HTTP/SSE adapter 和 React 前端继续留在 `1H-Agent-webUI`，以后可基于同一个 `protium-core` 独立接入。
-- v2 协议作为唯一新接口，旧 TUI 内部事件链逐步移除，不维护 v1/v2 双状态机。
+- `protium-core` 是后端核心的唯一业务状态机，未来可以独立迭代。
+- TUI、WebUI、Desktop 可以有不同 transport，但必须共享同一 `AppHandle` 语义和 v2 DTO/Event 契约。
+- 当前仓库暂不新增 WebUI 或 Desktop 源码；文档只规定它们的接入边界。
+- 当前工作树中用户已有的 `PLAN.md` 删除改动保持不变，不在本次文档修改中恢复或覆盖。

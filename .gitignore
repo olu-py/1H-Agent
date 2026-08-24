@@ -25,3 +25,4 @@ config.toml
 *.msi
 *.zip
 *.tar.gz
+PLAN.md

@@ -2,17 +2,21 @@
 
 ## 适用范围
 
-启动首页、渲染、布局缓存、长文本、实时思考、重绘合帧、滚动、鼠标命中、选择和复制。
+TUI adapter 的职责边界：projection、输入、布局、渲染、滚动和复制；不承担任何业务核心职责。
 
 ## 入口
 
-- `src/app.rs`：事件循环、`deferred_redraw_timer`、输入/菜单；`src/projection.rs`：`TuiSessionProjection` 的 revision、锚点和缓存失效。
+- `src/app.rs`：TUI 门面 `App` 持有 `AppHandle` 与事件循环；`deferred_redraw_timer`、输入/菜单；所有变更经 `AppHandle` 提交。
+- `src/projection.rs`：`TuiSessionProjection` 的 revision、锚点和缓存失效。
 - `src/home.rs`：启动首页状态、响应式布局、有限最近会话、选择菜单和命中矩形。
 - `src/output.rs`：`LayoutLine`、`StyleRun`、visual line、选区和 hit-test。
 - `src/ui.rs`：`render_visual_line`、Markdown、实时思考缓存和 footer 控件矩形。
 
 ## 不变量
 
+- TUI 只负责 projection、输入、布局、渲染、滚动和复制；所有会话/命令/审批/取消/provider 操作一律调用 `AppHandle`，不触碰核心 `SessionRuntime`/Storage/Provider/审批 oneshot。
+- `TuiSessionProjection` 只保存展示状态（entries/todos/busy/thinking 等），不保存核心 runtime 或 oneshot。
+- 终态、`TranscriptInvalidated`、`ResyncRequired` 时从 snapshot/messages 重建展示状态，不依赖被淘汰或过期的本地增量。
 - 逻辑行保存文本和 `StyleRun` 字节区间；可见行只切片相交段，不从行头扫描或逐字素建 Span。
 - Markdown/换行按 revision、宽度和展开状态缓存；摘要只失效目标条目，滚动/footer 不重解析正文。
 - 实时思考分离动态标题与正文；追加只重排末尾，裁剪或改宽才全量重建；每帧只生成一次结果。
@@ -35,6 +39,7 @@
 | 空闲高 CPU | 无更新 timer -> 动画生命周期 -> 后台误 redraw |
 | 点击错位 | 实际 Rect -> 裁剪/宽字符 -> scroll offset |
 | 选择乱码/缺失 | byte/grapheme 边界 -> 反向选区 -> style run 拆分 |
+| 展示与核心不一致 | 是否直读核心状态 -> 终态/`TranscriptInvalidated`/`ResyncRequired` 后是否重建 projection |
 
 ## 验证
 
