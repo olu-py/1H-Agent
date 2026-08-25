@@ -7,7 +7,7 @@
 ## 入口
 
 - `Cargo.toml`/`Cargo.lock`：版本；`.github/workflows/ci.yml`：三平台日常验证。
-- `crates/protium-core/Cargo.toml`：核心版本；消费端依赖声明。
+- 独立 core 仓库的 `Cargo.toml`：核心版本；消费端依赖声明。
 - `.github/workflows/release.yml`：正式发布；`.github/release-notes/`：按 tag 命名的说明。
 - `scripts/package-*` 仅作本地辅助，不是 GitHub Release 的权威流程。
 

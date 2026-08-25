@@ -39,6 +39,17 @@ cargo build --release
 ./target/release/1h-agent --workspace /path/to/project
 ```
 
+## 更新 protium-core
+
+TUI 通过 Git 依赖使用独立的 `protium-core` 仓库。core 合并到 `main` 后，在本仓库运行：
+
+```bash
+cargo update -p protium-core
+cargo test --all-features --locked
+```
+
+协议一致性夹具由 core 仓库维护；TUI 的 conformance 测试通过 Git 依赖的 `test-util` feature 消费它们。
+
 ## 配置 Provider
 
 进入主界面后按 `Ctrl+S` 打开 Provider 设置。设置页列出已保存的供应商连接和当前连接；选择“添加供应商”后，可从尚未添加的 OpenAI、DeepSeek、Qwen/Bailian、火山方舟和自定义兼容模板中创建连接。每种模板只能添加一次，选择已有连接可编辑并切换，`Ctrl+D` 可移除连接。非密钥配置保存到 TOML；API Key 仍保存到系统钥匙串，移除连接不会删除密钥。应用打开时只解锁当前 Provider 的钥匙串条目一次；其他 Provider 在用户显式切换或编辑时按需解锁一次，随后均使用进程缓存，不会在 Agent 热路径重复请求授权。

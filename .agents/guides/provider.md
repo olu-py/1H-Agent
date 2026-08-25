@@ -6,10 +6,10 @@ Provider 配置、密钥、请求协议、reasoning、`response_id`、上下文�
 
 ## 入口
 
-- 配置：`ProviderConfig`、`ProviderPreset`、`provider_for`、`upsert_provider`、`remove_provider`（`crates/protium-core/src/config.rs`）。
+- 配置：`ProviderConfig`、`ProviderPreset`、`provider_for`、`upsert_provider`、`remove_provider`（`protium-core (Git dependency): src/config.rs`）。
 - 密钥：`api_key_cached*`、`store_api_key_cached`（core `secrets` facade），仅存在性/解锁入口暴露给消费端。
 - 切换：消费端只经 `AppHandle::set_provider`/`set_provider_config`/`remove_provider` 提交，不直接改配置；首页选择 `HomeSelection`/`apply_home_selection` 是 TUI 侧入口。
-- 请求/恢复：`replay_safe_items`、请求游标、`crates/protium-core/src/provider/openai.rs`、`storage.rs` 的 Provider 状态。
+- 请求/恢复：`replay_safe_items`、请求游标、`protium-core (Git dependency): src/provider/openai.rs`、`storage.rs` 的 Provider 状态。
 
 ## 不变量
 

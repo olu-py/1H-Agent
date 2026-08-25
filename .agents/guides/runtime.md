@@ -6,11 +6,11 @@ core `Engine`/`AppHandle` 生命周期主体：当前/后台 runtime 停放与�
 
 ## 入口
 
-- `crates/protium-core/src/service.rs`：`Engine`/`AppHandle`、`CoreCommand` 串行队列、`AppService::start` 的 workspace 独占锁与 `shutdown`。
-- `crates/protium-core/src/app.rs`：核心 `App` 的 `activate_session`、`evict_background_overflow`、`handle_routed_event`。
-- `crates/protium-core/src/session.rs`：`SessionRuntime` 的 `shutdown`/`idle`/`parked_at`、终态事件复位。
-- `crates/protium-core/src/storage.rs`：`delete_session` 返回被删子树全部 id。
-- `crates/protium-core/src/bridge.rs`：`EventBridge` 向所有消费端 fan-out `Envelope`。
+- `protium-core (Git dependency): src/service.rs`：`Engine`/`AppHandle`、`CoreCommand` 串行队列、`AppService::start` 的 workspace 独占锁与 `shutdown`。
+- `protium-core (Git dependency): src/app.rs`：核心 `App` 的 `activate_session`、`evict_background_overflow`、`handle_routed_event`。
+- `protium-core (Git dependency): src/session.rs`：`SessionRuntime` 的 `shutdown`/`idle`/`parked_at`、终态事件复位。
+- `protium-core (Git dependency): src/storage.rs`：`delete_session` 返回被删子树全部 id。
+- `protium-core (Git dependency): src/bridge.rs`：`EventBridge` 向所有消费端 fan-out `Envelope`。
 
 ## 不变量
 

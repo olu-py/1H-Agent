@@ -6,10 +6,10 @@
 
 ## 入口
 
-- `crates/protium-core/src/service.rs`：`AppService::start`、`AppHandle` 全部类型化接口。
-- `crates/protium-core/src/protocol.rs`：v2 DTO 权威定义（`Event`/`AppSnapshotV2`/`MessageDto`/`MessagePage`/`Envelope`/`ContextBudgetDto`/`PartialDto`）。
-- `crates/protium-core/src/bridge.rs`：`EventBridge` 原子订阅（`subscribe_from`/`Subscription`/`ResyncRequired`）。
-- `crates/protium-core/src/conformance.rs`（`test-util` feature，非默认）：共享回放场景、`check_stream_invariants` 与穷尽变体目录；JSON 夹具产物在 `crates/protium-core/conformance/` 供外部消费端（WebUI 仓库）直接使用。
+- `protium-core (Git dependency): src/service.rs`：`AppService::start`、`AppHandle` 全部类型化接口。
+- `protium-core (Git dependency): src/protocol.rs`：v2 DTO 权威定义（`Event`/`AppSnapshotV2`/`MessageDto`/`MessagePage`/`Envelope`/`ContextBudgetDto`/`PartialDto`）。
+- `protium-core (Git dependency): src/bridge.rs`：`EventBridge` 原子订阅（`subscribe_from`/`Subscription`/`ResyncRequired`）。
+- `protium-core (Git dependency): src/conformance.rs`（`test-util` feature，非默认）：共享回放场景、`check_stream_invariants` 与穷尽变体目录；JSON 夹具产物在 `protium-core (Git dependency): conformance/` 供外部消费端（WebUI 仓库）直接使用。
 - 各消费端 adapter 的 transport/projection/render 层。
 
 ## 不变量
@@ -37,7 +37,7 @@
 
 - 文档改动跑 `bash scripts/check-agent-docs.sh` + `git diff --check`。
 - 新增协议事件：确认加法演进（旧 UI 可忽略）、贯通全部环节，并同步各消费端映射与展示。
-- 新增协议事件的强制链路：`conformance.rs` 穷尽变体目录先编译失败 -> 补至少一个场景 -> `cargo test -p protium-core --lib --features test-util conformance`（场景不变量 + 契约测试 `scripted_round_emits_documented_order` + JSON 夹具无漂移并提交）-> TUI 回放测试（`conformance_corpus_replays_into_projection`、`conformance_corpus_replays_and_dedups_by_cursor`）自动消费新场景。夹具仅在 `test-util` feature 下编译，不进 release 二进制。
-- 协议/DTO 变更后同步 `crates/protium-core/bindings/`：绑定由 `#[ts(export)]` 生成的 `export_bindings_*` 测试在 `cargo test` 时再生成并验证（ts-rs 默认配置、`bigint`），以无漂移为准；`protium-tsgen` 二进制用 `with_large_int("number")`，输出仅作参考且 CI 不校验。WebUI 契约随 v2 定义同步。
+- 新增协议事件的强制链路：`conformance.rs` 穷尽变体目录先编译失败 -> 补至少一个场景 -> `cargo test --lib --features test-util conformance`（场景不变量 + 契约测试 `scripted_round_emits_documented_order` + JSON 夹具无漂移并提交）-> TUI 回放测试（`conformance_corpus_replays_into_projection`、`conformance_corpus_replays_and_dedups_by_cursor`）自动消费新场景。夹具仅在 `test-util` feature 下编译，不进 release 二进制。
+- 协议/DTO 变更后同步 `protium-core (Git dependency): bindings/`：绑定由 `#[ts(export)]` 生成的 `export_bindings_*` 测试在 `cargo test` 时再生成并验证（ts-rs 默认配置、`bigint`），以无漂移为准。WebUI 契约随 v2 定义同步。
 - 事件/协议变更端到端速查：`ModelEvent`（provider 归一化）→ `AgentEvent`（forward 闭包合并/阈值，如 `ToolCallStreaming` 1 KiB 合并）→ `protocol::Event`（`routed_to_event` 映射 + doc 顺序保证）→ `bridge::event_payload_bytes` → 核心 reducer（`session.rs` phase/status）→ 消费端展示（TUI 见 tui.md）→ bindings（`cargo test` 导出测试）→ 测试（agent scripted / conformance 契约与回放 / protocol serde / projection / facade 帧文本）。
 - 协议/桥接改动升级到 `cargo test --lib --all-features --locked` 与完整 Clippy。

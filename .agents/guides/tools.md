@@ -6,10 +6,10 @@
 
 ## 入口
 
-- `crates/protium-core/src/tools/mod.rs`：`definitions()`、`execute()`、`policy()` 与只读模式拦截。
-- `crates/protium-core/src/tools/filesystem.rs`、`git.rs`、`process.rs`、`web.rs`：各领域实现。
-- `crates/protium-core/src/security.rs`：`Workspace` 解析、`classify_tool`。
-- 下游接入：`crates/protium-core/src/agent.rs`（`WRITE_TOOLS`/角色 infer）、`prompt.rs`；消费端展示映射：`src/ui.rs`（`tool_display_name`/`tool_compact_summary`/`tool_risk`/`argument_label`）与 protocol 的 `ToolCall`/`ToolStarted`/`ToolFinished` 事件。
+- `protium-core (Git dependency): src/tools/mod.rs`：`definitions()`、`execute()`、`policy()` 与只读模式拦截。
+- `protium-core (Git dependency): src/tools/filesystem.rs`、`git.rs`、`process.rs`、`web.rs`：各领域实现。
+- `protium-core (Git dependency): src/security.rs`：`Workspace` 解析、`classify_tool`。
+- 下游接入：`protium-core (Git dependency): src/agent.rs`（`WRITE_TOOLS`/角色 infer）、`prompt.rs`；消费端展示映射：`src/ui.rs`（`tool_display_name`/`tool_compact_summary`/`tool_risk`/`argument_label`）与 protocol 的 `ToolCall`/`ToolStarted`/`ToolFinished` 事件。
 
 ## 不变量
 

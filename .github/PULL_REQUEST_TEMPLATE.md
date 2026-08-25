@@ -14,7 +14,7 @@
 
 - [ ] 加法演进：新变体/字段旧 UI 可忽略；未改名、未重排、未复用旧 tag
 - [ ] `conformance.rs`：穷尽变体目录已补（编译强制）、至少一个新场景、契约测试通过
-- [ ] JSON 夹具无漂移并已提交（`cargo test -p protium-core --lib --features test-util conformance`）
+- [ ] JSON 夹具无漂移并已提交（`cargo test --lib --features test-util conformance`）
 - [ ] TUI 映射已更新（projection 穷尽 match），`cargo test --lib conformance` 回放通过
 - [ ] ts-rs bindings 已再生成（`cargo test` 导出测试，无漂移）
 - [ ] `.agents/guides/ui-contract.md` 顺序保证与文档已同步

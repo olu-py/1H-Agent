@@ -6,8 +6,8 @@
 
 ## 入口
 
-- `crates/protium-core/src/storage.rs`：`from_connection`（建表 + `ensure_column` 兼容旧库 + `backfill_turns`）、全部读写方法。
-- `crates/protium-core/src/service.rs`/`session.rs`：undo/redo/delete/fork 命令与文件回滚交互。
+- `protium-core (Git dependency): src/storage.rs`：`from_connection`（建表 + `ensure_column` 兼容旧库 + `backfill_turns`）、全部读写方法。
+- `protium-core (Git dependency): src/service.rs`/`session.rs`：undo/redo/delete/fork 命令与文件回滚交互。
 - 消费端只经 `AppHandle` 提交命令；`snapshot`/`messages` 是读取历史的唯一入口。
 
 ## 不变量

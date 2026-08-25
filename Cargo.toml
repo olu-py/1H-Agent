@@ -17,7 +17,7 @@ name = "1h-agent"
 path = "src/main.rs"
 
 [dependencies]
-protium-core = { path = "crates/protium-core" }
+protium-core = { workspace = true }
 anyhow = { workspace = true }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 base64 = "0.22"
@@ -40,11 +40,10 @@ uuid = { workspace = true }
 tempfile = { workspace = true }
 # Enables the shared conformance corpus (scenarios + stream invariants) so the
 # TUI replay tests consume the exact same fixtures the core asserts against.
-protium-core = { path = "crates/protium-core", features = ["test-util"] }
+protium-core = { workspace = true, features = ["test-util"] }
 
 [workspace]
 resolver = "2"
-members = ["crates/protium-core"]
 
 [workspace.package]
 version = "0.5.0"
@@ -53,6 +52,7 @@ rust-version = "1.85"
 description = "A lightweight, permission-aware multi-interface agent for Linux, macOS, and Windows"
 authors = ["olu"]
 license-file = "LICENSE"
+repository = "https://github.com/olu-py/1H-Agent"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -84,6 +84,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+protium-core = { git = "https://github.com/olu-py/1H-Agent-core.git", branch = "main" }
 
 [profile.release]
 opt-level = "s"

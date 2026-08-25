@@ -19,7 +19,7 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 
 1. 先运行 `git status --short --branch`，识别并保护用户已有改动。
 2. 用 `rg` 定位定义、直接调用者、事件变体和相邻测试；只读任务命中的专题。
-3. 按改动面直达相关模块（启动链路入口为 `src/main.rs -> app::run`）：TUI adapter 门面在 `src/app.rs`（`App` + `TuiSessionProjection`），核心状态机在 `crates/protium-core/src/service.rs`（`AppService`/`Engine`/`AppHandle`），单会话在 `session.rs`（`SessionRuntime`），模型/工具循环在 `agent.rs`（`AgentRunner`）；消费端契约在 `protocol.rs`/`bridge.rs`。
+3. 按改动面直达相关模块（启动链路入口为 `src/main.rs -> app::run`）：TUI adapter 门面在 `src/app.rs`（`App` + `TuiSessionProjection`），核心状态机在 `protium-core (Git dependency): src/service.rs`（`AppService`/`Engine`/`AppHandle`），单会话在 `session.rs`（`SessionRuntime`），模型/工具循环在 `agent.rs`（`AgentRunner`）；消费端契约在 `protocol.rs`/`bridge.rs`。
 4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
 5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
 
@@ -27,14 +27,14 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 
 | 领域 | 首读入口 | 专题/读取条件 |
 | --- | --- | --- |
-| 通用 UI 契约、事件游标/回放、resync、协议一致性夹具 | `crates/protium-core/src/protocol.rs`、`bridge.rs`、`service.rs`、`conformance.rs` | [UI Contract](.agents/guides/ui-contract.md) |
-| 启动、全局状态、会话路由 | `crates/protium-core/src/service.rs`、`crates/protium-core/src/app.rs`；TUI 门面 `src/app.rs` | [Runtime](.agents/guides/runtime.md)；仅沿目标事件链读取 |
-| Provider、模型、密钥、协议、压缩恢复 | `crates/protium-core/src/config.rs`、`agent.rs`、`provider/openai.rs` | [Provider](.agents/guides/provider.md) |
-| 子 Agent、审批、取消、集群停滞 | `crates/protium-core/src/agent.rs`、`service.rs` | [Cluster](.agents/guides/cluster.md) |
+| 通用 UI 契约、事件游标/回放、resync、协议一致性夹具 | `protium-core (Git dependency): src/protocol.rs`、`bridge.rs`、`service.rs`、`conformance.rs` | [UI Contract](.agents/guides/ui-contract.md) |
+| 启动、全局状态、会话路由 | `protium-core (Git dependency): src/service.rs`、`protium-core (Git dependency): src/app.rs`；TUI 门面 `src/app.rs` | [Runtime](.agents/guides/runtime.md)；仅沿目标事件链读取 |
+| Provider、模型、密钥、协议、压缩恢复 | `protium-core (Git dependency): src/config.rs`、`agent.rs`、`provider/openai.rs` | [Provider](.agents/guides/provider.md) |
+| 子 Agent、审批、取消、集群停滞 | `protium-core (Git dependency): src/agent.rs`、`service.rs` | [Cluster](.agents/guides/cluster.md) |
 | TUI projection、渲染、长文本、滚动、鼠标（门面非核心） | `src/projection.rs`、`src/app.rs`、`src/ui.rs`、`src/output.rs`、`src/ui_view_model.rs` | [TUI](.agents/guides/tui.md) |
-| 工具、路径、SSRF、外部进程 | `crates/protium-core/src/tools/`、`security.rs` | [Tools](.agents/guides/tools.md) |
-| 会话、分支、迁移、持久化 | `crates/protium-core/src/storage.rs`、`session.rs` | [Storage](.agents/guides/storage.md)；涉及 Provider 状态时再读 Provider |
-| 配置上限、容量归一化、新增配置键 | `crates/protium-core/src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算、`max_output_tokens`、未知模型窗口语义）；同步默认值与 `defaults_are_bounded` 类测试 |
+| 工具、路径、SSRF、外部进程 | `protium-core (Git dependency): src/tools/`、`security.rs` | [Tools](.agents/guides/tools.md) |
+| 会话、分支、迁移、持久化 | `protium-core (Git dependency): src/storage.rs`、`session.rs` | [Storage](.agents/guides/storage.md)；涉及 Provider 状态时再读 Provider |
+| 配置上限、容量归一化、新增配置键 | `protium-core (Git dependency): src/config.rs` 的 `Config::load` clamp 区、`config/config.example.toml` | Provider 专题（容量预算、`max_output_tokens`、未知模型窗口语义）；同步默认值与 `defaults_are_bounded` 类测试 |
 | CI、版本、安装包、tag | `.github/workflows/`、`Cargo.toml` | [Release](.agents/guides/release.md) |
 
 指南与源码不一致时以源码为准，并在同一改动中更新该指南；一个事实只归属根文档或一个专题。
