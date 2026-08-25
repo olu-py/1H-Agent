@@ -9,7 +9,7 @@ project: 1H-Agent（1H = 氕/protium）
 goal: 极致轻量、高性能、权限感知的跨平台 Agent；protium-core 独立演进，TUI/WebUI/Desktop 为消费端适配器
 runtime: 核心 protium-core（Rust/Tokio，SQLite/WAL）；消费端只经通用接口连接核心
 authority: 源码 > config/config.example.toml > .github/workflows > 本文件 > 专题指南
-scope: 核心状态机、通用 UI 协议、TUI adapter、模型流、受控工具、多会话、AI 集群、跨平台发布
+scope: TUI adapter、projection/渲染/输入、通用协议适配、跨平台发布
 excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束）、内置浏览器、远程 MCP、动态插件、图片和语音能力
 ```
 
@@ -19,15 +19,16 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 
 1. 先运行 `git status --short --branch`，识别并保护用户已有改动。
 2. 用 `rg` 定位定义、直接调用者、事件变体和相邻测试；只读任务命中的专题。
-3. 按改动面直达相关模块（启动链路入口为 `src/main.rs -> app::run`）：TUI adapter 门面在 `src/app.rs`（`App` + `TuiSessionProjection`），核心状态机在 `protium-core (Git dependency): src/service.rs`（`AppService`/`Engine`/`AppHandle`），单会话在 `session.rs`（`SessionRuntime`），模型/工具循环在 `agent.rs`（`AgentRunner`）；消费端契约在 `protocol.rs`/`bridge.rs`。
+3. 从 `src/main.rs -> app::run` 进入：TUI 门面是 `src/app.rs`（`App` + `TuiSessionProjection`）；核心接口在独立 `1H-Agent-core` 仓库的 `src/service.rs`、`protocol.rs`、`bridge.rs`。
 4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
 5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
+6. core 变更先在独立仓库完成并 push；本仓库只定向更新 Git 依赖、适配和提交锁文件，禁止编辑 Cargo checkout。
 
 ## 任务路由
 
 | 领域 | 首读入口 | 专题/读取条件 |
 | --- | --- | --- |
-| 通用 UI 契约、事件游标/回放、resync、协议一致性夹具 | `protium-core (Git dependency): src/protocol.rs`、`bridge.rs`、`service.rs`、`conformance.rs` | [UI Contract](.agents/guides/ui-contract.md) |
+| 通用 UI 契约、事件游标/回放、resync、协议一致性夹具 | core 仓库 `src/protocol.rs`、`bridge.rs`、`service.rs`、`conformance.rs` | [UI Contract](.agents/guides/ui-contract.md) |
 | 启动、全局状态、会话路由 | `protium-core (Git dependency): src/service.rs`、`protium-core (Git dependency): src/app.rs`；TUI 门面 `src/app.rs` | [Runtime](.agents/guides/runtime.md)；仅沿目标事件链读取 |
 | Provider、模型、密钥、协议、压缩恢复 | `protium-core (Git dependency): src/config.rs`、`agent.rs`、`provider/openai.rs` | [Provider](.agents/guides/provider.md) |
 | 子 Agent、审批、取消、集群停滞 | `protium-core (Git dependency): src/agent.rs`、`service.rs` | [Cluster](.agents/guides/cluster.md) |
@@ -70,9 +71,9 @@ protium-core
 | 改动 | 最小验证 |
 | --- | --- |
 | 文档 | `bash scripts/check-agent-docs.sh`、`git diff --check` |
-| 迭代中 | `cargo test -p <目标crate> --lib --all-features --locked <filter>`；每次只选一个相关过滤器 |
-| 局部 Rust 完成 | `cargo fmt --all -- --check`、`cargo test -p <目标crate> --lib --all-features --locked` |
+| 迭代中 | `cargo test --lib --all-features --locked <filter>`；每次只选一个相关过滤器 |
+| 局部 Rust 完成 | `cargo fmt --all -- --check`、`cargo test --lib --all-features --locked` |
 | 工具/存储/安全/进程或跨模块 | `cargo clippy --all-targets --all-features --locked -- -D warnings`、`cargo test --workspace --all-features --locked` |
 | 发布 | 读取 Release 专题并运行其完整验证 |
 
-保持改动聚焦，复用现有 helper，不清理无法证明无用的文件。未运行的检查必须在最终回复说明；不要因 Cargo 锁或冷缓存终止正常构建。验证档位按改动面判定：纯文档/展示改动可不跑 clippy 与全量；事件/协议/持久化类型改动必须覆盖所有构造点、match、序列化与恢复测试；跨模块才升级全量。注意工作区根 `cargo test` 只测根包 protium-tui，核心改动必须 `-p protium-core`、跨模块用 `--workspace`。
+保持改动聚焦，复用现有 helper，不清理无法证明无用的文件。未运行的检查必须在最终回复说明；不要因 Cargo 锁或冷缓存终止正常构建。验证档位按改动面判定：纯文档/展示改动可不跑 clippy 与全量；协议适配必须覆盖 match、回放与 projection；跨模块才升级全量。核心源码及其测试只在 `1H-Agent-core` 仓库运行。

@@ -1,10 +1,12 @@
-# 1H-Agent
+# 1H-Agent TUI
 
 `1H` 指氕（protium），即氢-1 同位素。1H-Agent 是面向 Linux、macOS 和 Windows 的轻量、权限感知终端 Agent：单 Rust 二进制、流式对话、工具审批与本地会话持久化。
 
+本仓库只维护 TUI 适配器；UI 无关状态机来自独立的 [1H-Agent-core](https://github.com/olu-py/1H-Agent-core) Git 依赖。普通用户不需要单独下载或构建 core。
+
 ## 获取与启动
 
-GitHub Releases 提供 Linux x86_64、Windows x86_64、macOS Intel 和 macOS Apple Silicon 的原生包，并附带 `SHA256SUMS.txt` 用于校验。
+[GitHub Releases](https://github.com/olu-py/1H-Agent/releases) 提供 Linux x86_64、Windows x86_64、macOS Intel 和 macOS Apple Silicon 的原生包，并附带 `SHA256SUMS.txt` 用于校验。
 
 Windows 解压后在 PowerShell 运行：
 
@@ -24,10 +26,19 @@ macOS 请按芯片选择 `macos-aarch64` 或 `macos-x86_64`，解压后运行：
 xattr -d com.apple.quarantine ./1h-agent
 ```
 
+也可以使用 Rust 工具链从 Git 安装。`--locked` 会使用本仓库提交的锁文件，包括其中锁定的 core commit：
+
+```bash
+cargo install --git https://github.com/olu-py/1H-Agent.git \
+  --locked --bin 1h-agent
+```
+
 从源码开发运行：
 
 ```bash
-cargo run -- --workspace /path/to/project
+git clone https://github.com/olu-py/1H-Agent.git
+cd 1H-Agent
+cargo run --locked --bin 1h-agent -- --workspace /path/to/project
 ```
 
 应用每次启动先进入轻量首页。直接输入首条消息并按 `Enter` 会创建新会话并进入主界面；按 `Tab` 可切换到最近会话列表，使用方向键和 `Enter` 恢复会话，也可以直接点击会话标题。首页不会预先创建空会话或加载历史消息。
@@ -35,20 +46,25 @@ cargo run -- --workspace /path/to/project
 构建 release 二进制：
 
 ```bash
-cargo build --release
+cargo build --release --locked --bin 1h-agent
 ./target/release/1h-agent --workspace /path/to/project
 ```
 
 ## 更新 protium-core
 
-TUI 通过 Git 依赖使用独立的 `protium-core` 仓库。core 合并到 `main` 后，在本仓库运行：
+这一节只面向维护者。普通构建不会自动追踪 core 的 `main`：`Cargo.lock` 锁定具体 commit，只有提交新的锁文件后，其他用户才会获得新版 core。
+
+先在独立的 [core 仓库](https://github.com/olu-py/1H-Agent-core) 完成测试、提交并 push `main`，再在本仓库运行：
 
 ```bash
 cargo update -p protium-core
+cargo test --lib conformance
 cargo test --all-features --locked
 ```
 
-协议一致性夹具由 core 仓库维护；TUI 的 conformance 测试通过 Git 依赖的 `test-util` feature 消费它们。
+检查 `Cargo.lock` 中的 core commit 和适配器差异后，在本仓库单独提交。普通 `cargo update` 会同时更新其他依赖，不适合仅升级 core。
+
+协议一致性夹具由 core 仓库维护；TUI conformance 测试通过 Git 依赖的 `test-util` feature 消费它们。不要修改 Cargo 缓存中的 checkout，也不要把 core 源码复制回本仓库。WebUI 是另一个独立消费端，见 [1H-Agent-webUI](https://github.com/olu-py/1H-Agent-webUI)。
 
 ## 配置 Provider
 

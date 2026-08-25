@@ -7,14 +7,15 @@
 ## 入口
 
 - `Cargo.toml`/`Cargo.lock`：版本；`.github/workflows/ci.yml`：三平台日常验证。
-- 独立 core 仓库的 `Cargo.toml`：核心版本；消费端依赖声明。
+- 独立 core 仓库：核心版本与协议产物；本仓库 `Cargo.lock`：实际锁定的 core commit。
 - `.github/workflows/release.yml`：正式发布；`.github/release-notes/`：按 tag 命名的说明。
 - `scripts/package-*` 仅作本地辅助，不是 GitHub Release 的权威流程。
 
 ## 不变量
 
 - Cargo manifest/lock 版本一致；tag 是同版本的新 annotated `vX.Y.Z`，不得移动或复用成功 tag。
-- workspace/core/adapter 版本必须兼容：核心协议版本（`PROTOCOL_VERSION`）与各消费端兼容性在发布前验证；TUI/WebUI/Desktop adapter 分别验证，核心变更需覆盖所有消费端。
+- 兼容性由本仓库锁定的 core commit、`PROTOCOL_VERSION` 和 conformance 测试共同确认；core 与 TUI 版本号不要求相同。
+- core 必须先 push；本仓库再定向更新 core、完成 TUI 适配并提交 `Cargo.lock`。TUI tag/release 不隐含发布 core 或其他消费端。
 - 先提交并推送 main、核对远端 SHA，再建 tag；notes 文件必须是 `.github/release-notes/vX.Y.Z.md`。
 - 权威流程：版本校验 -> 三平台验证 -> 四目标归档和安装包 -> checksums -> GitHub Release。
 - 归档保留 README、LICENSE、第三方声明和示例配置；Release 包含归档、DEB、MSI、checksums 和 notices。
@@ -29,7 +30,7 @@
 | version 失败 | tag 去 `v` -> Cargo metadata -> lockfile version |
 | publish 失败 | build/installers artifacts -> notes -> checksums -> 权限 |
 | 单平台失败 | runner shell -> 路径语义 -> 平台专用依赖/命令 |
-| 消费端协议不兼容 | `PROTOCOL_VERSION` -> 新旧事件/DTO 兼容 -> 各 adapter 构建与契约验证 |
+| core 升级后协议不兼容 | `Cargo.lock` core SHA -> `PROTOCOL_VERSION` -> conformance -> TUI projection |
 
 ## 验证
 
@@ -41,4 +42,4 @@ cargo build --release --locked
 git diff --check
 ```
 
-- 核心协议或 DTO 变更时，额外验证所有消费端 adapter（当前为 TUI）仍能构建并消费 v2 契约。
+- core 依赖更新时额外运行 `cargo test --lib conformance`；其他消费端由各自仓库独立验证和发布。

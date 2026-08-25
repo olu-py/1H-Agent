@@ -1,7 +1,7 @@
 # 协议一致性夹具与多端适配规范化实施计划
 
-> 状态：Phase 1 已批准实施。Phase 2 为后续独立改动。
-> 权威源码：`crates/protium-core/src/conformance.rs`（实施后生效，文档与源码不一致时以源码为准）。
+> 状态：已归档。本文记录 conformance 初次实施，当前维护以 `.agents/guides/ui-contract.md` 和独立 [1H-Agent-core](https://github.com/olu-py/1H-Agent-core) 仓库为准。
+> 文中的路径已按 core 抽离后的仓库结构更新，不再表示本仓库包含 core 源码。
 
 ## 背景与目标
 
@@ -27,25 +27,25 @@
 新建 `docs/plans/protocol-conformance-plan.md`（本文件）。
 
 ### 1. conformance 模块（test-util feature）
-- `crates/protium-core/Cargo.toml`：新增 `[features] test-util = []`（非默认，零新依赖）。
-- `crates/protium-core/src/lib.rs`：`#[cfg(feature = "test-util")] pub mod conformance;`
-- 新建 `crates/protium-core/src/conformance.rs`：
+- core 仓库 `Cargo.toml`：新增 `[features] test-util = []`（非默认，零新依赖）。
+- core 仓库 `src/lib.rs`：`#[cfg(feature = "test-util")] pub mod conformance;`
+- core 仓库新建 `src/conformance.rs`：
   - `pub struct Scenario { name, description, expectation: Expectation, envelopes: Vec<Envelope> }`；`pub enum Expectation { RoundStreaming, RoundCompleted, RoundFailed, RoundCancelled, ApprovalPending, Resync }`。
   - `pub fn scenarios()`：初始场景集覆盖全部 `Event` 变体（以覆盖测试为最终裁判）；cursor 从 1 递增、固定 session_id，保证确定性。
   - `pub fn check_stream_invariants(&[Envelope]) -> Result<(), Vec<String>>`：只实现 ui-contract.md 已文档化的规则——cursor 严格递增；同轮内 `ReasoningDelta* -> ReasoningCompleted`（仅一次、仅有思考时）`-> TextDelta* -> ToolCallStreaming*`（received_bytes 单调）`-> Approval/ToolStarted`；Approval 后终须 `ApprovalResolved` 或终态；终态每轮至多一次且居轮末。
   - `fn variant_name(&Event) -> &'static str`：穷尽 match 无通配——新增变体即编译失败，这是核心强制机制。
-- `crates/protium-core/src/service.rs`：`routed_to_event` 改 `pub(crate)`（一词改动，对外仍不可见）。
+- core 仓库 `src/service.rs`：`routed_to_event` 改 `pub(crate)`（一词改动，对外仍不可见）。
 
 ### 2. 核心契约测试（scripted -> 真实映射 -> 不变量）
 conformance.rs `#[cfg(test)]` 内：
 - 变体覆盖测试：目录中每个变体至少出现在一个场景。
 - `scripted_round_emits_documented_order`：复用 agent.rs harness（temp Storage + ToolRegistry + `OpenAiClient::scripted`）驱动 AgentRunner 跑含思考/正文/工具审批的完整轮次，逐条经 `routed_to_event` 映射，断言输出序列精确符合文档化顺序并通过 `check_stream_invariants`。
-- JSON 导出漂移测试：各场景 `serde_json` 序列化后写 `crates/protium-core/conformance/<name>.json` 并比对（基于 `CARGO_MANIFEST_DIR`，仿 export_bindings 模式）。
+- JSON 导出漂移测试：各场景 `serde_json` 序列化后写 core 仓库 `conformance/<name>.json` 并比对（基于 `CARGO_MANIFEST_DIR`，仿 export_bindings 模式）。
 - 不变量自检：全部场景通过 check；非法序列（乱序/重复终态）在测试内手构并断言报错。
 - 不新增服务层注入机制（Phase 2）；Engine 附加事件由既有 service 测试覆盖。
 
 ### 3. TUI 回放同一批夹具
-- 根 `Cargo.toml` dev-dependencies：`protium-core = { path = "crates/protium-core", features = ["test-util"] }`（仅测试构建启用；CI release 构建无 `--all-features`，二进制不含 conformance 代码）。
+- 根 `Cargo.toml` dev-dependencies：Git `protium-core` 依赖启用 `test-util`（仅测试构建启用，release 二进制不含 conformance 代码）。
 - `src/projection.rs` 测试：对每个 Scenario 新建 `TuiSessionProjection` 逐事件 `handle_event`，断言不 panic 且终态符合 expectation（如 RoundCompleted ⇒ 思考已提交、非 live；ApprovalPending ⇒ 审批挂起）。
 - `src/app.rs`：
   - 微重构：从 run 循环抽出 `fn accept_envelope(app, &Envelope) -> bool`（cursor 去重 + handle_envelope + 推进），coalesce 逻辑留在循环内。
@@ -53,14 +53,16 @@ conformance.rs `#[cfg(test)]` 内：
 
 ### 4. 文档与流程固化
 - `.agents/guides/ui-contract.md`：入口加 conformance.rs 与 JSON 产物；验证节加「新增事件 -> 场景 + 变体目录 + JSON 无漂移 + 契约测试 + TUI 回放」清单；注明 test-util 与 `--all-features` 语义（保持 ≤50 行）。
-- `AGENTS.md`：任务路由表加一行「协议夹具/契约测试 -> `crates/protium-core/src/conformance.rs` -> UI Contract」。
+- `AGENTS.md`：任务路由表把协议夹具/契约测试指向独立 core 仓库与 UI Contract。
 - `.agents/guides/tui.md`：验证节加夹具回放一行。
 - 新建 `.github/PULL_REQUEST_TEMPLATE.md`：勾选式事件链速查（动 protocol.rs/bridge.rs ⇒ 绑定/JSON 漂移、场景覆盖、指南同步、各端映射）。
 
 ### 5. 验证（跨模块档位，一次全过）
 ```
 cargo fmt --all -- --check
-cargo test -p protium-core --lib --all-features --locked
+# 在 core 仓库
+cargo test --lib --all-features --locked
+# 在 TUI 仓库
 cargo test --all-features --locked          # 根包 = TUI 回放测试
 cargo clippy --all-targets --all-features --locked -- -D warnings
 bash scripts/check-agent-docs.sh && git diff --check

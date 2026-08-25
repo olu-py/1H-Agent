@@ -44,4 +44,22 @@ if grep -R -n -F "$legacy_name" \
     fail "legacy singular agent document reference found"
 fi
 
+extracted_core_path='crates/protium''-core'
+legacy_core_test='cargo test -p protium''-core'
+if grep -R -n -F "$extracted_core_path" \
+    "$repo_root/README.md" "$root_doc" "$repo_root/.agents" \
+    "$repo_root/docs" "$repo_root/.github"; then
+    fail "consumer-local core path reference found"
+fi
+if grep -R -n -F "$legacy_core_test" \
+    "$repo_root/README.md" "$root_doc" "$repo_root/.agents" \
+    "$repo_root/docs" "$repo_root/.github"; then
+    fail "consumer workspace core test command found"
+fi
+
+grep -Fq 'https://github.com/olu-py/1H-Agent-core' "$repo_root/README.md" \
+    || fail "README.md does not link the core repository"
+grep -Fq 'git = "https://github.com/olu-py/1H-Agent-core.git"' "$repo_root/Cargo.toml" \
+    || fail "Cargo.toml does not use the canonical core Git dependency"
+
 echo "agent docs check passed"
