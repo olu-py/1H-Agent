@@ -42,6 +42,11 @@ keyring = { workspace = true, features = ["apple-native"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
 
+[features]
+# Shared fixture corpus + stream invariants for adapter tests. Never enabled
+# by default so release builds never carry fixture code.
+test-util = []
+
 [dev-dependencies]
 tempfile = "3"
 

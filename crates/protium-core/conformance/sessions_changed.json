@@ -1,0 +1,12 @@
+{
+  "name": "sessions_changed",
+  "description": "session list changed; consumer refreshes the list",
+  "expectation": "completed",
+  "envelopes": [
+    {
+      "cursor": 1,
+      "session_id": "conformance",
+      "type": "sessions_changed"
+    }
+  ]
+}

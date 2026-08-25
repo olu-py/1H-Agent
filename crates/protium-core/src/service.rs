@@ -1023,7 +1023,11 @@ fn stored_to_message_dto(row: &StoredMessage) -> MessageDto {
 
 /// Converts a routed agent event into its protocol shape. Approval events are
 /// handled separately (they need an engine-side `approval_id`).
-fn routed_to_event(event: &AgentEvent) -> Option<Event> {
+///
+/// `pub(crate)` so the `test-util` conformance module can drive the real
+/// `AgentEvent -> Event` mapping in its contract tests; still invisible to
+/// external consumers.
+pub(crate) fn routed_to_event(event: &AgentEvent) -> Option<Event> {
     Some(match event {
         AgentEvent::ReasoningDelta(delta) => Event::ReasoningDelta {
             delta: delta.clone(),

@@ -38,6 +38,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Enables the shared conformance corpus (scenarios + stream invariants) so the
+# TUI replay tests consume the exact same fixtures the core asserts against.
+protium-core = { path = "crates/protium-core", features = ["test-util"] }
 
 [workspace]
 resolver = "2"

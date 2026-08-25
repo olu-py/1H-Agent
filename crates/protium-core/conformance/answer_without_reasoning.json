@@ -1,0 +1,23 @@
+{
+  "name": "answer_without_reasoning",
+  "description": "round without reasoning never emits ReasoningCompleted",
+  "expectation": "completed",
+  "envelopes": [
+    {
+      "cursor": 1,
+      "session_id": "conformance",
+      "type": "model_streaming"
+    },
+    {
+      "cursor": 2,
+      "session_id": "conformance",
+      "type": "text_delta",
+      "delta": "直接回答，没有思考。"
+    },
+    {
+      "cursor": 3,
+      "session_id": "conformance",
+      "type": "completed"
+    }
+  ]
+}

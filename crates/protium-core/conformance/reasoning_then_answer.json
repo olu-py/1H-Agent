@@ -1,0 +1,48 @@
+{
+  "name": "reasoning_then_answer",
+  "description": "round with reasoning barrier, body deltas, usage, completion",
+  "expectation": "completed",
+  "envelopes": [
+    {
+      "cursor": 1,
+      "session_id": "conformance",
+      "type": "model_streaming"
+    },
+    {
+      "cursor": 2,
+      "session_id": "conformance",
+      "type": "reasoning_delta",
+      "delta": "正在分析项目结构"
+    },
+    {
+      "cursor": 3,
+      "session_id": "conformance",
+      "type": "reasoning_completed"
+    },
+    {
+      "cursor": 4,
+      "session_id": "conformance",
+      "type": "text_delta",
+      "delta": "结构确认完毕。"
+    },
+    {
+      "cursor": 5,
+      "session_id": "conformance",
+      "type": "text_delta",
+      "delta": "可以开始修改。"
+    },
+    {
+      "cursor": 6,
+      "session_id": "conformance",
+      "type": "usage",
+      "input_tokens": 1200,
+      "output_tokens": 80,
+      "total_tokens": 1280
+    },
+    {
+      "cursor": 7,
+      "session_id": "conformance",
+      "type": "completed"
+    }
+  ]
+}

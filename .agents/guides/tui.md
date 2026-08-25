@@ -45,6 +45,6 @@ TUI adapter 的职责边界：projection、输入、布局、渲染、滚动和�
 
 ## 验证
 
-- 迭代过滤器按改动选择：`home::tests`、`app::tests`、`ui::tests`、`output::tests`、`ui_layout::tests`。
+- 迭代过滤器按改动选择：`home::tests`、`app::tests`、`ui::tests`、`output::tests`、`ui_layout::tests`；协议事件相关改动回放核心共享夹具（`cargo test --lib conformance`：projection 终态断言 + facade cursor 去重）。
 - 性能回归优先使用具体行为名过滤器，避免迭代期重复运行整个模块。
 - 完成阶段按根文档运行一次 lib 测试；事件、缓存或选择跨模块变更升级到完整测试和 Clippy。

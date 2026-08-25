@@ -550,10 +550,10 @@ async fn event_loop(
             envelope = live.recv() => {
                 match envelope {
                     Ok(envelope) => {
-                        if envelope.cursor > app.event_cursor {
-                            let coalesce = should_coalesce_stream_redraw(&app.active_session, &envelope);
-                            redraw = handle_envelope(app, &envelope);
-                            app.event_cursor = envelope.cursor;
+                        let coalesce =
+                            should_coalesce_stream_redraw(&app.active_session, &envelope);
+                        if let Some(fresh_redraw) = accept_envelope(app, &envelope) {
+                            redraw = fresh_redraw;
                             if redraw && coalesce {
                                 schedule_deferred_redraw(&mut deferred_redraw_timer);
                                 redraw = false;
@@ -1882,6 +1882,20 @@ impl App {
     }
 }
 
+/// Applies one live envelope with cursor dedup: an envelope at or below the
+/// facade's last-processed cursor is skipped (replay/live overlap must
+/// deduplicate by cursor), a fresh one is handled and the cursor advances.
+/// Returns `Some(redraw)` when the envelope was accepted, `None` when its
+/// cursor was stale or duplicate.
+fn accept_envelope(app: &mut App, envelope: &Envelope) -> Option<bool> {
+    if envelope.cursor <= app.event_cursor {
+        return None;
+    }
+    let redraw = handle_envelope(app, envelope);
+    app.event_cursor = envelope.cursor;
+    Some(redraw)
+}
+
 fn handle_envelope(app: &mut App, envelope: &Envelope) -> bool {
     let approval_redraw = match &envelope.event {
         ProtocolEvent::Approval {
@@ -2721,6 +2735,80 @@ mod tests {
         let content = terminal.backend().buffer().content().to_vec();
         assert!(!content.is_empty());
         assert!(content.iter().any(|cell| cell.symbol() != " "));
+    }
+
+    /// Replays the core's shared conformance corpus through the facade's
+    /// cursor-deduped accept path: every envelope must be accepted exactly
+    /// once, the cursor must land on the last envelope, and replaying the
+    /// same batch (all stale cursors) must be a no-op.
+    #[tokio::test]
+    async fn conformance_corpus_replays_and_dedups_by_cursor() {
+        for scenario in protium_core::conformance::scenarios() {
+            let (mut app, _temp) = test_app().await;
+            app.event_cursor = 0;
+            app.current.session_id = protium_core::conformance::SESSION_ID.to_owned();
+            for envelope in &scenario.envelopes {
+                assert!(
+                    accept_envelope(&mut app, envelope).is_some(),
+                    "scenario {}: fresh envelope at cursor {} was skipped",
+                    scenario.name,
+                    envelope.cursor
+                );
+            }
+            let last = scenario
+                .envelopes
+                .last()
+                .map(|envelope| envelope.cursor)
+                .unwrap_or(0);
+            assert_eq!(
+                app.event_cursor, last,
+                "scenario {}: cursor must land on the last envelope",
+                scenario.name
+            );
+            let status_before = app.current.status.clone();
+            for envelope in &scenario.envelopes {
+                assert!(
+                    accept_envelope(&mut app, envelope).is_none(),
+                    "scenario {}: stale envelope at cursor {} was accepted",
+                    scenario.name,
+                    envelope.cursor
+                );
+            }
+            assert_eq!(
+                app.event_cursor, last,
+                "scenario {}: stale replay must not move the cursor",
+                scenario.name
+            );
+            assert_eq!(
+                app.current.status, status_before,
+                "scenario {}: stale replay must not touch projection state",
+                scenario.name
+            );
+        }
+    }
+
+    /// The live `Approval` event must populate the facade's global modal slot
+    /// immediately (an agent must never wait invisibly for the server-side
+    /// approval timeout).
+    #[tokio::test]
+    async fn conformance_approval_pending_populates_the_global_modal() {
+        let scenario = protium_core::conformance::scenarios()
+            .into_iter()
+            .find(|scenario| {
+                scenario.expectation == protium_core::conformance::Expectation::ApprovalPending
+            })
+            .expect("corpus must keep an approval-pending scenario");
+        let (mut app, _temp) = test_app().await;
+        app.event_cursor = 0;
+        app.current.session_id = protium_core::conformance::SESSION_ID.to_owned();
+        for envelope in &scenario.envelopes {
+            accept_envelope(&mut app, envelope);
+        }
+        assert!(
+            app.approval.is_some(),
+            "scenario {}: a live Approval must populate the global modal slot",
+            scenario.name
+        );
     }
 
     #[tokio::test]

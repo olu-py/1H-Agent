@@ -1,0 +1,12 @@
+{
+  "name": "resync_required",
+  "description": "cursor evicted; consumer must refetch snapshot and message page",
+  "expectation": "resync",
+  "envelopes": [
+    {
+      "cursor": 1,
+      "session_id": "",
+      "type": "resync_required"
+    }
+  ]
+}

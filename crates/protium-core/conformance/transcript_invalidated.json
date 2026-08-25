@@ -1,0 +1,12 @@
+{
+  "name": "transcript_invalidated",
+  "description": "history-modifying command; consumer refetches message pages",
+  "expectation": "completed",
+  "envelopes": [
+    {
+      "cursor": 1,
+      "session_id": "conformance",
+      "type": "transcript_invalidated"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "failed_round",
+  "description": "stream fails mid-round; terminal Failed state",
+  "expectation": "failed",
+  "envelopes": [
+    {
+      "cursor": 1,
+      "session_id": "conformance",
+      "type": "model_streaming"
+    },
+    {
+      "cursor": 2,
+      "session_id": "conformance",
+      "type": "text_delta",
+      "delta": "流式中途出错"
+    },
+    {
+      "cursor": 3,
+      "session_id": "conformance",
+      "type": "failed",
+      "error": "connection reset"
+    }
+  ]
+}

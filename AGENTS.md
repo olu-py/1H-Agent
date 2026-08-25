@@ -27,7 +27,7 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 
 | 领域 | 首读入口 | 专题/读取条件 |
 | --- | --- | --- |
-| 通用 UI 契约、事件游标/回放、resync | `crates/protium-core/src/protocol.rs`、`bridge.rs`、`service.rs` | [UI Contract](.agents/guides/ui-contract.md) |
+| 通用 UI 契约、事件游标/回放、resync、协议一致性夹具 | `crates/protium-core/src/protocol.rs`、`bridge.rs`、`service.rs`、`conformance.rs` | [UI Contract](.agents/guides/ui-contract.md) |
 | 启动、全局状态、会话路由 | `crates/protium-core/src/service.rs`、`crates/protium-core/src/app.rs`；TUI 门面 `src/app.rs` | [Runtime](.agents/guides/runtime.md)；仅沿目标事件链读取 |
 | Provider、模型、密钥、协议、压缩恢复 | `crates/protium-core/src/config.rs`、`agent.rs`、`provider/openai.rs` | [Provider](.agents/guides/provider.md) |
 | 子 Agent、审批、取消、集群停滞 | `crates/protium-core/src/agent.rs`、`service.rs` | [Cluster](.agents/guides/cluster.md) |

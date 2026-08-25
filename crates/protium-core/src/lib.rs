@@ -6,6 +6,14 @@
 //! [`service::AppService`] / [`service::AppHandle`] entry point and consumes
 //! the [`protocol`] DTOs over the [`bridge::EventBridge`].
 
+/// Shared conformance scenarios and stream invariants for UI adapters.
+///
+/// Enabled only via the non-default `test-util` feature so the shipped
+/// library and binaries never carry fixture code; adapters enable it in
+/// dev-dependencies and replay the same corpus the core asserts against.
+#[cfg(feature = "test-util")]
+pub mod conformance;
+
 pub mod agent;
 pub mod app;
 pub mod bridge;

@@ -1130,7 +1130,80 @@ pub(crate) fn next_output_scroll_top(current: usize, max_scroll: usize, delta: i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protium_core::conformance::Expectation;
     use protium_core::protocol::MessagePage;
+
+    /// Replays the core's shared conformance corpus through the projection:
+    /// every scenario must replay without panicking and must land the
+    /// projection in the end-state the scenario declares. When the core adds
+    /// an `Event` variant and a scenario for it, this test consumes the new
+    /// scenario automatically - the projection must keep up or this fails.
+    #[test]
+    fn conformance_corpus_replays_into_projection() {
+        for scenario in protium_core::conformance::scenarios() {
+            let mut projection = TuiSessionProjection::new(
+                protium_core::conformance::SESSION_ID.to_owned(),
+                AgentMode::Build,
+                None,
+            );
+            for envelope in &scenario.envelopes {
+                projection.handle_event(&envelope.event);
+            }
+            match scenario.expectation {
+                Expectation::Completed | Expectation::Cancelled => {
+                    assert_eq!(
+                        projection.agent_phase,
+                        AgentPhase::Idle,
+                        "scenario {}: terminal expectation must return to idle",
+                        scenario.name
+                    );
+                    assert!(
+                        !projection.thinking_active,
+                        "scenario {}: terminal expectation must commit the thinking row",
+                        scenario.name
+                    );
+                }
+                Expectation::Failed => {
+                    assert_eq!(
+                        projection.agent_phase,
+                        AgentPhase::Failed,
+                        "scenario {}: failed expectation",
+                        scenario.name
+                    );
+                    assert!(
+                        !projection.thinking_active,
+                        "scenario {}: failure must commit the thinking row",
+                        scenario.name
+                    );
+                }
+                Expectation::ApprovalPending => {
+                    assert_eq!(
+                        projection.agent_phase,
+                        AgentPhase::WaitingApproval,
+                        "scenario {}: approval expectation",
+                        scenario.name
+                    );
+                    assert!(
+                        projection.pending_approval.is_some(),
+                        "scenario {}: approval must be visible to the consumer",
+                        scenario.name
+                    );
+                }
+                Expectation::Active => {
+                    assert_ne!(
+                        projection.agent_phase,
+                        AgentPhase::Idle,
+                        "scenario {}: active expectation must not be idle",
+                        scenario.name
+                    );
+                }
+                Expectation::Resync => {
+                    // Transport-level signal: the projection itself stays
+                    // untouched; only the facade refetches state.
+                }
+            }
+        }
+    }
 
     #[test]
     fn message_page_rebuilds_entry_history() {
