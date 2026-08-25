@@ -22,7 +22,7 @@ excluded: 本仓库不实现 WebUI/Desktop 源码（仅契约覆盖接入约束�
 3. 从 `src/main.rs -> app::run` 进入：TUI 门面是 `src/app.rs`（`App` + `TuiSessionProjection`）；核心接口在独立 `1H-Agent-core` 仓库的 `src/service.rs`、`protocol.rs`、`bridge.rs`。
 4. 修改事件、配置或持久化类型时，覆盖所有构造点、match、序列化、恢复和测试。
 5. 先跑最小目标测试；跨模块行为才升级到完整 Clippy 和测试。
-6. core 变更先在独立仓库完成并 push；本仓库只定向更新 Git 依赖、适配和提交锁文件，禁止编辑 Cargo checkout。
+6. core/TUI 联调先用命令行本地 path patch 指向 `../protium-core`；交付前必须移除 patch、先完成并 push core，再定向更新 Git 锁文件、适配和 `--locked` 复测；禁止编辑 Cargo checkout。
 
 ## 任务路由
 

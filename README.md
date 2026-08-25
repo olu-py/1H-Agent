@@ -54,6 +54,20 @@ cargo build --release --locked --bin 1h-agent
 
 这一节只面向维护者。普通构建不会自动追踪 core 的 `main`：`Cargo.lock` 锁定具体 commit，只有提交新的锁文件后，其他用户才会获得新版 core。
 
+### 本地边改边测
+
+将 `1H-Agent` 与 `protium-core` 放在同一父目录后，可在 core 尚未 push 时用 Cargo 命令行配置临时覆盖 Git 依赖：
+
+```bash
+cargo --config \
+  'patch."https://github.com/olu-py/1H-Agent-core.git".protium-core.path="../protium-core"' \
+  test --lib conformance
+```
+
+同一个 `--config` 参数也可用于 `cargo run` 和其他 TUI 测试，实现本地 core 的增量编译。不要改受跟踪的 `Cargo.toml`；Cargo 可能临时改写 `Cargo.lock`，该 path 状态不得暂存或提交。若开始时锁文件已有用户改动，先保护原差异，不能让联调覆盖它。
+
+### 正式更新与交付
+
 先在独立的 [core 仓库](https://github.com/olu-py/1H-Agent-core) 完成测试、提交并 push `main`，再在本仓库运行：
 
 ```bash
@@ -62,7 +76,7 @@ cargo test --lib conformance
 cargo test --all-features --locked
 ```
 
-检查 `Cargo.lock` 中的 core commit 和适配器差异后，在本仓库单独提交。普通 `cargo update` 会同时更新其他依赖，不适合仅升级 core。
+移除本地 patch，检查 metadata 来源和 `Cargo.lock` 中的 core Git commit，再在本仓库单独提交适配器与锁文件。普通 `cargo update` 会同时更新其他依赖，不适合仅升级 core。
 
 协议一致性夹具由 core 仓库维护；TUI conformance 测试通过 Git 依赖的 `test-util` feature 消费它们。不要修改 Cargo 缓存中的 checkout，也不要把 core 源码复制回本仓库。WebUI 是另一个独立消费端，见 [1H-Agent-webUI](https://github.com/olu-py/1H-Agent-webUI)。
 

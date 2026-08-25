@@ -61,5 +61,17 @@ grep -Fq 'https://github.com/olu-py/1H-Agent-core' "$repo_root/README.md" \
     || fail "README.md does not link the core repository"
 grep -Fq 'git = "https://github.com/olu-py/1H-Agent-core.git"' "$repo_root/Cargo.toml" \
     || fail "Cargo.toml does not use the canonical core Git dependency"
+grep -Fq 'source = "git+https://github.com/olu-py/1H-Agent-core.git?branch=main#' "$repo_root/Cargo.lock" \
+    || fail "Cargo.lock does not pin a core Git commit"
+grep -Fq 'patch."https://github.com/olu-py/1H-Agent-core.git"' "$repo_root/README.md" \
+    || fail "README.md does not document the local core path patch workflow"
+grep -Fq '本地 path patch' "$root_doc" \
+    || fail "AGENTS.md does not require the local core integration workflow"
+
+core_patch_key='patch."https://github.com/olu-py/1H-Agent-core.git"'
+if [[ -d "$repo_root/.cargo" ]] \
+    && grep -R -n -F "$core_patch_key" "$repo_root/.cargo"; then
+    fail "local core path patch remains in repository Cargo config"
+fi
 
 echo "agent docs check passed"

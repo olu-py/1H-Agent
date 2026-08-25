@@ -14,6 +14,7 @@
 
 - [ ] 加法演进：新变体/字段旧 UI 可忽略；未改名、未重排、未复用旧 tag
 - [ ] 上游 core commit 已完成协议、conformance、JSON 夹具和 bindings 验证
+- [ ] 本地 path patch/临时 Cargo 配置已移除，metadata 与 `Cargo.lock` 均指向 Git core
 - [ ] `Cargo.lock` 只定向更新到预期 core commit
 - [ ] TUI 映射已更新（projection 穷尽 match），`cargo test --lib conformance` 回放通过
 - [ ] TUI 对新增事件/字段的 projection 与展示已适配

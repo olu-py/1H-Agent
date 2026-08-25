@@ -22,6 +22,7 @@
 - v2 之后协议只做加法演进：新变体/字段必须被旧 UI 忽略，不得改名、重排或复用旧 tag。
 - 事件接线链单一事实源：`ModelEvent`（provider 归一化）→ `AgentEvent`（forward 闭包，可 `SendMany` 展开为有序序列，如 `ReasoningCompleted`+`TextDelta`）→ protocol `Event`（session reducer 映射）→ `bridge` → 各消费端展示映射；沿链贯通，未知事件静默忽略。各专题只保留本层细节并回指本指南。
 - 分层约束：TUI 管 Ratatui 状态/projection/渲染/输入；WebUI 管 HTTP/SSE transport 与浏览器状态；Desktop 管 IPC transport 与原生窗口生命周期。transport 不承载业务规则，核心不依赖任何 UI 框架。
+- core/TUI 同步开发可用 Cargo `--config` path patch 指向同级独立 clone；不得改 manifest 或提交 path 锁文件，正式验收必须恢复 Git source。
 
 ## 诊断
 
@@ -39,5 +40,6 @@
 - 新增协议事件：确认加法演进（旧 UI 可忽略）、贯通全部环节，并同步各消费端映射与展示。
 - 新增协议事件的强制链路：`conformance.rs` 穷尽变体目录先编译失败 -> 补至少一个场景 -> `cargo test --lib --features test-util conformance`（场景不变量 + 契约测试 `scripted_round_emits_documented_order` + JSON 夹具无漂移并提交）-> TUI 回放测试（`conformance_corpus_replays_into_projection`、`conformance_corpus_replays_and_dedups_by_cursor`）自动消费新场景。夹具仅在 `test-util` feature 下编译，不进 release 二进制。
 - 协议/DTO 先在 core 仓库更新 conformance 与 `bindings/` 并 push；本仓库再执行 `cargo update -p protium-core` 和 TUI conformance 回放。TUI 不复制 TS bindings，WebUI 在其独立仓库同步。
+- 本地 patch 联调结束后检查 metadata source 为 Git、`Cargo.lock` 为预期 SHA，再运行全部 `--locked` 验证。
 - 事件/协议变更端到端速查：`ModelEvent`（provider 归一化）→ `AgentEvent`（forward 闭包合并/阈值，如 `ToolCallStreaming` 1 KiB 合并）→ `protocol::Event`（`routed_to_event` 映射 + doc 顺序保证）→ `bridge::event_payload_bytes` → 核心 reducer（`session.rs` phase/status）→ 消费端展示（TUI 见 tui.md）→ bindings（`cargo test` 导出测试）→ 测试（agent scripted / conformance 契约与回放 / protocol serde / projection / facade 帧文本）。
 - 协议/桥接改动升级到 `cargo test --lib --all-features --locked` 与完整 Clippy。
